@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Databases (Local data stays local)
+*.db
+*.sqlite3
+
+# Environments (If you ever create a .venv)
+.venv/
+env/
+venv/
+ENV/
+
+# Python build/distribution
+dist/
+build/
+*.egg-info/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Optional: User-specific configuration
+.env
