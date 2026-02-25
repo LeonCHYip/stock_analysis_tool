@@ -72,7 +72,13 @@ def get_competitor_tickers(ticker: str) -> list[str]:
 # ── Per-peer valuation ────────────────────────────────────────────────────────
 
 def _get_valuation(ticker: str) -> dict:
-    """Fetch forward PE and P/B for a single ticker (cached, throttled, with retry)."""
+    """Fetch forward PE and P/B for a single ticker (cached, throttled, no retry).
+
+    Peer valuations are best-effort — a single attempt is sufficient.
+    Retrying causes excessive delays for delisted/404 tickers because yfinance
+    handles HTTP 404 internally and returns an empty dict without raising an
+    exception, making it indistinguishable from a rate-limit at call time.
+    """
     key = ticker.upper()
     if key in _valuation_cache:
         return _valuation_cache[key]
@@ -86,22 +92,17 @@ def _get_valuation(ticker: str) -> dict:
         except Exception:
             return None
 
-    for attempt, delay in enumerate([0] + _RETRY_DELAYS, 0):
-        if delay:
-            time.sleep(delay)
-        try:
-            info = yf.Ticker(ticker).info
-            if len(info) >= 5:
-                result = {"forward_pe": _clean(info.get("forwardPE")),
-                          "pb":         _clean(info.get("priceToBook"))}
-                _valuation_cache[key] = result
-                return result
-            if attempt < len(_RETRY_DELAYS):
-                print(f"  [peers] Rate-limited valuation for {ticker}, retrying in {_RETRY_DELAYS[attempt]}s...")
-        except Exception:
-            pass
-
     empty = {"forward_pe": None, "pb": None}
+    try:
+        info = yf.Ticker(ticker).info
+        if len(info) >= 5:
+            result = {"forward_pe": _clean(info.get("forwardPE")),
+                      "pb":         _clean(info.get("priceToBook"))}
+            _valuation_cache[key] = result
+            return result
+    except Exception:
+        pass
+
     _valuation_cache[key] = empty
     return empty
 

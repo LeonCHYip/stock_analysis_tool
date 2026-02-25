@@ -206,23 +206,81 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
 
         # ── Step 2: parallel fund + peer fetches ──────────────────────────────
         progress["current"] = f"Batch {batch_num}: {batch[0]}…{batch[-1]} (fund + peers)"
+        consecutive_failures   = 0
+        vpn_switched_this_batch = False
+        rate_limited_tickers:  list[str] = []
+
+        def _do_vpn_switch(reason: str):
+            nonlocal consecutive_failures, vpn_switched_this_batch
+            country = VPN_COUNTRIES[batch_num % len(VPN_COUNTRIES)]
+            progress["current"] = f"{reason} — switching VPN to {country.upper()}…"
+            vpn_switcher.switch_server(
+                country,
+                log=lambda msg: progress.update({"current": msg}),
+            )
+            consecutive_failures   = 0
+            vpn_switched_this_batch = True
+
+        # Skip tickers the bulk download already flagged as delisted / no data
+        def _is_delisted(t):
+            err = bulk_tech.get(t, {}).get("error", "")
+            return "No price data" in err or "delisted" in err.lower() or "No bulk data" in err
+
+        valid_batch   = [t for t in batch if not _is_delisted(t)]
+        skipped_count = len(batch) - len(valid_batch)
+        if skipped_count:
+            done += skipped_count
+            progress["done"] = done
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_FUND_WORKERS) as pool:
-            future_map = {pool.submit(_run_fund_and_peers, t, fetch_peers): t for t in batch}
+            future_map = {pool.submit(_run_fund_and_peers, t, fetch_peers): t for t in valid_batch}
             for future in concurrent.futures.as_completed(future_map):
                 if stop_event.is_set():
                     break
                 t = future_map[future]
                 try:
                     fund, peer_data = future.result()
-                    tech = bulk_tech.get(t, {"error": "Not in bulk data"})
-                    indicators = evaluate_all(t, tech, fund, peer_data)
-                    save_results(t, indicators, analysis_dt, fund.get("market_cap"))
+                    if fund.get("rate_limited"):
+                        consecutive_failures += 1
+                        rate_limited_tickers.append(t)
+                    else:
+                        consecutive_failures = 0
+                        tech = bulk_tech.get(t, {"error": "Not in bulk data"})
+                        indicators = evaluate_all(t, tech, fund, peer_data)
+                        save_results(t, indicators, analysis_dt, fund.get("market_cap"))
+                    # Reactive VPN switch: 3 consecutive auth blocks, once per batch
+                    if vpn_rotate and consecutive_failures >= 3 and not vpn_switched_this_batch:
+                        _do_vpn_switch("Persistent auth block detected")
                 except Exception:
                     pass
                 done += 1
                 progress["done"] = done
 
-        # ── Step 3: cooldown + optional VPN switch ────────────────────────────
+        # ── Step 2b: re-queue rate-limited tickers after VPN switch ───────────
+        if rate_limited_tickers and vpn_switched_this_batch and not stop_event.is_set():
+            progress["current"] = (
+                f"Re-processing {len(rate_limited_tickers)} rate-limited tickers on new IP…"
+            )
+            # Use 2 workers — gentle on the freshly switched IP
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as retry_pool:
+                retry_map = {
+                    retry_pool.submit(_run_fund_and_peers, t, fetch_peers): t
+                    for t in rate_limited_tickers
+                }
+                for future in concurrent.futures.as_completed(retry_map):
+                    if stop_event.is_set():
+                        break
+                    t = retry_map[future]
+                    try:
+                        fund, peer_data = future.result()
+                        if not fund.get("rate_limited"):
+                            tech = bulk_tech.get(t, {"error": "Not in bulk data"})
+                            indicators = evaluate_all(t, tech, fund, peer_data)
+                            save_results(t, indicators, analysis_dt, fund.get("market_cap"))
+                    except Exception:
+                        pass
+
+        # ── Step 3: cooldown + optional proactive VPN switch ──────────────────
         if batch_start + SCAN_BATCH_SIZE < total and not stop_event.is_set():
             progress["current"] = f"Cooldown {SCAN_BATCH_COOLDOWN}s before next batch…"
             for _ in range(SCAN_BATCH_COOLDOWN * 10):
@@ -230,14 +288,9 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                     break
                 time.sleep(0.1)
 
-            if vpn_rotate and not stop_event.is_set():
-                batch_num = batch_start // SCAN_BATCH_SIZE + 1
-                country = VPN_COUNTRIES[batch_num % len(VPN_COUNTRIES)]
-                progress["current"] = f"Switching VPN to {country.upper()}…"
-                vpn_switcher.switch_server(
-                    country,
-                    log=lambda msg: progress.update({"current": msg}),
-                )
+            # Proactive switch — skip if reactive already fired this batch
+            if vpn_rotate and not stop_event.is_set() and not vpn_switched_this_batch:
+                _do_vpn_switch("Batch complete")
 
     progress["finished"] = True
     progress["current"]  = ""
@@ -393,7 +446,7 @@ def render_detail_t1(ticker: str, ind_result: dict, detail: dict):
                 ("Volume Change %",    _pct(detail.get(f"{period} Volume Change %"))),
             ]
             st.dataframe(pd.DataFrame(rows, columns=["Field", "Value"]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
 
 def render_detail_t2(ticker: str, ind_result: dict, detail: dict):
@@ -427,7 +480,7 @@ def render_detail_t2(ticker: str, ind_result: dict, detail: dict):
                 ("Volume Change %",    _pct(detail.get(f"{period} Volume Change %"))),
             ]
             st.dataframe(pd.DataFrame(rows, columns=["Field", "Value"]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
 
 def render_detail_t3(ticker: str, ind_result: dict, detail: dict):
@@ -453,7 +506,7 @@ def render_detail_t3(ticker: str, ind_result: dict, detail: dict):
             ("MA200", _num(detail.get("MA200"))),
         ]
         st.dataframe(pd.DataFrame(rows, columns=["Field", "Value"]),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
 
 
 def render_detail_t4(ticker: str, ind_result: dict, detail: dict):
@@ -475,7 +528,7 @@ def render_detail_t4(ticker: str, ind_result: dict, detail: dict):
                      "✅" if ev.get("vol_above_avg") else "❌"]
                     for ev in up_evts]
             st.dataframe(pd.DataFrame(rows, columns=["Date","Change%","Volume","30d Avg Vol","Vol>Avg"]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
         if dn_evts:
             st.markdown("**⬇️ Big Down Events:**")
             rows = [[ev["date"], f"{ev['pct_change']:+.1f}%",
@@ -483,7 +536,7 @@ def render_detail_t4(ticker: str, ind_result: dict, detail: dict):
                      "✅" if ev.get("vol_above_avg") else "❌"]
                     for ev in dn_evts]
             st.dataframe(pd.DataFrame(rows, columns=["Date","Change%","Volume","30d Avg Vol","Vol>Avg"]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
 
 
 def render_detail_f1(ticker: str, ind_result: dict, detail: dict):
@@ -496,7 +549,7 @@ def render_detail_f1(ticker: str, ind_result: dict, detail: dict):
             st.markdown(f"  {e} **{label}**")
         st.markdown("---")
         rows = [("Q Revenue", _millify(detail.get("Q Revenue"))), ("Q EPS", _num(detail.get("Q EPS")))]
-        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), width="stretch", hide_index=True)
 
 
 def render_detail_f2(ticker: str, ind_result: dict, detail: dict):
@@ -509,7 +562,7 @@ def render_detail_f2(ticker: str, ind_result: dict, detail: dict):
             st.markdown(f"  {e} **{label}**")
         st.markdown("---")
         rows = [("Annual Revenue", _millify(detail.get("Annual Revenue"))), ("Annual EPS", _num(detail.get("Annual EPS")))]
-        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), width="stretch", hide_index=True)
 
 
 def render_detail_f3(ticker: str, ind_result: dict, detail: dict):
@@ -529,7 +582,7 @@ def render_detail_f3(ticker: str, ind_result: dict, detail: dict):
             ("Q EPS Source",      detail.get("Q EPS Source") or "N/A"),
             ("Threshold",         "Revenue > +10%  |  EPS > +30%"),
         ]
-        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), width="stretch", hide_index=True)
 
 
 def render_detail_f4(ticker: str, ind_result: dict, detail: dict):
@@ -549,7 +602,7 @@ def render_detail_f4(ticker: str, ind_result: dict, detail: dict):
             ("Annual EPS Source",    detail.get("Annual EPS Source") or "N/A"),
             ("Threshold",            "Revenue > +10%  |  EPS > +30%"),
         ]
-        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), width="stretch", hide_index=True)
 
 
 def render_detail_f5(ticker: str, ind_result: dict, detail: dict):
@@ -564,7 +617,7 @@ def render_detail_f5(ticker: str, ind_result: dict, detail: dict):
             ("Peer Tickers",        ", ".join(detail.get("Peer Tickers") or [])),
             ("Peer Fwd PE Values",  str(detail.get("Peer Fwd PE Values") or [])),
         ]
-        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), width="stretch", hide_index=True)
 
 
 def render_detail_f6(ticker: str, ind_result: dict, detail: dict):
@@ -579,7 +632,7 @@ def render_detail_f6(ticker: str, ind_result: dict, detail: dict):
             ("Peer Tickers",        ", ".join(detail.get("Peer Tickers") or [])),
             ("Peer P/B Values",     str(detail.get("Peer P/B Values") or [])),
         ]
-        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows, columns=["Field","Value"]), width="stretch", hide_index=True)
 
 
 DETAIL_RENDERERS = {
@@ -724,7 +777,7 @@ with st.sidebar:
         help="Rotates Mullvad server after each batch to avoid rate limiting. Requires Mullvad CLI.",
     )
 
-    run_btn  = st.button("▶ Run Analysis", type="primary", use_container_width=True)
+    run_btn  = st.button("▶ Run Analysis", type="primary", width="stretch")
     st.divider()
 
     st.markdown("""
@@ -769,72 +822,49 @@ F4.2 A EPS YoY>+30%
 # ── Handle Run button ─────────────────────────────────────────────────────────
 if run_btn:
     raw = ticker_input.strip()
-    daily_str  = str(daily_date_input)  if daily_date_input  else None
-    weekly_str = str(weekly_date_input) if weekly_date_input else None
+    daily_str   = str(daily_date_input)  if daily_date_input  else None
+    weekly_str  = str(weekly_date_input) if weekly_date_input else None
     analysis_dt = _now_cst()
     fetch_peers = st.session_state.get("fetch_peers", True)
     vpn_rotate  = st.session_state.get("vpn_rotate",  False)
 
+    # Determine ticker list — manual input or full tickers.txt
     if raw:
-        # Manual ticker mode
-        tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
-        st.sidebar.success(f"Analyzing: {', '.join(tickers)}")
+        ticker_list = [t.strip().upper() for t in raw.split(",") if t.strip()]
+        label = f"Analyzing {len(ticker_list)} ticker(s): {', '.join(ticker_list)}"
+    else:
+        ticker_list = load_ticker_list()
+        label = f"Scan started — {len(ticker_list)} tickers"
 
-        prog_ph = st.empty()
-        detail_live: dict = {}
-        inds_live:   dict = {}
-
-        with st.spinner(f"Analyzing {len(tickers)} ticker(s)…"):
-            for ticker in tickers:
-                prog_ph.info(f"**{ticker}** — fetching data…")
-                tech, fund, peer_data = _run_one(ticker, daily_str, weekly_str, fetch_peers)
-                indicators = evaluate_all(ticker, tech, fund, peer_data)
-                market_cap = fund.get("market_cap") if fund else None
-                save_results(ticker, indicators, analysis_dt, market_cap)
-                inds_live[ticker]   = indicators
-                detail_live[ticker] = {iid: ind["detail"] for iid, ind in indicators.items()}
-
-        prog_ph.success(f"✅ Done — {analysis_dt}")
-        st.session_state.last_analysis_dt = analysis_dt
-        st.session_state.last_tickers     = tickers
-        st.session_state.last_detail_map  = detail_live
-        st.session_state["last_inds_live"] = inds_live
-        # Stop any running scan
+    if not ticker_list:
+        st.sidebar.error("No tickers to process. Enter tickers or check tickers.txt.")
+    else:
+        # Stop any existing scan/run
         if st.session_state.scan_stop_event:
             st.session_state.scan_stop_event.set()
+            time.sleep(0.2)
 
-    else:
-        # Scan mode
-        ticker_list = load_ticker_list()
-        if not ticker_list:
-            st.sidebar.error("tickers.txt not found or empty.")
-        else:
-            # Stop existing scan if running
-            if st.session_state.scan_stop_event:
-                st.session_state.scan_stop_event.set()
-                time.sleep(0.2)
+        pause_event = threading.Event()
+        stop_event  = threading.Event()
+        progress    = {}
 
-            pause_event = threading.Event()
-            stop_event  = threading.Event()
-            progress    = {}
+        st.session_state.scan_pause_event  = pause_event
+        st.session_state.scan_stop_event   = stop_event
+        st.session_state.scan_progress     = progress
+        st.session_state.last_analysis_dt  = analysis_dt
+        st.session_state.last_tickers      = []
+        st.session_state.last_detail_map   = {}
+        st.session_state["last_inds_live"] = {}
 
-            st.session_state.scan_pause_event  = pause_event
-            st.session_state.scan_stop_event   = stop_event
-            st.session_state.scan_progress     = progress
-            st.session_state.last_analysis_dt  = analysis_dt
-            st.session_state.last_tickers      = []
-            st.session_state.last_detail_map   = {}
-            st.session_state["last_inds_live"] = {}
-
-            t = threading.Thread(
-                target=scan_thread_func,
-                args=(ticker_list, analysis_dt, daily_str, weekly_str,
-                      pause_event, stop_event, progress, fetch_peers, vpn_rotate),
-                daemon=True,
-            )
-            st.session_state.scan_thread = t
-            t.start()
-            st.sidebar.success(f"Scan started — {len(ticker_list)} tickers")
+        t = threading.Thread(
+            target=scan_thread_func,
+            args=(ticker_list, analysis_dt, daily_str, weekly_str,
+                  pause_event, stop_event, progress, fetch_peers, vpn_rotate),
+            daemon=True,
+        )
+        st.session_state.scan_thread = t
+        t.start()
+        st.sidebar.success(label)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto-refresh while scan is running
@@ -910,7 +940,7 @@ with tab_latest:
 
     edited = st.data_editor(
         sum_df, column_config=col_cfg,
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
         key="latest_sum_editor",
     )
     if st.button("💾 Save Edits", key="save_latest"):
@@ -989,7 +1019,7 @@ with tab_history:
 
     all_edited = st.data_editor(
         all_df, column_config=all_col_cfg,
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
         key="all_sum_editor",
     )
     if st.button("💾 Save Edits", key="save_all"):

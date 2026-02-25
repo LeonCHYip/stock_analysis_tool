@@ -358,41 +358,63 @@ def fetch_fundamental(ticker: str, skip_normalize: bool = False) -> dict:
     """
     _RETRY_DELAYS = [5, 10, 20]
 
+    def _is_auth_err(e) -> bool:
+        s = str(e)
+        return "401" in s or "Unauthorized" in s or "Invalid Crumb" in s
+
     def _fetch_info(stock):
-        """Fetch stock.info with retry on rate-limit (empty/tiny response)."""
+        """Fetch stock.info with retry on rate-limit (empty/tiny response).
+        Raises on 401 — caller treats it as a persistent block."""
         for attempt, delay in enumerate(_RETRY_DELAYS, 1):
-            info = stock.info
-            if len(info) >= 10:          # real response has many keys
-                return info
-            print(f"  [fund] Rate-limited on info (attempt {attempt}), waiting {delay}s...")
-            time.sleep(delay)
-        return stock.info                # return whatever we get on last try
+            try:
+                info = stock.info
+                if len(info) >= 10:
+                    return info
+                print(f"  [fund] Rate-limited on info (attempt {attempt}), waiting {delay}s...")
+                time.sleep(delay)
+            except Exception as e:
+                if _is_auth_err(e):
+                    raise
+                time.sleep(delay)
+        return stock.info   # return whatever we get on last try
 
     def _fetch_qf(stock):
-        """Fetch quarterly_financials with retry."""
-        for attempt, delay in enumerate(_RETRY_DELAYS, 1):
-            try:
-                qf = stock.quarterly_financials
-                if not qf.empty:
-                    return qf
-            except Exception:
-                pass
-            print(f"  [fund] Rate-limited on quarterly_financials (attempt {attempt}), waiting {delay}s...")
-            time.sleep(delay)
-        return stock.quarterly_financials
+        """Fetch quarterly_financials.
+        Empty DataFrame = ticker has no quarterly data (accept it).
+        Only retry on network exceptions, not on empty results."""
+        try:
+            return stock.quarterly_financials
+        except Exception as e:
+            if _is_auth_err(e):
+                raise
+            for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+                print(f"  [fund] Retry quarterly_financials (attempt {attempt}), waiting {delay}s...")
+                time.sleep(delay)
+                try:
+                    return stock.quarterly_financials
+                except Exception as e2:
+                    if _is_auth_err(e2):
+                        raise
+        return pd.DataFrame()
 
     def _fetch_af(stock):
-        """Fetch annual financials with retry."""
-        for attempt, delay in enumerate(_RETRY_DELAYS, 1):
-            try:
-                af = stock.financials
-                if not af.empty:
-                    return af
-            except Exception:
-                pass
-            print(f"  [fund] Rate-limited on financials (attempt {attempt}), waiting {delay}s...")
-            time.sleep(delay)
-        return stock.financials
+        """Fetch annual financials.
+        Empty DataFrame = ticker has no annual data (accept it).
+        Only retry on network exceptions, not on empty results."""
+        try:
+            return stock.financials
+        except Exception as e:
+            if _is_auth_err(e):
+                raise
+            for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+                print(f"  [fund] Retry financials (attempt {attempt}), waiting {delay}s...")
+                time.sleep(delay)
+                try:
+                    return stock.financials
+                except Exception as e2:
+                    if _is_auth_err(e2):
+                        raise
+        return pd.DataFrame()
 
     try:
         sym   = ticker if skip_normalize else normalize_ticker(ticker)
@@ -474,4 +496,7 @@ def fetch_fundamental(ticker: str, skip_normalize: bool = False) -> dict:
         }
 
     except Exception as e:
+        err = str(e)
+        if "401" in err or "Unauthorized" in err or "Invalid Crumb" in err:
+            return {"error": f"Auth block for {ticker}: {e}", "rate_limited": True}
         return {"error": f"Fundamental fetch failed for {ticker}: {e}"}
