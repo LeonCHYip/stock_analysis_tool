@@ -6,6 +6,7 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 import threading
+import concurrent.futures
 import time
 from datetime import datetime, date
 from pathlib import Path
@@ -14,8 +15,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from data_fetcher  import fetch_technical, fetch_fundamental
-from peers_fetcher import get_peer_valuations
+from data_fetcher  import fetch_technical, fetch_fundamental, fetch_technical_bulk
+from peers_fetcher import get_peer_valuations, clear_peer_cache
+import vpn_switcher
 from indicators    import evaluate_all, score_indicators
 from db import (
     init_db, save_results, update_field,
@@ -145,24 +147,48 @@ def load_ticker_list() -> list[str]:
 # Scan thread
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_one(ticker: str, daily_date, weekly_date) -> tuple[dict, dict, dict]:
-    """Run full analysis for one ticker. Returns (tech, fund, peer_data)."""
+# Batch scan settings
+SCAN_BATCH_SIZE     = 100   # tickers per bulk technical download
+SCAN_FUND_WORKERS   = 5     # parallel threads for fundamental + peer fetches
+SCAN_BATCH_COOLDOWN = 10    # seconds to rest between batches
+
+# Mullvad VPN rotation — countries cycled through between batches
+VPN_COUNTRIES = ["us", "nl", "de", "se", "ch", "gb", "ca", "fr"]
+
+
+def _run_one(ticker: str, daily_date, weekly_date, fetch_peers: bool = True) -> tuple[dict, dict, dict]:
+    """Run full analysis for one ticker (used in manual/single-ticker mode)."""
     tech      = fetch_technical(ticker, daily_date, weekly_date)
     if "error" in tech: tech = {}
     fund      = fetch_fundamental(ticker)
     if "error" in fund: fund = {}
-    peer_data = get_peer_valuations(ticker)
+    peer_data = get_peer_valuations(ticker, skip_peers=not fetch_peers)
     return tech, fund, peer_data
 
 
+def _run_fund_and_peers(ticker: str, fetch_peers: bool = True) -> tuple[dict, dict]:
+    """Fetch fundamentals + peer valuations for one ticker (runs in thread pool)."""
+    fund = fetch_fundamental(ticker, skip_normalize=True)
+    if "error" in fund:
+        fund = {}
+    if fetch_peers:
+        time.sleep(0.5)   # brief gap between fund and peer calls to avoid burst
+    peer_data = get_peer_valuations(ticker, skip_peers=not fetch_peers)
+    return fund, peer_data
+
+
 def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
-                     pause_event, stop_event, progress):
+                     pause_event, stop_event, progress,
+                     fetch_peers: bool = True, vpn_rotate: bool = False):
+    clear_peer_cache()   # fresh cache for each scan run
     total = len(tickers)
     progress.update({"total": total, "done": 0, "current": "", "finished": False, "error": None})
 
-    for i, ticker in enumerate(tickers):
+    done = 0
+    for batch_start in range(0, total, SCAN_BATCH_SIZE):
         if stop_event.is_set():
             break
+
         # Pause loop
         while pause_event.is_set():
             progress["paused"] = True
@@ -171,18 +197,47 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                 break
         progress["paused"] = False
 
-        progress["current"] = ticker
-        progress["done"]    = i
+        batch = tickers[batch_start: batch_start + SCAN_BATCH_SIZE]
+        batch_num = batch_start // SCAN_BATCH_SIZE + 1
+        progress["current"] = f"Batch {batch_num}: {batch[0]}…{batch[-1]} (bulk download)"
 
-        try:
-            tech, fund, peer_data = _run_one(ticker, daily_date, weekly_date)
-            indicators = evaluate_all(ticker, tech, fund, peer_data)
-            market_cap = fund.get("market_cap") if fund else None
-            save_results(ticker, indicators, analysis_dt, market_cap)
-        except Exception as ex:
-            pass  # store partial results; errors don't stop scan
+        # ── Step 1: one bulk download for the whole batch ─────────────────────
+        bulk_tech = fetch_technical_bulk(batch, daily_date, weekly_date)
 
-        progress["done"] = i + 1
+        # ── Step 2: parallel fund + peer fetches ──────────────────────────────
+        progress["current"] = f"Batch {batch_num}: {batch[0]}…{batch[-1]} (fund + peers)"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_FUND_WORKERS) as pool:
+            future_map = {pool.submit(_run_fund_and_peers, t, fetch_peers): t for t in batch}
+            for future in concurrent.futures.as_completed(future_map):
+                if stop_event.is_set():
+                    break
+                t = future_map[future]
+                try:
+                    fund, peer_data = future.result()
+                    tech = bulk_tech.get(t, {"error": "Not in bulk data"})
+                    indicators = evaluate_all(t, tech, fund, peer_data)
+                    save_results(t, indicators, analysis_dt, fund.get("market_cap"))
+                except Exception:
+                    pass
+                done += 1
+                progress["done"] = done
+
+        # ── Step 3: cooldown + optional VPN switch ────────────────────────────
+        if batch_start + SCAN_BATCH_SIZE < total and not stop_event.is_set():
+            progress["current"] = f"Cooldown {SCAN_BATCH_COOLDOWN}s before next batch…"
+            for _ in range(SCAN_BATCH_COOLDOWN * 10):
+                if stop_event.is_set():
+                    break
+                time.sleep(0.1)
+
+            if vpn_rotate and not stop_event.is_set():
+                batch_num = batch_start // SCAN_BATCH_SIZE + 1
+                country = VPN_COUNTRIES[batch_num % len(VPN_COUNTRIES)]
+                progress["current"] = f"Switching VPN to {country.upper()}…"
+                vpn_switcher.switch_server(
+                    country,
+                    log=lambda msg: progress.update({"current": msg}),
+                )
 
     progress["finished"] = True
     progress["current"]  = ""
@@ -588,6 +643,9 @@ def render_detail_for_tickers(tickers: list[str], detail_map: dict,
                     else:
                         grade = "PARTIAL"
                     ind_result = {"pass": grade}
+                elif "Result" in detail:
+                    # F5/F6 store grade directly (no sub_checks)
+                    ind_result = {"pass": detail["Result"]}
 
             renderer(ticker, ind_result, detail)
 
@@ -652,6 +710,20 @@ with st.sidebar:
     daily_date_input  = st.date_input("Latest Date for Daily",  value=None, key="daily_date")
     weekly_date_input = st.date_input("Latest Date for Weekly", value=None, key="weekly_date")
 
+    fetch_peers_cb = st.checkbox(
+        "Fetch peer valuations (F5 & F6)",
+        value=True,
+        key="fetch_peers",
+        help="Uncheck to skip peer API calls. F5 & F6 will show N/A.",
+    )
+
+    vpn_rotate_cb = st.checkbox(
+        "Switch Mullvad VPN between batches",
+        value=True,
+        key="vpn_rotate",
+        help="Rotates Mullvad server after each batch to avoid rate limiting. Requires Mullvad CLI.",
+    )
+
     run_btn  = st.button("▶ Run Analysis", type="primary", use_container_width=True)
     st.divider()
 
@@ -700,6 +772,8 @@ if run_btn:
     daily_str  = str(daily_date_input)  if daily_date_input  else None
     weekly_str = str(weekly_date_input) if weekly_date_input else None
     analysis_dt = _now_cst()
+    fetch_peers = st.session_state.get("fetch_peers", True)
+    vpn_rotate  = st.session_state.get("vpn_rotate",  False)
 
     if raw:
         # Manual ticker mode
@@ -713,7 +787,7 @@ if run_btn:
         with st.spinner(f"Analyzing {len(tickers)} ticker(s)…"):
             for ticker in tickers:
                 prog_ph.info(f"**{ticker}** — fetching data…")
-                tech, fund, peer_data = _run_one(ticker, daily_str, weekly_str)
+                tech, fund, peer_data = _run_one(ticker, daily_str, weekly_str, fetch_peers)
                 indicators = evaluate_all(ticker, tech, fund, peer_data)
                 market_cap = fund.get("market_cap") if fund else None
                 save_results(ticker, indicators, analysis_dt, market_cap)
@@ -755,7 +829,7 @@ if run_btn:
             t = threading.Thread(
                 target=scan_thread_func,
                 args=(ticker_list, analysis_dt, daily_str, weekly_str,
-                      pause_event, stop_event, progress),
+                      pause_event, stop_event, progress, fetch_peers, vpn_rotate),
                 daemon=True,
             )
             st.session_state.scan_thread = t
@@ -875,11 +949,21 @@ with tab_history:
     with fcol3:
         all_show_sub = st.checkbox("Show sub-indicators", value=False, key="all_queries_show_sub")
 
-    f_pass_inds = st.multiselect(
-        "Must PASS these indicators (filters rows):",
-        options=MAIN_IND_COLS,
-        key="hist_f_pass_inds",
-    )
+    pcol1, pcol2 = st.columns([2, 1])
+    with pcol1:
+        f_pass_inds = st.multiselect(
+            "Must PASS these indicators (filters rows):",
+            options=MAIN_IND_COLS,
+            key="hist_f_pass_inds",
+        )
+    with pcol2:
+        pass_mode = st.radio(
+            "Show tickers where:",
+            ["PASS or N/A", "PASS only", "N/A only"],
+            horizontal=False,
+            key="hist_pass_mode",
+            disabled=not f_pass_inds,
+        )
 
     # Fetch filtered rows
     filt_rows = get_all_summaries(
@@ -887,11 +971,17 @@ with tab_history:
         datetimes = f_dts     if f_dts     else None,
     )
 
-    # Apply PASS filter — keep only rows where all selected indicators are PASS or NA
+    # Apply indicator filter
     if f_pass_inds:
+        if pass_mode == "PASS only":
+            accepted = {"PASS"}
+        elif pass_mode == "N/A only":
+            accepted = {"NA"}
+        else:
+            accepted = {"PASS", "NA"}
         filt_rows = [
             r for r in filt_rows
-            if all(str(r.get(ind, "NA")).upper() in ("PASS", "NA") for ind in f_pass_inds)
+            if all(str(r.get(ind, "NA")).upper() in accepted for ind in f_pass_inds)
         ]
 
     all_df = build_summary_df(filt_rows, show_sub=all_show_sub, include_datetime=True)

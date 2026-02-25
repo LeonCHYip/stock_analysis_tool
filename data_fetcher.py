@@ -11,6 +11,7 @@ Changes from previous version:
 """
 
 from __future__ import annotations
+import time
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -109,23 +110,14 @@ def _compare_averages(frame: pd.DataFrame, bars_back: int,
 # Technical data
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_technical(ticker: str,
-                    daily_latest_date=None,
-                    weekly_latest_date=None) -> dict:
+def _compute_technical(ticker: str, data: pd.DataFrame,
+                        daily_latest_date=None,
+                        weekly_latest_date=None) -> dict:
     """
-    3 years of daily OHLCV → technical indicators.
-    daily_latest_date / weekly_latest_date: str 'YYYY-MM-DD' or None.
-    When provided, data is truncated to that date before computing indicators,
-    so incomplete day/week doesn't skew results.
+    Compute technical indicators from a pre-downloaded OHLCV DataFrame.
+    Used by both fetch_technical (single ticker) and fetch_technical_bulk (batch).
     """
     try:
-        sym   = normalize_ticker(ticker)
-        stock = yf.Ticker(sym)
-        data  = stock.history(period="3y", interval="1d", auto_adjust=False)
-
-        if data.empty:
-            return {"error": f"No price data for {ticker}"}
-
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
@@ -165,10 +157,9 @@ def fetch_technical(ticker: str,
         if weekly_latest_date:
             df_weekly = df_weekly.loc[:weekly_latest_date]
 
-        # Use the cutoff-aware dataframe for latest bar
         latest = df_daily.iloc[-1] if not df_daily.empty else df.iloc[-1]
 
-        # MA alignment (always from full df, cutoff-aware for latest bar)
+        # MA alignment
         ma = {
             "MA10":  _safe(latest.get("SMA10"),  2),
             "MA20":  _safe(latest.get("SMA20"),  2),
@@ -221,7 +212,7 @@ def fetch_technical(ticker: str,
             (big_up_events if pct >= 10 else big_down_events).append(event)
 
         return {
-            "ticker":          sym,
+            "ticker":          ticker,
             "date":            str(latest.name.date()),
             "close":           _safe(latest["Close"], 2),
             "volume":          _safe(latest["Volume"], as_int=True),
@@ -236,7 +227,85 @@ def fetch_technical(ticker: str,
         }
 
     except Exception as e:
+        return {"error": f"Technical compute failed for {ticker}: {e}"}
+
+
+def fetch_technical(ticker: str,
+                    daily_latest_date=None,
+                    weekly_latest_date=None) -> dict:
+    """
+    3 years of daily OHLCV → technical indicators (single ticker).
+    daily_latest_date / weekly_latest_date: str 'YYYY-MM-DD' or None.
+    """
+    try:
+        sym   = normalize_ticker(ticker)
+        stock = yf.Ticker(sym)
+        data  = stock.history(period="3y", interval="1d", auto_adjust=False)
+
+        if data.empty:
+            return {"error": f"No price data for {ticker}"}
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        missing  = [c for c in required if c not in data.columns]
+        if missing:
+            return {"error": f"Missing columns: {missing}"}
+
+        return _compute_technical(sym, data, daily_latest_date, weekly_latest_date)
+
+    except Exception as e:
         return {"error": f"Technical fetch failed for {ticker}: {e}"}
+
+
+def fetch_technical_bulk(tickers: list[str],
+                         daily_latest_date=None,
+                         weekly_latest_date=None) -> dict:
+    """
+    Download 3 years of daily OHLCV for all tickers in ONE request,
+    then compute technical indicators for each.
+    Returns {ticker: tech_result_dict}.
+    Skips normalize_ticker — intended for scan mode (US tickers only).
+    """
+    try:
+        raw = yf.download(
+            tickers=tickers,
+            period="3y",
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+            progress=False,
+        )
+    except Exception as e:
+        print(f"  [bulk_tech] Download failed: {e}")
+        return {t: {"error": f"Bulk download failed: {e}"} for t in tickers}
+
+    is_multi = isinstance(raw.columns, pd.MultiIndex)
+    results  = {}
+
+    for ticker in tickers:
+        try:
+            if is_multi:
+                if ticker not in raw.columns.get_level_values(0):
+                    results[ticker] = {"error": f"No bulk data for {ticker}"}
+                    continue
+                df = raw[ticker].copy()
+            else:
+                # Single-ticker download returns flat columns
+                df = raw.copy()
+
+            if df.empty or df["Close"].isna().all():
+                results[ticker] = {"error": f"No price data for {ticker}"}
+                continue
+
+            results[ticker] = _compute_technical(
+                ticker, df, daily_latest_date, weekly_latest_date
+            )
+        except Exception as e:
+            results[ticker] = {"error": f"Technical compute failed for {ticker}: {e}"}
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,7 +339,7 @@ def _yoy_from_frame(frame, row) -> float | None:
         return None
 
 
-def fetch_fundamental(ticker: str) -> dict:
+def fetch_fundamental(ticker: str, skip_normalize: bool = False) -> dict:
     """
     Fundamental metrics via yfinance.
 
@@ -283,14 +352,55 @@ def fetch_fundamental(ticker: str) -> dict:
       Same approach: tries info fields (revenueGrowth is quarterly, no direct
       annual equivalent in info), so always computed from financials.
       Records source and fiscal year end date.
-    """
-    try:
-        sym   = normalize_ticker(ticker)
-        stock = yf.Ticker(sym)
-        info  = stock.info
 
-        qf = stock.quarterly_financials   # newest quarter = col 0
-        af = stock.financials             # newest year    = col 0
+    skip_normalize: set True in scan mode (US-only tickers) to avoid extra
+      yf.Ticker().history() calls inside normalize_ticker.
+    """
+    _RETRY_DELAYS = [5, 10, 20]
+
+    def _fetch_info(stock):
+        """Fetch stock.info with retry on rate-limit (empty/tiny response)."""
+        for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+            info = stock.info
+            if len(info) >= 10:          # real response has many keys
+                return info
+            print(f"  [fund] Rate-limited on info (attempt {attempt}), waiting {delay}s...")
+            time.sleep(delay)
+        return stock.info                # return whatever we get on last try
+
+    def _fetch_qf(stock):
+        """Fetch quarterly_financials with retry."""
+        for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+            try:
+                qf = stock.quarterly_financials
+                if not qf.empty:
+                    return qf
+            except Exception:
+                pass
+            print(f"  [fund] Rate-limited on quarterly_financials (attempt {attempt}), waiting {delay}s...")
+            time.sleep(delay)
+        return stock.quarterly_financials
+
+    def _fetch_af(stock):
+        """Fetch annual financials with retry."""
+        for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+            try:
+                af = stock.financials
+                if not af.empty:
+                    return af
+            except Exception:
+                pass
+            print(f"  [fund] Rate-limited on financials (attempt {attempt}), waiting {delay}s...")
+            time.sleep(delay)
+        return stock.financials
+
+    try:
+        sym   = ticker if skip_normalize else normalize_ticker(ticker)
+        stock = yf.Ticker(sym)
+        info  = _fetch_info(stock)
+
+        qf = _fetch_qf(stock)   # newest quarter = col 0
+        af = _fetch_af(stock)   # newest year    = col 0
 
         def _get(frame, row, col_idx=0):
             try:

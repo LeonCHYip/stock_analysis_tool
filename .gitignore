@@ -7,6 +7,8 @@ __pycache__/
 # Databases (Local data stays local)
 *.db
 *.sqlite3
+*.db-wal
+*.db-shm
 
 # Environments (If you ever create a .venv)
 .venv/

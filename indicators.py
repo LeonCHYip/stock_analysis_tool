@@ -271,6 +271,7 @@ def indicator_f5(fund: dict, peer_data: dict) -> dict:
         pct_diff = round((fpe - median) / abs(median) * 100, 2) if median else None
 
     detail = {
+        "Result":                result,
         "Ticker Fwd PE":         fpe,
         "Peer Median Fwd PE":    median,
         "Ticker vs Median %":    pct_diff,
@@ -299,6 +300,7 @@ def indicator_f6(fund: dict, peer_data: dict) -> dict:
         pct_diff = round((pb - median) / abs(median) * 100, 2) if median else None
 
     detail = {
+        "Result":              result,
         "Ticker P/B":          pb,
         "Peer Median P/B":     median,
         "Ticker vs Median %":  pct_diff,
