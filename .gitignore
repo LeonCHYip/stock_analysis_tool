@@ -3,12 +3,16 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py[cod]
+*$py.class
 
 # Databases (Local data stays local)
 *.db
 *.sqlite3
 *.db-wal
 *.db-shm
+*.duckdb
+*.duckdb.wal
 
 # Environments (If you ever create a .venv)
 .venv/
@@ -27,3 +31,12 @@ Thumbs.db
 
 # Optional: User-specific configuration
 .env
+
+# Logs
+*.log
+
+# Claude / AI tool artifacts
+.claude/
+
+# Chat exports / transcripts
+chat_export_*.md
