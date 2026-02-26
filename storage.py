@@ -349,6 +349,29 @@ def get_tech_for_ticker(ticker: str, as_of_date: str | None = None) -> dict | No
     return dict(zip(cols, row))
 
 
+def get_tech_for_tickers(tickers: list[str]) -> dict[str, dict]:
+    """Batch-fetch the latest tech_indicators row for each ticker in `tickers`."""
+    if not tickers:
+        return {}
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    rows = con.execute(
+        f"SELECT t.* FROM tech_indicators t "
+        f"INNER JOIN ("
+        f"  SELECT ticker, MAX(as_of_date) AS d "
+        f"  FROM tech_indicators WHERE ticker IN ({placeholders}) GROUP BY ticker"
+        f") latest ON t.ticker = latest.ticker AND t.as_of_date = latest.d",
+        tickers,
+    ).fetchall()
+    if not rows:
+        return {}
+    cols = [d[0] for d in con.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'tech_indicators' ORDER BY ordinal_position"
+    ).fetchall()]
+    return {dict(zip(cols, r))["ticker"]: dict(zip(cols, r)) for r in rows}
+
+
 # ── Fundamentals ──────────────────────────────────────────────────────────────
 
 def save_fundamental(ticker: str, fetch_date: str, fields: dict) -> None:

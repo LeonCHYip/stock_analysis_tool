@@ -29,7 +29,7 @@ from storage import (
     get_detail_filtered, get_all_tickers,
     get_datetimes_for_ticker, get_tickers_for_datetime,
     get_cached_peer_valuations, save_peer_valuations,
-    get_all_fundamentals_for_run,
+    get_all_fundamentals_for_run, get_tech_for_tickers,
     MAIN_IND_COLS, ALL_SUB_COLS, SUB_COLS,
 )
 
@@ -47,6 +47,7 @@ TICKERS_FILE = Path(__file__).parent / "tickers.txt"
 
 # ── Value table column groups ──────────────────────────────────────────────────
 VALUE_COL_GROUPS: dict[str, list[str]] = {
+    # ── Indicator-derived groups (from analysis detail JSON) ──────────────────
     "Price & Volume — Daily (T1)": [
         "3M Daily Px%", "3M Daily Vol%", "12M Daily Px%", "12M Daily Vol%",
     ],
@@ -63,20 +64,136 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "# Up≥10%", "# Dn≥10%",
     ],
     "Quarterly (F1/F3)": [
-        "Q Rev", "Q EPS", "Q Rev YoY%", "Q EPS YoY%",
+        "Q Rev", "Q EPS", "Q End Date", "Q Rev YoY%", "Q EPS YoY%",
     ],
     "Annual (F2/F4)": [
-        "A Rev", "A EPS", "A Rev YoY%", "A EPS YoY%",
+        "A Rev", "A EPS", "A End Date", "A Rev YoY%", "A EPS YoY%",
     ],
     "Valuation (F5/F6)": [
         "Fwd PE", "Fwd PE vs Med%", "P/B", "P/B vs Med%",
     ],
     "Fundamentals": [
-        "Mkt Cap", "Sector", "Industry",
+        "Mkt Cap ($B)", "Sector", "Industry",
+    ],
+    # ── tech_indicators groups ─────────────────────────────────────────────────
+    "Price & 52W": [
+        "Close", "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
+    ],
+    "EMA & Slope": [
+        "EMA9", "EMA21", "EMA50", "EMA200", "SMA50 Slope 20D", "From SMA200%",
+    ],
+    "Momentum": [
+        "RSI14", "MACD Line", "MACD Signal", "MACD Hist", "Stoch K", "Stoch D",
+    ],
+    "Bollinger Bands": [
+        "BB Upper", "BB Middle", "BB Lower", "BB %B",
+    ],
+    "Volatility": [
+        "ATR14", "ATR%", "ADX14", "+DI", "-DI", "RVol 20D%", "RVol 60D%",
+    ],
+    "Drawdown": [
+        "Max DD 63D%", "Max DD 252D%",
+    ],
+    "Volume": [
+        "OBV", "CMF20", "AD Line", "Avg $Vol 20D", "Avg $Vol 50D", "Med Vol 50D",
+    ],
+    "Donchian": [
+        "Don High 20", "Don Low 20", "Don High 55", "Don Low 55",
+        "Don High 252", "Don Low 252",
+        "From 20D High%", "From 55D High%", "From 252D High%",
+        "Breakout 55D", "Breakout 3M",
+    ],
+    "Rolling Stats 3M": [
+        "Up Days 3M", "Down Days 3M", "UD Ratio 3M", "Max Win Str 3M", "Win Str 5% 3M",
+    ],
+    "Rolling Stats 1Y": [
+        "Up Days 1Y", "Down Days 1Y", "UD Ratio 1Y", "Max Win Str 1Y", "Win Str 5% 1Y",
+    ],
+    "Gap Stats": [
+        "Gap Rate 60D%", "Max Gap 60D%",
+    ],
+    "Big Moves 90D": [
+        "# Big Up 90D", "# Big Down 90D",
     ],
 }
+
+# tech_indicators column name → display column name
+TECH_COL_MAP: dict[str, str] = {
+    "close":               "Close",
+    "high_52w":            "52W High",
+    "low_52w":             "52W Low",
+    "pct_from_52w_high":   "From 52W High%",
+    "pct_from_52w_low":    "From 52W Low%",
+    "pos_52w_pct":         "52W Pos%",
+    "ema9":                "EMA9",
+    "ema21":               "EMA21",
+    "ema50_e":             "EMA50",
+    "ema200":              "EMA200",
+    "sma50_slope_20d":     "SMA50 Slope 20D",
+    "pct_from_sma200":     "From SMA200%",
+    "rsi14":               "RSI14",
+    "macd_line":           "MACD Line",
+    "macd_signal":         "MACD Signal",
+    "macd_hist":           "MACD Hist",
+    "stoch_k":             "Stoch K",
+    "stoch_d":             "Stoch D",
+    "bb_upper":            "BB Upper",
+    "bb_middle":           "BB Middle",
+    "bb_lower":            "BB Lower",
+    "bb_pct_b":            "BB %B",
+    "atr14":               "ATR14",
+    "atr_pct":             "ATR%",
+    "adx14":               "ADX14",
+    "plus_di":             "+DI",
+    "minus_di":            "-DI",
+    "realized_vol_20d":    "RVol 20D%",
+    "realized_vol_60d":    "RVol 60D%",
+    "max_drawdown_63d":    "Max DD 63D%",
+    "max_drawdown_252d":   "Max DD 252D%",
+    "obv":                 "OBV",
+    "cmf20":               "CMF20",
+    "ad_line":             "AD Line",
+    "avg_dollar_vol_20d":  "Avg $Vol 20D",
+    "avg_dollar_vol_50d":  "Avg $Vol 50D",
+    "median_volume_50d":   "Med Vol 50D",
+    "donchian_high_20":    "Don High 20",
+    "donchian_low_20":     "Don Low 20",
+    "donchian_high_55":    "Don High 55",
+    "donchian_low_55":     "Don Low 55",
+    "donchian_high_252":   "Don High 252",
+    "donchian_low_252":    "Don Low 252",
+    "pct_from_20d_high":   "From 20D High%",
+    "pct_from_55d_high":   "From 55D High%",
+    "pct_from_252d_high":  "From 252D High%",
+    "breakout_55d_high":   "Breakout 55D",
+    "breakout_3m_high":    "Breakout 3M",
+    "up_days_3m":          "Up Days 3M",
+    "down_days_3m":        "Down Days 3M",
+    "up_down_ratio_3m":    "UD Ratio 3M",
+    "max_win_streak_3m":   "Max Win Str 3M",
+    "win_streaks_5p_3m":   "Win Str 5% 3M",
+    "up_days_1y":          "Up Days 1Y",
+    "down_days_1y":        "Down Days 1Y",
+    "up_down_ratio_1y":    "UD Ratio 1Y",
+    "max_win_streak_1y":   "Max Win Str 1Y",
+    "win_streaks_5p_1y":   "Win Str 5% 1Y",
+    "gap_rate_60d":        "Gap Rate 60D%",
+    "max_gap_60d":         "Max Gap 60D%",
+}
+# Reverse map: display name → tech_indicators field
+TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
+
+# Columns from tech_indicators that are boolean (rendered as ✅/❌)
+TECH_BOOL_COLS = {"Breakout 55D", "Breakout 3M"}
+
+# Default groups shown on load (indicator-derived groups only)
+DEFAULT_VALUE_GROUPS = [
+    "Price & Volume — Daily (T1)", "Price & Volume — Weekly (T2)",
+    "MA Checks (T3)", "MA Values (T3)", "Big Moves 90d (T4)",
+    "Quarterly (F1/F3)", "Annual (F2/F4)", "Valuation (F5/F6)", "Fundamentals",
+]
+
 ALL_VALUE_COLS = [c for cols in VALUE_COL_GROUPS.values() for c in cols]
-DEFAULT_VALUE_GROUPS = list(VALUE_COL_GROUPS.keys())
 
 # Sub-indicator display labels (for column headers)
 SUB_DISPLAY = {
@@ -170,9 +287,63 @@ def _price_list(lst) -> str:
 def _now_cst() -> str:
     return datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S CST")
 
+def _f(v) -> float | None:
+    """Convert to float for native sorting; None if missing."""
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
 
-def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict) -> dict:
-    """Build one value-table row from indicator detail JSON + DB fundamentals."""
+def _mkt_cap_b(v) -> float | None:
+    """Market cap in billions (2 dp) for readable display without clicking."""
+    f = _f(v)
+    return round(f / 1e9, 2) if f is not None else None
+
+def _parse_raw_info(f_db: dict) -> dict:
+    rij = f_db.get("raw_info_json")
+    if not rij:
+        return {}
+    try:
+        return json.loads(rij)
+    except Exception:
+        return {}
+
+def _extract_si(fund_map: dict) -> dict[str, tuple[str, str]]:
+    """Extract {ticker: (sector, industry)} from a fund_map dict."""
+    result: dict[str, tuple[str, str]] = {}
+    for ticker, f_db in fund_map.items():
+        raw_info = _parse_raw_info(f_db)
+        result[ticker] = (
+            raw_info.get("sector") or "N/A",
+            raw_info.get("industry") or "N/A",
+        )
+    return result
+
+def _extract_ne(fund_map: dict) -> dict[str, str]:
+    """Extract {ticker: next_earnings_date_str} from a fund_map dict."""
+    from datetime import timezone
+    result: dict[str, str] = {}
+    for ticker, f_db in fund_map.items():
+        raw_info = _parse_raw_info(f_db)
+        v = raw_info.get("earningsDate") or raw_info.get("earningsTimestamp")
+        if v is None:
+            result[ticker] = "N/A"
+            continue
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if v is None:
+            result[ticker] = "N/A"
+            continue
+        try:
+            result[ticker] = datetime.fromtimestamp(float(v), tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            result[ticker] = "N/A"
+    return result
+
+
+def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
+                        tech: dict | None = None) -> dict:
+    """Build one value-table row. Numeric columns are native float for correct sorting."""
     t1 = detail.get("T1", {})
     t2 = detail.get("T2", {})
     t3 = detail.get("T3", {})
@@ -184,66 +355,152 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict) -> dic
     f5 = detail.get("F5", {})
     f6 = detail.get("F6", {})
     sub3 = t3.get("sub_checks", {})
-
-    raw_info = {}
-    rij = f_db.get("raw_info_json")
-    if rij:
-        try:
-            raw_info = json.loads(rij)
-        except Exception:
-            pass
+    tc = tech or {}
+    raw_info = _parse_raw_info(f_db)
 
     def _bi(v):  # bool → icon
         if v is True:  return "✅"
         if v is False: return "❌"
         return "⚪️"
 
-    return {
+    def _big_count(json_str) -> int | None:
+        if not json_str:
+            return None
+        try:
+            events = json.loads(json_str)
+            return len(events) if isinstance(events, list) else None
+        except Exception:
+            return None
+
+    def _next_earnings(info: dict) -> str:
+        v = info.get("earningsDate") or info.get("earningsTimestamp")
+        if v is None:
+            return "N/A"
+        # yfinance returns a list of epoch timestamps or a single timestamp
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if v is None:
+            return "N/A"
+        try:
+            from datetime import timezone
+            return datetime.fromtimestamp(float(v), tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            return str(v)
+
+    rec = {
         "Ticker":          ticker,
-        # T1 — daily comparisons
-        "3M Daily Px%":   _pct(t1.get("3M Price Change %")),
-        "3M Daily Vol%":  _pct(t1.get("3M Volume Change %")),
-        "12M Daily Px%":  _pct(t1.get("12M Price Change %")),
-        "12M Daily Vol%": _pct(t1.get("12M Volume Change %")),
-        # T2 — weekly comparisons
-        "3M Wkly Px%":    _pct(t2.get("3M Price Change %")),
-        "3M Wkly Vol%":   _pct(t2.get("3M Volume Change %")),
-        "12M Wkly Px%":   _pct(t2.get("12M Price Change %")),
-        "12M Wkly Vol%":  _pct(t2.get("12M Volume Change %")),
+        # T1 — daily comparisons (float %)
+        "3M Daily Px%":   _f(t1.get("3M Price Change %")),
+        "3M Daily Vol%":  _f(t1.get("3M Volume Change %")),
+        "12M Daily Px%":  _f(t1.get("12M Price Change %")),
+        "12M Daily Vol%": _f(t1.get("12M Volume Change %")),
+        # T2 — weekly comparisons (float %)
+        "3M Wkly Px%":    _f(t2.get("3M Price Change %")),
+        "3M Wkly Vol%":   _f(t2.get("3M Volume Change %")),
+        "12M Wkly Px%":   _f(t2.get("12M Price Change %")),
+        "12M Wkly Vol%":  _f(t2.get("12M Volume Change %")),
         # T3 — MA booleans
         "MA10>20":        _bi(sub3.get("MA10>MA20")),
         "MA20>50":        _bi(sub3.get("MA20>MA50")),
         "MA50>150":       _bi(sub3.get("MA50>MA150")),
         "MA150>200":      _bi(sub3.get("MA150>MA200")),
-        # T3 — MA values
-        "MA10":           _num(t3.get("MA10")),
-        "MA20":           _num(t3.get("MA20")),
-        "MA50":           _num(t3.get("MA50")),
-        "MA150":          _num(t3.get("MA150")),
-        "MA200":          _num(t3.get("MA200")),
-        # T4 — big move counts
-        "# Up≥10%":       t4.get("Big Up Days Count", "N/A"),
-        "# Dn≥10%":       t4.get("Big Down Days Count", "N/A"),
-        # F1/F3 — quarterly
-        "Q Rev":          _millify(f1.get("Q Revenue") or f_db.get("q_revenue")),
-        "Q EPS":          _num(f1.get("Q EPS") or f_db.get("q_eps")),
-        "Q Rev YoY%":     _pct(f3.get("Q Revenue YoY %") or f_db.get("q_rev_yoy")),
-        "Q EPS YoY%":     _pct(f3.get("Q EPS YoY %") or f_db.get("q_eps_yoy")),
-        # F2/F4 — annual
-        "A Rev":          _millify(f2.get("Annual Revenue") or f_db.get("a_revenue")),
-        "A EPS":          _num(f2.get("Annual EPS") or f_db.get("a_eps")),
-        "A Rev YoY%":     _pct(f4.get("Annual Revenue YoY %") or f_db.get("a_rev_yoy")),
-        "A EPS YoY%":     _pct(f4.get("Annual EPS YoY %") or f_db.get("a_eps_yoy")),
-        # F5/F6 — valuation vs peers
-        "Fwd PE":         _num(f5.get("Ticker Fwd PE") or f_db.get("forward_pe")),
-        "Fwd PE vs Med%": _pct(f5.get("Ticker vs Median %")),
-        "P/B":            _num(f6.get("Ticker P/B") or f_db.get("pb_ratio")),
-        "P/B vs Med%":    _pct(f6.get("Ticker vs Median %")),
+        # T3 — MA values (float)
+        "MA10":           _f(t3.get("MA10")),
+        "MA20":           _f(t3.get("MA20")),
+        "MA50":           _f(t3.get("MA50")),
+        "MA150":          _f(t3.get("MA150")),
+        "MA200":          _f(t3.get("MA200")),
+        # T4 — big move counts (int)
+        "# Up≥10%":       t4.get("Big Up Days Count"),
+        "# Dn≥10%":       t4.get("Big Down Days Count"),
+        # F1/F3 — quarterly (float)
+        "Q Rev":          _f(f1.get("Q Revenue") or f_db.get("q_revenue")),
+        "Q EPS":          _f(f1.get("Q EPS") or f_db.get("q_eps")),
+        "Q End Date":     f_db.get("q_end_date") or "N/A",
+        "Q Rev YoY%":     _f(f3.get("Q Revenue YoY %") or f_db.get("q_rev_yoy")),
+        "Q EPS YoY%":     _f(f3.get("Q EPS YoY %") or f_db.get("q_eps_yoy")),
+        # F2/F4 — annual (float)
+        "A Rev":          _f(f2.get("Annual Revenue") or f_db.get("a_revenue")),
+        "A EPS":          _f(f2.get("Annual EPS") or f_db.get("a_eps")),
+        "A End Date":     f_db.get("a_end_date") or "N/A",
+        "A Rev YoY%":     _f(f4.get("Annual Revenue YoY %") or f_db.get("a_rev_yoy")),
+        "A EPS YoY%":     _f(f4.get("Annual EPS YoY %") or f_db.get("a_eps_yoy")),
+        # F5/F6 — valuation vs peers (float)
+        "Fwd PE":         _f(f5.get("Ticker Fwd PE") or f_db.get("forward_pe")),
+        "Fwd PE vs Med%": _f(f5.get("Ticker vs Median %")),
+        "P/B":            _f(f6.get("Ticker P/B") or f_db.get("pb_ratio")),
+        "P/B vs Med%":    _f(f6.get("Ticker vs Median %")),
         # Fundamentals
-        "Mkt Cap":        _millify(row.get("market_cap") or f_db.get("market_cap")),
-        "Sector":         raw_info.get("sector") or f_db.get("sector") or "N/A",
-        "Industry":       raw_info.get("industry") or f_db.get("industry") or "N/A",
+        "Mkt Cap ($B)":   _mkt_cap_b(row.get("market_cap") or f_db.get("market_cap")),
+        "Sector":         raw_info.get("sector") or "N/A",
+        "Industry":       raw_info.get("industry") or "N/A",
+        # Next earnings
+        "Next Earnings Date": _next_earnings(raw_info),
+        # ── tech_indicators columns ───────────────────────────────────────────
+        "Close":           _f(tc.get("close")),
+        "52W High":        _f(tc.get("high_52w")),
+        "52W Low":         _f(tc.get("low_52w")),
+        "From 52W High%":  _f(tc.get("pct_from_52w_high")),
+        "From 52W Low%":   _f(tc.get("pct_from_52w_low")),
+        "52W Pos%":        _f(tc.get("pos_52w_pct")),
+        "EMA9":            _f(tc.get("ema9")),
+        "EMA21":           _f(tc.get("ema21")),
+        "EMA50":           _f(tc.get("ema50_e")),
+        "EMA200":          _f(tc.get("ema200")),
+        "SMA50 Slope 20D": _f(tc.get("sma50_slope_20d")),
+        "From SMA200%":    _f(tc.get("pct_from_sma200")),
+        "RSI14":           _f(tc.get("rsi14")),
+        "MACD Line":       _f(tc.get("macd_line")),
+        "MACD Signal":     _f(tc.get("macd_signal")),
+        "MACD Hist":       _f(tc.get("macd_hist")),
+        "Stoch K":         _f(tc.get("stoch_k")),
+        "Stoch D":         _f(tc.get("stoch_d")),
+        "BB Upper":        _f(tc.get("bb_upper")),
+        "BB Middle":       _f(tc.get("bb_middle")),
+        "BB Lower":        _f(tc.get("bb_lower")),
+        "BB %B":           _f(tc.get("bb_pct_b")),
+        "ATR14":           _f(tc.get("atr14")),
+        "ATR%":            _f(tc.get("atr_pct")),
+        "ADX14":           _f(tc.get("adx14")),
+        "+DI":             _f(tc.get("plus_di")),
+        "-DI":             _f(tc.get("minus_di")),
+        "RVol 20D%":       _f(tc.get("realized_vol_20d")),
+        "RVol 60D%":       _f(tc.get("realized_vol_60d")),
+        "Max DD 63D%":     _f(tc.get("max_drawdown_63d")),
+        "Max DD 252D%":    _f(tc.get("max_drawdown_252d")),
+        "OBV":             _f(tc.get("obv")),
+        "CMF20":           _f(tc.get("cmf20")),
+        "AD Line":         _f(tc.get("ad_line")),
+        "Avg $Vol 20D":    _f(tc.get("avg_dollar_vol_20d")),
+        "Avg $Vol 50D":    _f(tc.get("avg_dollar_vol_50d")),
+        "Med Vol 50D":     _f(tc.get("median_volume_50d")),
+        "Don High 20":     _f(tc.get("donchian_high_20")),
+        "Don Low 20":      _f(tc.get("donchian_low_20")),
+        "Don High 55":     _f(tc.get("donchian_high_55")),
+        "Don Low 55":      _f(tc.get("donchian_low_55")),
+        "Don High 252":    _f(tc.get("donchian_high_252")),
+        "Don Low 252":     _f(tc.get("donchian_low_252")),
+        "From 20D High%":  _f(tc.get("pct_from_20d_high")),
+        "From 55D High%":  _f(tc.get("pct_from_55d_high")),
+        "From 252D High%": _f(tc.get("pct_from_252d_high")),
+        "Breakout 55D":    _bi(tc.get("breakout_55d_high")),
+        "Breakout 3M":     _bi(tc.get("breakout_3m_high")),
+        "Up Days 3M":      tc.get("up_days_3m"),
+        "Down Days 3M":    tc.get("down_days_3m"),
+        "UD Ratio 3M":     _f(tc.get("up_down_ratio_3m")),
+        "Max Win Str 3M":  tc.get("max_win_streak_3m"),
+        "Win Str 5% 3M":   tc.get("win_streaks_5p_3m"),
+        "Up Days 1Y":      tc.get("up_days_1y"),
+        "Down Days 1Y":    tc.get("down_days_1y"),
+        "UD Ratio 1Y":     _f(tc.get("up_down_ratio_1y")),
+        "Max Win Str 1Y":  tc.get("max_win_streak_1y"),
+        "Win Str 5% 1Y":   tc.get("win_streaks_5p_1y"),
+        "Gap Rate 60D%":   _f(tc.get("gap_rate_60d")),
+        "Max Gap 60D%":    _f(tc.get("max_gap_60d")),
+        "# Big Up 90D":    _big_count(tc.get("big_up_events_90d")),
+        "# Big Down 90D":  _big_count(tc.get("big_down_events_90d")),
     }
+    return rec
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -441,18 +698,20 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
 def build_summary_df(rows: list[dict],
                      show_sub: bool = False,
                      selected_inds: list[str] | None = None,
-                     include_datetime: bool = False) -> pd.DataFrame:
+                     include_datetime: bool = False,
+                     si_map: dict | None = None,
+                     ne_map: dict | None = None) -> pd.DataFrame:
     """
     Build the indicator summary DataFrame.
-    rows: list of DB dicts (from get_summary_for_run / get_all_summaries)
-    show_sub: whether to include sub-indicator columns
-    selected_inds: if set, only include these main indicator columns
-    include_datetime: add Datetime column (for All Queries tab)
+    si_map: {ticker: (sector, industry)}
+    ne_map: {ticker: next_earnings_date_str}
     """
     if not rows:
         return pd.DataFrame()
 
     inds_to_show = selected_inds if selected_inds else MAIN_IND_COLS
+    si = si_map or {}
+    ne = ne_map or {}
 
     records = []
     for r in rows:
@@ -470,6 +729,15 @@ def build_summary_df(rows: list[dict],
                     rec[SUB_DISPLAY.get(sc, sc)] = _e(r.get(sc, "NA"))
 
         rec["Comments"] = r.get("comments") or ""
+
+        # Rightmost: Mkt Cap, Sector, Industry, Next Earnings
+        ticker = r.get("ticker", "")
+        rec["Mkt Cap ($B)"] = _mkt_cap_b(r.get("market_cap"))
+        sector, industry = si.get(ticker, ("N/A", "N/A"))
+        rec["Sector"]         = sector
+        rec["Industry"]       = industry
+        rec["Next Earnings"]  = ne.get(ticker, "N/A")
+
         records.append(rec)
 
     return pd.DataFrame(records)
@@ -536,6 +804,12 @@ def make_column_config(df: pd.DataFrame) -> dict:
             )
         elif col == "Comments":
             config[col] = st.column_config.TextColumn("Comments", width="large")
+        elif col == "Mkt Cap ($B)":
+            config[col] = st.column_config.NumberColumn(
+                "Mkt Cap ($B)", format="%.2f", disabled=True
+            )
+        elif col in ("Sector", "Industry", "Next Earnings"):
+            config[col] = st.column_config.TextColumn(col, disabled=True)
     return config
 
 
@@ -889,33 +1163,33 @@ def _scan_progress_autorefresh():
 
 def render_indicator_filter(tab_key: str) -> dict[str, set[str]]:
     """
-    Renders per-indicator value filter UI inside an expander.
+    Renders per-indicator value filter UI inline (no expander).
     Returns {indicator_id: set_of_accepted_values} for active filters only.
-    Empty dict = no filtering.
     """
     ind_filters: dict[str, set[str]] = {}
-    with st.expander("🔽 Filter by Indicator Values", expanded=False):
-        selected_inds = st.multiselect(
-            "Filter on indicators:",
-            options=MAIN_IND_COLS,
-            key=f"filt_inds_{tab_key}",
-        )
-        if not selected_inds:
-            st.caption("Select indicators above to filter rows by their result values.")
-            return {}
+    st.markdown("**Filter by Indicator Values**")
+    selected_inds = st.multiselect(
+        "Filter on indicators:",
+        options=MAIN_IND_COLS,
+        key=f"filt_inds_{tab_key}",
+        label_visibility="collapsed",
+        placeholder="Select indicators to filter by value…",
+    )
+    if not selected_inds:
+        return {}
 
-        cols = st.columns(min(len(selected_inds), 5))
-        for i, ind in enumerate(selected_inds):
-            with cols[i % 5]:
-                vals = st.multiselect(
-                    f"{ind}:",
-                    options=["PASS", "PARTIAL", "FAIL", "NA"],
-                    default=["PASS"],
-                    format_func=lambda v: f"{EMOJI.get(v, v)} {v}",
-                    key=f"filt_vals_{tab_key}_{ind}",
-                )
-                if vals:
-                    ind_filters[ind] = set(vals)
+    vcols = st.columns(min(len(selected_inds), 5))
+    for i, ind in enumerate(selected_inds):
+        with vcols[i % 5]:
+            vals = st.multiselect(
+                f"{ind}:",
+                options=["PASS", "PARTIAL", "FAIL", "NA"],
+                default=["PASS"],
+                format_func=lambda v: f"{EMOJI.get(v, v)} {v}",
+                key=f"filt_vals_{tab_key}_{ind}",
+            )
+            if vals:
+                ind_filters[ind] = set(vals)
     return ind_filters
 
 
@@ -930,49 +1204,79 @@ def apply_indicator_filter(rows: list[dict],
     ]
 
 
+def _value_col_config(cols: list[str]) -> dict:
+    """Build st.column_config for the value table based on column names."""
+    cfg: dict = {}
+    pct_suffix = {"%"}
+    for col in cols:
+        if col == "Ticker":
+            cfg[col] = st.column_config.TextColumn(col, disabled=True)
+        elif col in ("Sector", "Industry", "Q End Date", "A End Date",
+                     "Next Earnings Date", "Breakout 55D", "Breakout 3M",
+                     "MA10>20", "MA20>50", "MA50>150", "MA150>200"):
+            cfg[col] = st.column_config.TextColumn(col, disabled=True)
+        elif col == "Mkt Cap ($B)":
+            cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
+        elif col.endswith("%"):
+            cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
+        else:
+            cfg[col] = st.column_config.NumberColumn(col, format="%.4g", disabled=True)
+    return cfg
+
+
 def render_value_table(tickers: list[str], detail_map: dict,
                        rows_by_ticker: dict, fund_map: dict,
-                       tab_key: str):
+                       tab_key: str, tech_map: dict | None = None):
     """
-    Render the value table with:
-      - Column group multiselect (user-selectable groups)
-      - Ticker text search
-      - Data from indicator detail JSON + DuckDB fundamentals
+    Render the Indicator Values Table with:
+      - Group multiselect + individual column multiselect
+      - Numeric columns as native floats for correct sorting
+      - tech_indicators columns when tech_map is provided
     """
-    with st.expander("📐 Indicator Values Table", expanded=False):
-        vcol1, vcol2 = st.columns([3, 1])
-        with vcol1:
-            sel_groups = st.multiselect(
-                "Column groups:",
-                options=list(VALUE_COL_GROUPS.keys()),
-                default=DEFAULT_VALUE_GROUPS,
-                key=f"val_groups_{tab_key}",
-            )
-        with vcol2:
-            val_search = st.text_input(
-                "Search ticker:",
-                placeholder="e.g. AAPL",
-                key=f"val_search_{tab_key}",
-            )
+    tm = tech_map or {}
+    all_groups = list(VALUE_COL_GROUPS.keys())
 
-        show_cols = ["Ticker"] + [
-            c for g in sel_groups for c in VALUE_COL_GROUPS.get(g, [])
-        ]
+    st.markdown("### 📐 Indicator Values Table")
 
-        records = []
-        for ticker in tickers:
-            if val_search and val_search.upper() not in ticker.upper():
-                continue
-            detail = detail_map.get(ticker, {})
-            row    = rows_by_ticker.get(ticker, {})
-            f_db   = fund_map.get(ticker, {})
-            rec    = _build_value_record(ticker, detail, row, f_db)
-            records.append({c: rec.get(c, "N/A") for c in show_cols})
+    # ── Column group selector ────────────────────────────────────────────────
+    sel_groups = st.multiselect(
+        "Column groups:",
+        options=all_groups,
+        default=DEFAULT_VALUE_GROUPS,
+        key=f"val_groups_{tab_key}",
+    )
 
-        if records:
-            st.dataframe(pd.DataFrame(records), width="stretch", hide_index=True)
-        else:
-            st.info("No data matches current search.")
+    # ── Individual column selector within selected groups ────────────────────
+    group_cols = [c for g in sel_groups for c in VALUE_COL_GROUPS.get(g, [])]
+    sel_cols = st.multiselect(
+        "Individual columns (leave blank = all columns in selected groups):",
+        options=group_cols,
+        default=[],
+        key=f"val_cols_{tab_key}",
+    )
+
+    _fixed_right = {"Mkt Cap ($B)", "Sector", "Industry", "Next Earnings Date"}
+    data_cols = [c for c in (sel_cols if sel_cols else group_cols) if c not in _fixed_right]
+    # Order: Ticker | data columns | Mkt Cap ($B) | Sector | Industry | Next Earnings Date
+    show_cols = ["Ticker"] + data_cols + ["Mkt Cap ($B)", "Sector", "Industry", "Next Earnings Date"]
+
+    # ── Build records ────────────────────────────────────────────────────────
+    records = []
+    for ticker in tickers:
+        detail = detail_map.get(ticker, {})
+        row    = rows_by_ticker.get(ticker, {})
+        f_db   = fund_map.get(ticker, {})
+        tc     = tm.get(ticker, {})
+        rec    = _build_value_record(ticker, detail, row, f_db, tc)
+        records.append({c: rec.get(c) for c in show_cols})
+
+    if records:
+        df = pd.DataFrame(records)
+        st.caption(f"{len(df)} rows")
+        st.dataframe(df, column_config=_value_col_config(show_cols),
+                     width="stretch", hide_index=True)
+    else:
+        st.info("No data available.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1153,31 +1457,85 @@ with tab_latest:
         st.caption(f"Scan mode — showing top 50 of {total_scanned} tickers "
                    f"(ranked by score then market cap)")
 
-    # ── Ticker search + indicator value filter ────────────────────────────────
-    lsrch_col, lsub_col = st.columns([2, 1])
-    with lsrch_col:
-        latest_search = st.text_input(
-            "Search ticker:", placeholder="e.g. AAPL",
-            key="latest_ticker_search",
-        )
-    with lsub_col:
-        show_sub = st.checkbox("Show sub-indicators", value=False, key="latest_show_sub")
+    # ── Fetch fund/tech data ───────────────────────────────────────────────────
+    fund_map_latest = get_all_fundamentals_for_run(top50_tickers)
+    tech_map_latest = get_tech_for_tickers(top50_tickers)
+    si_map_latest   = _extract_si(fund_map_latest)
+    ne_map_latest   = _extract_ne(fund_map_latest)
 
+    # Build sector→industries mapping for cascade
+    _s2i_l: dict[str, set[str]] = {}
+    for s, i in si_map_latest.values():
+        if s != "N/A" and i != "N/A":
+            _s2i_l.setdefault(s, set()).add(i)
+
+    # Pre-read sector selection for cascade
+    _f_sectors_l_pre = st.session_state.get("latest_f_sector", [])
+    all_sectors_l    = sorted({s for s, _ in si_map_latest.values() if s != "N/A"})
+    if _f_sectors_l_pre:
+        avail_industries_l = sorted({i for s in _f_sectors_l_pre for i in _s2i_l.get(s, set())})
+    else:
+        avail_industries_l = sorted({i for _, i in si_map_latest.values() if i != "N/A"})
+
+    # ── Row 1: ticker name | sector | industry ────────────────────────────────
+    lf1, lf2, lf3 = st.columns(3)
+    with lf1:
+        f_ticker_l = st.text_input("Filter by Ticker", placeholder="e.g. AAPL",
+                                   key="latest_f_ticker_name")
+    with lf2:
+        f_sectors_l = st.multiselect("Filter by Sector", options=all_sectors_l,
+                                     key="latest_f_sector")
+    with lf3:
+        f_industries_l = st.multiselect("Filter by Industry", options=avail_industries_l,
+                                        key="latest_f_industry")
+
+    # ── Market cap filter ─────────────────────────────────────────────────────
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        mc_lo_l = st.number_input("Mkt Cap min ($B)", value=None, min_value=0.0,
+                                  placeholder="no min", key="latest_mc_lo",
+                                  format="%.2f", step=1.0)
+    with mc2:
+        mc_hi_l = st.number_input("Mkt Cap max ($B)", value=None, min_value=0.0,
+                                  placeholder="no max", key="latest_mc_hi",
+                                  format="%.2f", step=1.0)
+
+    # ── Indicator filter — always visible ─────────────────────────────────────
     latest_ind_filter = render_indicator_filter("latest")
 
-    # Apply filters to displayed rows
+    # ── Options below indicator filter ────────────────────────────────────────
+    show_sub = st.checkbox("Show sub-indicators", value=False, key="latest_show_sub")
+
+    # Apply filters
     display_rows = top50_rows
-    if latest_search:
+    if f_ticker_l:
         display_rows = [r for r in display_rows
-                        if latest_search.upper() in r["ticker"].upper()]
+                        if f_ticker_l.upper() in r["ticker"].upper()]
+    if f_sectors_l:
+        display_rows = [r for r in display_rows
+                        if si_map_latest.get(r["ticker"], ("N/A",))[0] in f_sectors_l]
+    if f_industries_l:
+        display_rows = [r for r in display_rows
+                        if si_map_latest.get(r["ticker"], ("N/A", "N/A"))[1] in f_industries_l]
+    if mc_lo_l is not None:
+        display_rows = [r for r in display_rows
+                        if _mkt_cap_b(r.get("market_cap")) is not None
+                        and _mkt_cap_b(r.get("market_cap")) >= mc_lo_l]
+    if mc_hi_l is not None:
+        display_rows = [r for r in display_rows
+                        if _mkt_cap_b(r.get("market_cap")) is not None
+                        and _mkt_cap_b(r.get("market_cap")) <= mc_hi_l]
     display_rows = apply_indicator_filter(display_rows, latest_ind_filter)
     display_tickers = [r["ticker"] for r in display_rows]
+
+    st.caption(f"Showing **{len(display_rows)}** / {len(top50_rows)} rows")
 
     # ── Indicator Summary ─────────────────────────────────────────────────────
     st.markdown("### 📊 Indicator Summary")
     st.caption("✅ PASS · ⭕ PARTIAL · ❌ FAIL · ⚪️ N/A  —  Edit any cell and click **Save Edits**")
 
-    sum_df  = build_summary_df(display_rows, show_sub=show_sub)
+    sum_df  = build_summary_df(display_rows, show_sub=show_sub,
+                               si_map=si_map_latest, ne_map=ne_map_latest)
     col_cfg = make_column_config(sum_df)
 
     edited = st.data_editor(
@@ -1192,10 +1550,10 @@ with tab_latest:
     st.markdown("---")
 
     # ── Value Table ───────────────────────────────────────────────────────────
-    fund_map_latest = get_all_fundamentals_for_run(display_tickers)
     rows_by_ticker_latest = {r["ticker"]: r for r in display_rows}
     render_value_table(display_tickers, detail_map,
-                       rows_by_ticker_latest, fund_map_latest, "latest")
+                       rows_by_ticker_latest, fund_map_latest, "latest",
+                       tech_map=tech_map_latest)
 
     st.markdown("---")
 
@@ -1219,39 +1577,112 @@ with tab_history:
     st.markdown("### 🗂 All-Runs Summary")
     st.caption("Rows sorted: newest datetime first, then alphabetical ticker")
 
-    # Filters
-    all_stored_tickers = get_all_tickers()
-    fcol1, fcol2, fcol3 = st.columns(3)
-    with fcol1:
-        f_tickers = st.multiselect("Filter by Ticker", options=all_stored_tickers, key="hist_f_tick")
-    with fcol2:
-        f_dts = st.multiselect("Filter by Datetime", options=all_dts, key="hist_f_dt")
-    with fcol3:
-        all_show_sub = st.checkbox("Show sub-indicators", value=False, key="all_queries_show_sub")
+    # Pre-read widget states for data fetching before widget rendering
+    _f_tickers_pre   = st.session_state.get("hist_f_tick", [])
+    _f_dts_pre       = st.session_state.get("hist_f_dt", [])
+    _only_latest_pre = st.session_state.get("hist_only_latest", True)   # default True
+    _f_sectors_pre   = st.session_state.get("hist_f_sector", [])
+    _mc_lo_pre       = st.session_state.get("hist_mc_lo", None)
+    _mc_hi_pre       = st.session_state.get("hist_mc_hi", None)
 
-    # Ticker text search
-    hist_search = st.text_input(
-        "Search ticker:", placeholder="e.g. AAPL",
-        key="hist_ticker_search",
+    # ── Fetch rows ────────────────────────────────────────────────────────────
+    filt_rows = get_all_summaries(
+        tickers   = _f_tickers_pre if _f_tickers_pre else None,
+        datetimes = _f_dts_pre     if _f_dts_pre     else None,
     )
+    total_before = len(filt_rows)
 
+    # Apply "latest only" using pre-read value
+    if _only_latest_pre:
+        _seen: dict[str, str] = {}
+        for r in filt_rows:
+            t, dt = r["ticker"], r.get("analysis_datetime", "")
+            if t not in _seen or dt > _seen[t]:
+                _seen[t] = dt
+        filt_rows = [r for r in filt_rows
+                     if r.get("analysis_datetime") == _seen.get(r["ticker"])]
+
+    # Apply mkt cap pre-filter (so sector options reflect mkt-cap-filtered set)
+    if _mc_lo_pre is not None:
+        filt_rows = [r for r in filt_rows
+                     if _mkt_cap_b(r.get("market_cap")) is not None
+                     and _mkt_cap_b(r.get("market_cap")) >= _mc_lo_pre]
+    if _mc_hi_pre is not None:
+        filt_rows = [r for r in filt_rows
+                     if _mkt_cap_b(r.get("market_cap")) is not None
+                     and _mkt_cap_b(r.get("market_cap")) <= _mc_hi_pre]
+
+    # ── Fetch fund/tech data for filtered tickers ─────────────────────────────
+    _hist_tickers_pre = list({r["ticker"] for r in filt_rows})
+    hist_fund_map     = get_all_fundamentals_for_run(_hist_tickers_pre)
+    hist_tech_map     = get_tech_for_tickers(_hist_tickers_pre)
+    si_map_hist       = _extract_si(hist_fund_map)
+    ne_map_hist       = _extract_ne(hist_fund_map)
+
+    # Build sector→industries cascade mapping
+    _s2i_h: dict[str, set[str]] = {}
+    for s, i in si_map_hist.values():
+        if s != "N/A" and i != "N/A":
+            _s2i_h.setdefault(s, set()).add(i)
+    all_sectors_h = sorted({s for s, _ in si_map_hist.values() if s != "N/A"})
+    if _f_sectors_pre:
+        avail_industries_h = sorted({i for s in _f_sectors_pre for i in _s2i_h.get(s, set())})
+    else:
+        avail_industries_h = sorted({i for _, i in si_map_hist.values() if i != "N/A"})
+
+    # ── Row 1: ticker | datetime | sector | industry ──────────────────────────
+    all_stored_tickers = get_all_tickers()
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    with fc1:
+        f_tickers = st.multiselect("Filter by Ticker", options=all_stored_tickers,
+                                   key="hist_f_tick")
+    with fc2:
+        f_dts = st.multiselect("Filter by Datetime", options=all_dts, key="hist_f_dt")
+    with fc3:
+        f_sectors_h = st.multiselect("Filter by Sector", options=all_sectors_h,
+                                     key="hist_f_sector")
+    with fc4:
+        f_industries_h = st.multiselect("Filter by Industry", options=avail_industries_h,
+                                        key="hist_f_industry")
+
+    # ── Market cap filter ─────────────────────────────────────────────────────
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        mc_lo_h = st.number_input("Mkt Cap min ($B)", value=None, min_value=0.0,
+                                  placeholder="no min", key="hist_mc_lo",
+                                  format="%.2f", step=1.0)
+    with mc2:
+        mc_hi_h = st.number_input("Mkt Cap max ($B)", value=None, min_value=0.0,
+                                  placeholder="no max", key="hist_mc_hi",
+                                  format="%.2f", step=1.0)
+
+    # ── Indicator filter — always visible ─────────────────────────────────────
     hist_ind_filter = render_indicator_filter("history")
 
-    # Fetch filtered rows
-    filt_rows = get_all_summaries(
-        tickers   = f_tickers if f_tickers else None,
-        datetimes = f_dts     if f_dts     else None,
-    )
+    # ── Options below indicator filter ────────────────────────────────────────
+    oc1, oc2 = st.columns(2)
+    with oc1:
+        all_show_sub = st.checkbox("Show sub-indicators", value=False,
+                                   key="all_queries_show_sub")
+    with oc2:
+        only_latest = st.checkbox("Latest entry per ticker only", value=True,
+                                  key="hist_only_latest")
 
-    # Apply ticker text search
-    if hist_search:
+    # Apply remaining filters using current-run widget values
+    if f_sectors_h:
         filt_rows = [r for r in filt_rows
-                     if hist_search.upper() in r["ticker"].upper()]
+                     if si_map_hist.get(r["ticker"], ("N/A",))[0] in f_sectors_h]
+    if f_industries_h:
+        filt_rows = [r for r in filt_rows
+                     if si_map_hist.get(r["ticker"], ("N/A", "N/A"))[1] in f_industries_h]
 
-    # Apply indicator filter
     filt_rows = apply_indicator_filter(filt_rows, hist_ind_filter)
 
-    all_df = build_summary_df(filt_rows, show_sub=all_show_sub, include_datetime=True)
+    st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
+
+    all_df = build_summary_df(filt_rows, show_sub=all_show_sub,
+                              include_datetime=True, si_map=si_map_hist,
+                              ne_map=ne_map_hist)
     all_col_cfg = make_column_config(all_df)
 
     all_edited = st.data_editor(
@@ -1280,10 +1711,10 @@ with tab_history:
         if t in t_det:
             hist_detail_map[t] = t_det[t]
 
-    hist_fund_map       = get_all_fundamentals_for_run(hist_tickers)
     hist_rows_by_ticker = {r["ticker"]: r for r in filt_rows}
     render_value_table(hist_tickers, hist_detail_map,
-                       hist_rows_by_ticker, hist_fund_map, "history")
+                       hist_rows_by_ticker, hist_fund_map, "history",
+                       tech_map=hist_tech_map)
 
     st.markdown("---")
 
