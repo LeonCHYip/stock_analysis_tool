@@ -40,3 +40,6 @@ Thumbs.db
 
 # Chat exports / transcripts
 chat_export_*.md
+user_prefs.json
+
+CRWV_*.md

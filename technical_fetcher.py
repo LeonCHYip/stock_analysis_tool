@@ -445,6 +445,7 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame) -> dict:
             "up_down_ratio_1y":    r1y,
             "max_win_streak_1y":   ms1y,
             "win_streaks_5p_1y":   sp1y,
+            "daily_pct_change":    _safe(float(pct_change.iloc[-1]), 2) if len(pct_change) >= 2 else None,
             "big_up_events_90d":   json.dumps(big_up_events, default=str),
             "big_down_events_90d": json.dumps(big_down_events, default=str),
             "daily_vs_3m":         json.dumps(daily_3m,   default=str),

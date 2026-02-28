@@ -161,6 +161,8 @@ CREATE TABLE IF NOT EXISTS tech_indicators (
     daily_vs_12m        TEXT,
     weekly_vs_3m        TEXT,
     weekly_vs_12m       TEXT,
+    -- Daily price change
+    daily_pct_change    DOUBLE,
     -- Status
     is_finalized        BOOLEAN DEFAULT FALSE,
     computed_at         TIMESTAMP,
@@ -248,13 +250,28 @@ def _conn() -> duckdb.DuckDBPyConnection:
 
 
 def init_db() -> None:
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, and migrate schema."""
     con = _conn()
     con.execute(_DDL_TECH)
     con.execute(_DDL_FUND)
     con.execute(_DDL_RUNS)
     con.execute(_DDL_DETAILS)
     con.execute(_DDL_PEERS)
+    # Migrate: add columns introduced after initial schema creation
+    _migrate_add_columns(con)
+
+
+def _migrate_add_columns(con) -> None:
+    """Add new columns to existing tables if they don't already exist."""
+    new_tech_cols = [
+        ("daily_pct_change", "DOUBLE"),
+    ]
+    existing = {row[0] for row in con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'tech_indicators'"
+    ).fetchall()}
+    for col, dtype in new_tech_cols:
+        if col not in existing:
+            con.execute(f"ALTER TABLE tech_indicators ADD COLUMN {col} {dtype}")
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

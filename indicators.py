@@ -5,7 +5,7 @@ Result strings:
   "PASS"    — all sub-indicators True
   "PARTIAL" — mix of True and False (no None)
   "FAIL"    — all sub-indicators False
-  "NA"      — any sub-indicator is None (data unavailable)
+  "NA"      — all sub-indicators are None (data unavailable)
 
 F5/F6 have no sub-indicators: binary PASS/FAIL/NA only.
 """
@@ -21,9 +21,13 @@ def _pf(condition) -> bool | None:
 
 
 def _grade(sub_dict: dict) -> str:
-    """Compute PASS/PARTIAL/FAIL/NA from a dict of bool|None sub-check values."""
-    vals = list(sub_dict.values())
-    if any(v is None for v in vals):
+    """Compute PASS/PARTIAL/FAIL/NA from a dict of bool|None sub-check values.
+
+    None sub-checks are skipped; only available checks are graded.
+    Returns NA only if all sub-checks are None.
+    """
+    vals = [v for v in sub_dict.values() if v is not None]
+    if not vals:
         return "NA"
     if all(v is True for v in vals):
         return "PASS"

@@ -13,6 +13,25 @@ from datetime import datetime, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# ─────────────────────────────────────────────────────────────────────────────
+# User preferences (persisted to JSON)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PREFS_PATH = Path(__file__).parent / "user_prefs.json"
+
+
+def _load_prefs() -> dict:
+    if _PREFS_PATH.exists():
+        try:
+            return json.loads(_PREFS_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_prefs(prefs: dict) -> None:
+    _PREFS_PATH.write_text(json.dumps(prefs, indent=2))
+
 import pandas as pd
 import streamlit as st
 
@@ -77,7 +96,7 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     ],
     # ── tech_indicators groups ─────────────────────────────────────────────────
     "Price & 52W": [
-        "Close", "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
+        "Tech Date", "Close", "Latest Px %", "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
     ],
     "EMA & Slope": [
         "EMA9", "EMA21", "EMA50", "EMA200", "SMA50 Slope 20D", "From SMA200%",
@@ -114,6 +133,18 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     ],
     "Big Moves 90D": [
         "# Big Up 90D", "# Big Down 90D",
+    ],
+    "Volume (Raw)": [
+        "Volume",
+    ],
+    "SMA Values": [
+        "SMA10", "SMA20", "SMA50", "SMA150", "SMA200",
+    ],
+    "MA Alignment (Raw)": [
+        "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
+    ],
+    "Tech Metadata": [
+        "Finalized",
     ],
 }
 
@@ -179,12 +210,29 @@ TECH_COL_MAP: dict[str, str] = {
     "win_streaks_5p_1y":   "Win Str 5% 1Y",
     "gap_rate_60d":        "Gap Rate 60D%",
     "max_gap_60d":         "Max Gap 60D%",
+    "volume":              "Volume",
+    "sma10":               "SMA10",
+    "sma20":               "SMA20",
+    "sma50":               "SMA50",
+    "sma150":              "SMA150",
+    "sma200":              "SMA200",
+    "ma10_gt_ma20":        "MA10>MA20",
+    "ma20_gt_ma50":        "MA20>MA50",
+    "ma50_gt_ma150":       "MA50>MA150",
+    "ma150_gt_ma200":      "MA150>MA200",
+    "as_of_date":          "Tech Date",
+    "is_finalized":        "Finalized",
+    "daily_pct_change":    "Latest Px %",
 }
 # Reverse map: display name → tech_indicators field
 TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
 
 # Columns from tech_indicators that are boolean (rendered as ✅/❌)
-TECH_BOOL_COLS = {"Breakout 55D", "Breakout 3M"}
+TECH_BOOL_COLS = {
+    "Breakout 55D", "Breakout 3M",
+    "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
+    "Finalized",
+}
 
 # Default groups shown on load (indicator-derived groups only)
 DEFAULT_VALUE_GROUPS = [
@@ -193,7 +241,21 @@ DEFAULT_VALUE_GROUPS = [
     "Quarterly (F1/F3)", "Annual (F2/F4)", "Valuation (F5/F6)", "Fundamentals",
 ]
 
-ALL_VALUE_COLS = [c for cols in VALUE_COL_GROUPS.values() for c in cols]
+ALL_VALUE_COLS = list(dict.fromkeys(c for cols in VALUE_COL_GROUPS.values() for c in cols))
+
+# ── Column filter classification ───────────────────────────────────────────────
+_COL_FILTER_SKIP = {
+    "Ticker", "Sector", "Industry", "Next Earnings Date", "Mkt Cap ($B)",
+}
+_COL_FILTER_EMOJI = {
+    "MA10>20", "MA20>50", "MA50>150", "MA150>200",
+    "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
+    "Breakout 55D", "Breakout 3M", "Finalized",
+}
+_COL_FILTER_DATES = {"Q End Date", "A End Date", "Tech Date"}
+_COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
+# All user-filterable value columns (ordered, deduplicated)
+_FILTERABLE_COLS  = [c for c in ALL_VALUE_COLS if c not in _COL_FILTER_SKIP]
 
 # Sub-indicator display labels (for column headers)
 SUB_DISPLAY = {
@@ -499,6 +561,20 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "Max Gap 60D%":    _f(tc.get("max_gap_60d")),
         "# Big Up 90D":    _big_count(tc.get("big_up_events_90d")),
         "# Big Down 90D":  _big_count(tc.get("big_down_events_90d")),
+        # Additional tech_indicators columns
+        "Volume":          tc.get("volume"),
+        "SMA10":           _f(tc.get("sma10")),
+        "SMA20":           _f(tc.get("sma20")),
+        "SMA50":           _f(tc.get("sma50")),
+        "SMA150":          _f(tc.get("sma150")),
+        "SMA200":          _f(tc.get("sma200")),
+        "MA10>MA20":       _bi(tc.get("ma10_gt_ma20")),
+        "MA20>MA50":       _bi(tc.get("ma20_gt_ma50")),
+        "MA50>MA150":      _bi(tc.get("ma50_gt_ma150")),
+        "MA150>MA200":     _bi(tc.get("ma150_gt_ma200")),
+        "Tech Date":       str(tc.get("as_of_date") or "N/A"),
+        "Finalized":       _bi(tc.get("is_finalized")),
+        "Latest Px %":     _f(tc.get("daily_pct_change")),
     }
     return rec
 
@@ -1161,12 +1237,171 @@ def _scan_progress_autorefresh():
 
 
 
-def render_indicator_filter(tab_key: str) -> dict[str, set[str]]:
+# ── Per-tab filter session-state key mapping ──────────────────────────────────
+_TAB_FILTER_KEYS: dict[str, dict[str, str]] = {
+    "latest": {
+        "f_ticker_text": "latest_f_ticker_name",
+        "f_sector":      "latest_f_sector",
+        "f_industry":    "latest_f_industry",
+        "mc_lo":         "latest_mc_lo",
+        "mc_hi":         "latest_mc_hi",
+        "show_sub":      "latest_show_sub",
+    },
+    "history": {
+        "f_ticker_multi": "hist_f_tick",
+        "f_dt":           "hist_f_dt",
+        "f_sector":       "hist_f_sector",
+        "f_industry":     "hist_f_industry",
+        "mc_lo":          "hist_mc_lo",
+        "mc_hi":          "hist_mc_hi",
+        "show_sub":       "all_queries_show_sub",
+        "only_latest":    "hist_only_latest",
+    },
+}
+
+_TAB_FILTER_DEFAULTS: dict[str, dict[str, object]] = {
+    "latest": {
+        "f_ticker_text": "",
+        "f_sector":      [],
+        "f_industry":    [],
+        "mc_lo":         None,
+        "mc_hi":         None,
+        "show_sub":      False,
+    },
+    "history": {
+        "f_ticker_multi": [],
+        "f_dt":           [],
+        "f_sector":       [],
+        "f_industry":     [],
+        "mc_lo":          None,
+        "mc_hi":          None,
+        "show_sub":       False,
+        "only_latest":    True,
+    },
+}
+
+
+def _actually_clear_filter_keys(tab_key: str) -> None:
+    """Reset all filter session state keys for tab_key. Call before widgets render."""
+    defaults = _TAB_FILTER_DEFAULTS.get(tab_key, {})
+    mapping  = _TAB_FILTER_KEYS.get(tab_key, {})
+    for logical_key, ss_key in mapping.items():
+        st.session_state[ss_key] = defaults.get(logical_key)
+    st.session_state[f"filt_inds_{tab_key}"] = []
+    for ind in MAIN_IND_COLS:
+        k = f"filt_vals_{tab_key}_{ind}"
+        if k in st.session_state:
+            del st.session_state[k]
+    # Clear column filter keys
+    st.session_state[f"col_filt_cols_{tab_key}"] = []
+    stale = [k for k in st.session_state
+             if k.startswith(f"col_filt_op_{tab_key}_")
+             or k.startswith(f"col_filt_numval_{tab_key}_")
+             or k.startswith(f"col_filt_catvals_{tab_key}_")]
+    for k in stale:
+        del st.session_state[k]
+
+
+def _actually_apply_filter_group(tab_key: str, group: dict) -> None:
+    """Apply a saved filter group dict to session state. Call before widgets render."""
+    mapping = _TAB_FILTER_KEYS.get(tab_key, {})
+    for logical_key, ss_key in mapping.items():
+        if logical_key in group:
+            st.session_state[ss_key] = group[logical_key]
+    st.session_state[f"filt_inds_{tab_key}"] = group.get("selected_inds", [])
+    for ind, vals in group.get("ind_vals", {}).items():
+        st.session_state[f"filt_vals_{tab_key}_{ind}"] = vals
+    # Column filter
+    st.session_state[f"col_filt_cols_{tab_key}"] = group.get("col_filt_cols", [])
+    for col in group.get("col_filt_cols", []):
+        if col in _COL_FILTER_EMOJI:
+            st.session_state[f"col_filt_catvals_{tab_key}_{col}"] = group.get(f"_cfcatvals_{col}", [])
+        else:
+            st.session_state[f"col_filt_op_{tab_key}_{col}"]     = group.get(f"_cfop_{col}", ">=")
+            st.session_state[f"col_filt_numval_{tab_key}_{col}"] = group.get(f"_cfval_{col}")
+
+
+def _queue_filter_clear(tab_key: str) -> None:
+    """Queue a filter clear to be applied before next widget render."""
+    st.session_state[f"_pending_filt_clear_{tab_key}"] = True
+
+
+def _queue_filter_group(tab_key: str, group: dict) -> None:
+    """Queue a filter group load to be applied before next widget render."""
+    st.session_state[f"_pending_filt_group_{tab_key}"] = group
+
+
+def _process_pending_ops() -> None:
+    """Apply any pending filter/column ops. Must be called before any widgets render."""
+    for tab_key in list(_TAB_FILTER_KEYS.keys()):
+        # Filter pending ops
+        clear_key = f"_pending_filt_clear_{tab_key}"
+        group_key = f"_pending_filt_group_{tab_key}"
+        if st.session_state.pop(clear_key, False):
+            _actually_clear_filter_keys(tab_key)
+        if group_key in st.session_state:
+            _actually_apply_filter_group(tab_key, st.session_state.pop(group_key))
+        # Column group pending ops
+        col_cols_key = f"_pending_col_cols_{tab_key}"
+        if col_cols_key in st.session_state:
+            st.session_state[f"val_cols_{tab_key}"] = st.session_state.pop(col_cols_key)
+
+
+def _snapshot_filter_group(tab_key: str) -> dict:
+    """Snapshot current filter state into a serialisable dict."""
+    mapping = _TAB_FILTER_KEYS.get(tab_key, {})
+    group: dict = {}
+    for logical_key, ss_key in mapping.items():
+        group[logical_key] = st.session_state.get(ss_key)
+    group["selected_inds"] = list(st.session_state.get(f"filt_inds_{tab_key}", []))
+    ind_vals: dict[str, list] = {}
+    for ind in group["selected_inds"]:
+        k = f"filt_vals_{tab_key}_{ind}"
+        ind_vals[ind] = st.session_state.get(k, ["PASS"])
+    group["ind_vals"] = ind_vals
+    # Column filter snapshot
+    col_filt_cols = list(st.session_state.get(f"col_filt_cols_{tab_key}", []))
+    group["col_filt_cols"] = col_filt_cols
+    for col in col_filt_cols:
+        if col in _COL_FILTER_EMOJI:
+            group[f"_cfcatvals_{col}"] = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
+        else:
+            group[f"_cfop_{col}"]  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
+            group[f"_cfval_{col}"] = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
+    return group
+
+
+def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
     """
-    Renders per-indicator value filter UI inline (no expander).
-    Returns {indicator_id: set_of_accepted_values} for active filters only.
+    Renders per-indicator value filter UI inline.
+    Returns (ind_filters, col_filter):
+      ind_filters: {indicator_id: set_of_accepted_values} for active filters only.
+      col_filter:  {col_name: {"type":..., ...}} for active column value filters.
+    Includes clear/reset buttons, a filter group manager, and column value filter.
     """
-    ind_filters: dict[str, set[str]] = {}
+    # ── Auto-load custom default group (once per session per tab) ─────────────
+    _loaded_key = f"filt_group_loaded_{tab_key}"
+    if _loaded_key not in st.session_state:
+        prefs = _load_prefs()
+        fd = prefs.get("filter_default", {}).get(tab_key)
+        fg = prefs.get("filter_groups", {}).get(tab_key, {})
+        st.session_state[_loaded_key] = True
+        if fd and fd in fg:
+            _queue_filter_group(tab_key, fg[fd])
+            st.rerun()
+
+    # ── Action buttons ────────────────────────────────────────────────────────
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        if st.button("Clear all filters", key=f"filt_clear_{tab_key}"):
+            _queue_filter_clear(tab_key)
+            st.rerun()
+    with bc2:
+        if st.button("Reset to default", key=f"filt_reset_{tab_key}"):
+            _queue_filter_clear(tab_key)
+            st.rerun()
+
+    # ── Indicator filter ──────────────────────────────────────────────────────
     st.markdown("**Filter by Indicator Values**")
     selected_inds = st.multiselect(
         "Filter on indicators:",
@@ -1175,22 +1410,154 @@ def render_indicator_filter(tab_key: str) -> dict[str, set[str]]:
         label_visibility="collapsed",
         placeholder="Select indicators to filter by value…",
     )
-    if not selected_inds:
-        return {}
 
-    vcols = st.columns(min(len(selected_inds), 5))
-    for i, ind in enumerate(selected_inds):
-        with vcols[i % 5]:
-            vals = st.multiselect(
-                f"{ind}:",
-                options=["PASS", "PARTIAL", "FAIL", "NA"],
-                default=["PASS"],
-                format_func=lambda v: f"{EMOJI.get(v, v)} {v}",
-                key=f"filt_vals_{tab_key}_{ind}",
+    ind_filters: dict[str, set[str]] = {}
+    if selected_inds:
+        vcols = st.columns(min(len(selected_inds), 5))
+        for i, ind in enumerate(selected_inds):
+            with vcols[i % 5]:
+                vals = st.multiselect(
+                    f"{ind}:",
+                    options=["PASS", "PARTIAL", "FAIL", "NA"],
+                    default=["PASS"],
+                    format_func=lambda v: f"{EMOJI.get(v, v)} {v}",
+                    key=f"filt_vals_{tab_key}_{ind}",
+                )
+                if vals:
+                    ind_filters[ind] = set(vals)
+
+    # ── Column value filter ────────────────────────────────────────────────────
+    st.markdown("**Filter by Column Values**")
+    col_filt_selected = st.multiselect(
+        "Filter on columns:",
+        options=_FILTERABLE_COLS,
+        key=f"col_filt_cols_{tab_key}",
+        label_visibility="collapsed",
+        placeholder="Select columns to filter by value…",
+    )
+    if col_filt_selected:
+        for col in col_filt_selected:
+            if col in _COL_FILTER_EMOJI:
+                st.multiselect(
+                    f"{col}",
+                    options=["✅", "❌", "⚪️"],
+                    key=f"col_filt_catvals_{tab_key}_{col}",
+                )
+            elif col in _COL_FILTER_DATES:
+                dc1, dc2, dc3 = st.columns([2, 1, 3])
+                with dc1:
+                    st.markdown(f"**{col}**")
+                with dc2:
+                    st.selectbox(
+                        f"op_{col}",
+                        options=_COL_FILTER_OPS,
+                        key=f"col_filt_op_{tab_key}_{col}",
+                        label_visibility="collapsed",
+                    )
+                with dc3:
+                    st.text_input(
+                        f"val_{col}",
+                        key=f"col_filt_numval_{tab_key}_{col}",
+                        label_visibility="collapsed",
+                        placeholder="YYYY-MM-DD",
+                    )
+            else:
+                nc1, nc2, nc3 = st.columns([2, 1, 3])
+                with nc1:
+                    st.markdown(f"**{col}**")
+                with nc2:
+                    st.selectbox(
+                        f"op_{col}",
+                        options=_COL_FILTER_OPS,
+                        key=f"col_filt_op_{tab_key}_{col}",
+                        label_visibility="collapsed",
+                    )
+                with nc3:
+                    st.number_input(
+                        f"val_{col}",
+                        key=f"col_filt_numval_{tab_key}_{col}",
+                        label_visibility="collapsed",
+                        value=None,
+                        placeholder="numeric value",
+                    )
+
+    # Build col_filter dict from current widget states
+    col_filter: dict = {}
+    for col in st.session_state.get(f"col_filt_cols_{tab_key}", []):
+        if col in _COL_FILTER_EMOJI:
+            catvals = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
+            if catvals:
+                col_filter[col] = {"type": "cat", "vals": set(catvals)}
+        elif col in _COL_FILTER_DATES:
+            op  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
+            val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}", "")
+            if val:
+                col_filter[col] = {"type": "date", "op": op, "val": str(val)}
+        else:
+            op  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
+            val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
+            if val is not None:
+                col_filter[col] = {"type": "num", "op": op, "val": float(val)}
+
+    # ── Custom filter groups manager ──────────────────────────────────────────
+    with st.expander("Manage filter groups"):
+        prefs = _load_prefs()
+        fg = prefs.setdefault("filter_groups", {}).setdefault(tab_key, {})
+        fd = prefs.get("filter_default", {}).get(tab_key)
+        group_names = list(fg.keys())
+
+        if fd:
+            st.caption(f"Default group: **{fd}**")
+
+        # Save current filters as a named group
+        sg1, sg2 = st.columns([3, 1])
+        with sg1:
+            save_name = st.text_input(
+                "Save current filters as group name:",
+                key=f"filt_save_name_{tab_key}",
+                label_visibility="collapsed",
+                placeholder="Group name…",
             )
-            if vals:
-                ind_filters[ind] = set(vals)
-    return ind_filters
+        with sg2:
+            if st.button("Save", key=f"filt_save_{tab_key}"):
+                if save_name:
+                    fg[save_name] = _snapshot_filter_group(tab_key)
+                    _save_prefs(prefs)
+                    st.success(f"Saved '{save_name}'")
+                    st.rerun()
+                else:
+                    st.warning("Enter a group name first.")
+
+        # Load / Set default / Delete existing groups
+        if group_names:
+            gg1, gg2, gg3, gg4 = st.columns([3, 1, 1, 1])
+            with gg1:
+                sel_group = st.selectbox(
+                    "Group:", options=group_names,
+                    key=f"filt_sel_group_{tab_key}",
+                    label_visibility="collapsed",
+                )
+            with gg2:
+                if st.button("Load", key=f"filt_load_{tab_key}"):
+                    _queue_filter_group(tab_key, fg[sel_group])
+                    st.rerun()
+            with gg3:
+                if st.button("Set default", key=f"filt_setdef_{tab_key}"):
+                    prefs.setdefault("filter_default", {})[tab_key] = sel_group
+                    _save_prefs(prefs)
+                    st.success(f"'{sel_group}' set as default")
+                    st.rerun()
+            with gg4:
+                if st.button("Delete", key=f"filt_del_{tab_key}"):
+                    fg.pop(sel_group, None)
+                    if prefs.get("filter_default", {}).get(tab_key) == sel_group:
+                        prefs["filter_default"].pop(tab_key, None)
+                    _save_prefs(prefs)
+                    st.rerun()
+        else:
+            st.caption("No saved groups yet.")
+
+    return ind_filters, col_filter
 
 
 def apply_indicator_filter(rows: list[dict],
@@ -1204,6 +1571,50 @@ def apply_indicator_filter(rows: list[dict],
     ]
 
 
+def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
+    """Return True if a value-table record passes one column filter spec."""
+    val = rec.get(col)
+    if val is None:
+        return False
+    t = spec["type"]
+    if t == "cat":
+        return str(val) in spec["vals"]
+    op, fv = spec["op"], spec["val"]
+    if t == "date":
+        sval = str(val)
+        return (op == "=" and sval == fv) or (op == ">" and sval > fv) \
+            or (op == "<" and sval < fv) or (op == ">=" and sval >= fv) \
+            or (op == "<=" and sval <= fv)
+    # numeric
+    try:
+        nval = float(val)
+    except (TypeError, ValueError):
+        return False
+    return (op == "=" and nval == fv) or (op == ">" and nval > fv) \
+        or (op == "<" and nval < fv) or (op == ">=" and nval >= fv) \
+        or (op == "<=" and nval <= fv)
+
+
+def apply_col_filter(tickers: list[str], col_filter: dict,
+                     detail_map: dict, rows_by_ticker: dict,
+                     fund_map: dict, tech_map: dict) -> list[str]:
+    """Return subset of tickers whose value-table records pass all column filters."""
+    if not col_filter:
+        return tickers
+    out = []
+    for t in tickers:
+        rec = _build_value_record(
+            t,
+            detail_map.get(t, {}),
+            rows_by_ticker.get(t, {}),
+            fund_map.get(t, {}),
+            tech_map.get(t, {}),
+        )
+        if all(_col_filter_passes(rec, col, spec) for col, spec in col_filter.items()):
+            out.append(t)
+    return out
+
+
 def _value_col_config(cols: list[str]) -> dict:
     """Build st.column_config for the value table based on column names."""
     cfg: dict = {}
@@ -1212,11 +1623,15 @@ def _value_col_config(cols: list[str]) -> dict:
         if col == "Ticker":
             cfg[col] = st.column_config.TextColumn(col, disabled=True)
         elif col in ("Sector", "Industry", "Q End Date", "A End Date",
-                     "Next Earnings Date", "Breakout 55D", "Breakout 3M",
-                     "MA10>20", "MA20>50", "MA50>150", "MA150>200"):
+                     "Next Earnings Date", "Tech Date",
+                     "Breakout 55D", "Breakout 3M", "Finalized",
+                     "MA10>20", "MA20>50", "MA50>150", "MA150>200",
+                     "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200"):
             cfg[col] = st.column_config.TextColumn(col, disabled=True)
         elif col == "Mkt Cap ($B)":
             cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
+        elif col == "Volume":
+            cfg[col] = st.column_config.NumberColumn(col, format="%d", disabled=True)
         elif col.endswith("%"):
             cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
         else:
@@ -1230,13 +1645,51 @@ def render_value_table(tickers: list[str], detail_map: dict,
     """
     Render the Indicator Values Table with:
       - Group multiselect + individual column multiselect
+      - Select all / Clear all / Reset to default buttons
+      - Custom named column groups (saved to user_prefs.json)
       - Numeric columns as native floats for correct sorting
       - tech_indicators columns when tech_map is provided
     """
     tm = tech_map or {}
-    all_groups = list(VALUE_COL_GROUPS.keys())
+
+    # ── Load custom groups and build merged group dict ────────────────────────
+    prefs = _load_prefs()
+    custom_col_groups: dict[str, list[str]] = prefs.get("col_groups", {})
+    # Build effective group dict: built-in + custom (prefixed with ⭐)
+    effective_groups: dict[str, list[str]] = dict(VALUE_COL_GROUPS)
+    for name, cols in custom_col_groups.items():
+        effective_groups[f"⭐ {name}"] = cols
+    all_groups = list(effective_groups.keys())
 
     st.markdown("### 📐 Indicator Values Table")
+
+    # ── Auto-load custom default column group (once per session per tab) ─────
+    _col_loaded_key = f"col_group_loaded_{tab_key}"
+    if _col_loaded_key not in st.session_state:
+        cd = prefs.get("col_default", {}).get(tab_key)
+        if cd and cd in custom_col_groups:
+            st.session_state[f"val_cols_{tab_key}"] = list(custom_col_groups[cd])
+        st.session_state[_col_loaded_key] = True
+
+    # all_cols: every column across all groups (options for individual selector)
+    # Computed here so button handlers can reference it before widgets are rendered.
+    all_cols = list(dict.fromkeys(c for g in all_groups for c in effective_groups.get(g, [])))
+
+    # ── Select all / Clear all / Reset to default buttons ────────────────────
+    # No st.rerun() — session state changes made before the multiselects below
+    # are picked up immediately in the same render pass.
+    vb1, vb2, vb3 = st.columns(3)
+    with vb1:
+        if st.button("Select all columns", key=f"val_sel_all_{tab_key}"):
+            st.session_state[f"val_cols_{tab_key}"] = list(all_cols)
+    with vb2:
+        if st.button("Clear all columns", key=f"val_clear_{tab_key}"):
+            st.session_state[f"val_groups_{tab_key}"] = []
+            st.session_state[f"val_cols_{tab_key}"] = []
+    with vb3:
+        if st.button("Reset to default", key=f"val_reset_{tab_key}"):
+            st.session_state[f"val_groups_{tab_key}"] = DEFAULT_VALUE_GROUPS
+            st.session_state[f"val_cols_{tab_key}"] = []
 
     # ── Column group selector ────────────────────────────────────────────────
     sel_groups = st.multiselect(
@@ -1246,14 +1699,72 @@ def render_value_table(tickers: list[str], detail_map: dict,
         key=f"val_groups_{tab_key}",
     )
 
-    # ── Individual column selector within selected groups ────────────────────
-    group_cols = [c for g in sel_groups for c in VALUE_COL_GROUPS.get(g, [])]
+    # group_cols: columns from selected groups (fallback when no individual cols chosen)
+    group_cols = list(dict.fromkeys(c for g in sel_groups for c in effective_groups.get(g, [])))
+    # Filter stale val_cols to valid options (avoid Streamlit invalid-default error)
+    cur_val_cols = st.session_state.get(f"val_cols_{tab_key}", [])
+    if any(c not in all_cols for c in cur_val_cols):
+        st.session_state[f"val_cols_{tab_key}"] = [c for c in cur_val_cols if c in all_cols]
     sel_cols = st.multiselect(
         "Individual columns (leave blank = all columns in selected groups):",
-        options=group_cols,
+        options=all_cols,
         default=[],
         key=f"val_cols_{tab_key}",
     )
+
+    # ── Custom column group manager ───────────────────────────────────────────
+    with st.expander("Manage column groups"):
+        cg_default = prefs.get("col_default", {}).get(tab_key)
+        if cg_default:
+            st.caption(f"Default group: **{cg_default}**")
+
+        cg1, cg2 = st.columns([3, 1])
+        with cg1:
+            cg_save_name = st.text_input(
+                "Save current column selection as group:",
+                key=f"col_save_name_{tab_key}",
+                label_visibility="collapsed",
+                placeholder="Column group name…",
+            )
+        with cg2:
+            if st.button("Save", key=f"col_save_{tab_key}"):
+                if cg_save_name:
+                    cols_to_save = sel_cols if sel_cols else group_cols
+                    prefs.setdefault("col_groups", {})[cg_save_name] = cols_to_save
+                    _save_prefs(prefs)
+                    st.success(f"Saved '{cg_save_name}'")
+                    st.rerun()
+                else:
+                    st.warning("Enter a group name first.")
+
+        cg_names = list(custom_col_groups.keys())
+        if cg_names:
+            cc1, cc2, cc3, cc4 = st.columns([3, 1, 1, 1])
+            with cc1:
+                sel_cg = st.selectbox(
+                    "Column group:", options=cg_names,
+                    key=f"col_sel_group_{tab_key}",
+                    label_visibility="collapsed",
+                )
+            with cc2:
+                if st.button("Load", key=f"col_load_{tab_key}"):
+                    st.session_state[f"_pending_col_cols_{tab_key}"] = list(custom_col_groups[sel_cg])
+                    st.rerun()
+            with cc3:
+                if st.button("Set default", key=f"col_setdef_{tab_key}"):
+                    prefs.setdefault("col_default", {})[tab_key] = sel_cg
+                    _save_prefs(prefs)
+                    st.success(f"'{sel_cg}' set as default")
+                    st.rerun()
+            with cc4:
+                if st.button("Delete", key=f"col_del_{tab_key}"):
+                    prefs.get("col_groups", {}).pop(sel_cg, None)
+                    if prefs.get("col_default", {}).get(tab_key) == sel_cg:
+                        prefs["col_default"].pop(tab_key, None)
+                    _save_prefs(prefs)
+                    st.rerun()
+        else:
+            st.caption("No saved column groups yet.")
 
     _fixed_right = {"Mkt Cap ($B)", "Sector", "Industry", "Next Earnings Date"}
     data_cols = [c for c in (sel_cols if sel_cols else group_cols) if c not in _fixed_right]
@@ -1407,6 +1918,11 @@ if run_btn:
 _scan_progress_autorefresh()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Apply any pending filter/column ops (must run before any filter widgets render)
+# ─────────────────────────────────────────────────────────────────────────────
+_process_pending_ops()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
 tab_latest, tab_history = st.tabs(["📊 Latest Query", "🗂 All Queries"])
@@ -1501,7 +2017,7 @@ with tab_latest:
                                   format="%.2f", step=1.0)
 
     # ── Indicator filter — always visible ─────────────────────────────────────
-    latest_ind_filter = render_indicator_filter("latest")
+    latest_ind_filter, latest_col_filter = render_indicator_filter("latest")
 
     # ── Options below indicator filter ────────────────────────────────────────
     show_sub = st.checkbox("Show sub-indicators", value=False, key="latest_show_sub")
@@ -1527,6 +2043,14 @@ with tab_latest:
                         and _mkt_cap_b(r.get("market_cap")) <= mc_hi_l]
     display_rows = apply_indicator_filter(display_rows, latest_ind_filter)
     display_tickers = [r["ticker"] for r in display_rows]
+    # Apply column value filter
+    if latest_col_filter:
+        all_rows_by_ticker_l = {r["ticker"]: r for r in top50_rows}
+        display_tickers = apply_col_filter(
+            display_tickers, latest_col_filter, detail_map,
+            all_rows_by_ticker_l, fund_map_latest, tech_map_latest,
+        )
+        display_rows = [r for r in display_rows if r["ticker"] in set(display_tickers)]
 
     st.caption(f"Showing **{len(display_rows)}** / {len(top50_rows)} rows")
 
@@ -1657,7 +2181,7 @@ with tab_history:
                                   format="%.2f", step=1.0)
 
     # ── Indicator filter — always visible ─────────────────────────────────────
-    hist_ind_filter = render_indicator_filter("history")
+    hist_ind_filter, hist_col_filter = render_indicator_filter("history")
 
     # ── Options below indicator filter ────────────────────────────────────────
     oc1, oc2 = st.columns(2)
@@ -1677,6 +2201,28 @@ with tab_history:
                      if si_map_hist.get(r["ticker"], ("N/A", "N/A"))[1] in f_industries_h]
 
     filt_rows = apply_indicator_filter(filt_rows, hist_ind_filter)
+
+    # Build detail map (needed for col filter): use most-recent datetime per ticker
+    _ticker_latest: dict[str, str] = {}
+    for r in filt_rows:
+        t  = r["ticker"]
+        dt = r.get("analysis_datetime", "")
+        if t not in _ticker_latest or dt > _ticker_latest[t]:
+            _ticker_latest[t] = dt
+    hist_detail_map: dict = {}
+    for t, dt in _ticker_latest.items():
+        t_det = get_detail_filtered(ticker=t, analysis_dt=dt)
+        if t in t_det:
+            hist_detail_map[t] = t_det[t]
+
+    # Apply column value filter
+    if hist_col_filter:
+        hist_rows_by_ticker_all = {r["ticker"]: r for r in filt_rows}
+        _hist_pass = set(apply_col_filter(
+            [r["ticker"] for r in filt_rows], hist_col_filter, hist_detail_map,
+            hist_rows_by_ticker_all, hist_fund_map, hist_tech_map,
+        ))
+        filt_rows = [r for r in filt_rows if r["ticker"] in _hist_pass]
 
     st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
 
@@ -1698,19 +2244,6 @@ with tab_history:
 
     # ── Value Table ───────────────────────────────────────────────────────────
     hist_tickers = [r["ticker"] for r in filt_rows]
-    # Build detail map: use most-recent datetime per ticker
-    _ticker_latest: dict[str, str] = {}
-    for r in filt_rows:
-        t  = r["ticker"]
-        dt = r.get("analysis_datetime", "")
-        if t not in _ticker_latest or dt > _ticker_latest[t]:
-            _ticker_latest[t] = dt
-    hist_detail_map: dict = {}
-    for t, dt in _ticker_latest.items():
-        t_det = get_detail_filtered(ticker=t, analysis_dt=dt)
-        if t in t_det:
-            hist_detail_map[t] = t_det[t]
-
     hist_rows_by_ticker = {r["ticker"]: r for r in filt_rows}
     render_value_table(hist_tickers, hist_detail_map,
                        hist_rows_by_ticker, hist_fund_map, "history",
