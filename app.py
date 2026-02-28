@@ -96,7 +96,7 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     ],
     # ── tech_indicators groups ─────────────────────────────────────────────────
     "Price & 52W": [
-        "Tech Date", "Close", "Latest Px %", "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
+        "Last Close Date", "Close", "Change %", "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
     ],
     "EMA & Slope": [
         "EMA9", "EMA21", "EMA50", "EMA200", "SMA50 Slope 20D", "From SMA200%",
@@ -220,9 +220,9 @@ TECH_COL_MAP: dict[str, str] = {
     "ma20_gt_ma50":        "MA20>MA50",
     "ma50_gt_ma150":       "MA50>MA150",
     "ma150_gt_ma200":      "MA150>MA200",
-    "as_of_date":          "Tech Date",
+    "as_of_date":          "Last Close Date",
     "is_finalized":        "Finalized",
-    "daily_pct_change":    "Latest Px %",
+    "daily_pct_change":    "Change %",
 }
 # Reverse map: display name → tech_indicators field
 TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
@@ -252,7 +252,7 @@ _COL_FILTER_EMOJI = {
     "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
     "Breakout 55D", "Breakout 3M", "Finalized",
 }
-_COL_FILTER_DATES = {"Q End Date", "A End Date", "Tech Date"}
+_COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
 # All user-filterable value columns (ordered, deduplicated)
 _FILTERABLE_COLS  = [c for c in ALL_VALUE_COLS if c not in _COL_FILTER_SKIP]
@@ -572,9 +572,9 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "MA20>MA50":       _bi(tc.get("ma20_gt_ma50")),
         "MA50>MA150":      _bi(tc.get("ma50_gt_ma150")),
         "MA150>MA200":     _bi(tc.get("ma150_gt_ma200")),
-        "Tech Date":       str(tc.get("as_of_date") or "N/A"),
-        "Finalized":       _bi(tc.get("is_finalized")),
-        "Latest Px %":     _f(tc.get("daily_pct_change")),
+        "Last Close Date":  str(tc.get("as_of_date") or "N/A"),
+        "Finalized":        _bi(tc.get("is_finalized")),
+        "Change %":         _f(tc.get("daily_pct_change")),
     }
     return rec
 
@@ -776,11 +776,13 @@ def build_summary_df(rows: list[dict],
                      selected_inds: list[str] | None = None,
                      include_datetime: bool = False,
                      si_map: dict | None = None,
-                     ne_map: dict | None = None) -> pd.DataFrame:
+                     ne_map: dict | None = None,
+                     tech_map: dict | None = None) -> pd.DataFrame:
     """
     Build the indicator summary DataFrame.
     si_map: {ticker: (sector, industry)}
     ne_map: {ticker: next_earnings_date_str}
+    tech_map: {ticker: tech_indicators dict} for Close / Change % / Last Close Date
     """
     if not rows:
         return pd.DataFrame()
@@ -788,6 +790,7 @@ def build_summary_df(rows: list[dict],
     inds_to_show = selected_inds if selected_inds else MAIN_IND_COLS
     si = si_map or {}
     ne = ne_map or {}
+    tm = tech_map or {}
 
     records = []
     for r in rows:
@@ -806,13 +809,17 @@ def build_summary_df(rows: list[dict],
 
         rec["Comments"] = r.get("comments") or ""
 
-        # Rightmost: Mkt Cap, Sector, Industry, Next Earnings
+        # Rightmost: Mkt Cap, Sector, Industry, Next Earnings, Close, Change %, Last Close Date
         ticker = r.get("ticker", "")
         rec["Mkt Cap ($B)"] = _mkt_cap_b(r.get("market_cap"))
         sector, industry = si.get(ticker, ("N/A", "N/A"))
-        rec["Sector"]         = sector
-        rec["Industry"]       = industry
-        rec["Next Earnings"]  = ne.get(ticker, "N/A")
+        rec["Sector"]          = sector
+        rec["Industry"]        = industry
+        rec["Next Earnings"]   = ne.get(ticker, "N/A")
+        tc = tm.get(ticker, {})
+        rec["Close"]           = tc.get("close")
+        rec["Change %"]        = tc.get("daily_pct_change")
+        rec["Last Close Date"] = str(tc.get("as_of_date") or "N/A")
 
         records.append(rec)
 
@@ -884,8 +891,12 @@ def make_column_config(df: pd.DataFrame) -> dict:
             config[col] = st.column_config.NumberColumn(
                 "Mkt Cap ($B)", format="%.2f", disabled=True
             )
-        elif col in ("Sector", "Industry", "Next Earnings"):
+        elif col in ("Sector", "Industry", "Next Earnings", "Last Close Date"):
             config[col] = st.column_config.TextColumn(col, disabled=True)
+        elif col == "Close":
+            config[col] = st.column_config.NumberColumn("Close", format="%.2f", disabled=True)
+        elif col == "Change %":
+            config[col] = st.column_config.NumberColumn("Change %", format="%.2f", disabled=True)
     return config
 
 
@@ -1623,7 +1634,7 @@ def _value_col_config(cols: list[str]) -> dict:
         if col == "Ticker":
             cfg[col] = st.column_config.TextColumn(col, disabled=True)
         elif col in ("Sector", "Industry", "Q End Date", "A End Date",
-                     "Next Earnings Date", "Tech Date",
+                     "Next Earnings Date", "Last Close Date",
                      "Breakout 55D", "Breakout 3M", "Finalized",
                      "MA10>20", "MA20>50", "MA50>150", "MA150>200",
                      "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200"):
@@ -2059,7 +2070,8 @@ with tab_latest:
     st.caption("✅ PASS · ⭕ PARTIAL · ❌ FAIL · ⚪️ N/A  —  Edit any cell and click **Save Edits**")
 
     sum_df  = build_summary_df(display_rows, show_sub=show_sub,
-                               si_map=si_map_latest, ne_map=ne_map_latest)
+                               si_map=si_map_latest, ne_map=ne_map_latest,
+                               tech_map=tech_map_latest)
     col_cfg = make_column_config(sum_df)
 
     edited = st.data_editor(
@@ -2228,7 +2240,7 @@ with tab_history:
 
     all_df = build_summary_df(filt_rows, show_sub=all_show_sub,
                               include_datetime=True, si_map=si_map_hist,
-                              ne_map=ne_map_hist)
+                              ne_map=ne_map_hist, tech_map=hist_tech_map)
     all_col_cfg = make_column_config(all_df)
 
     all_edited = st.data_editor(
