@@ -41,6 +41,7 @@ from fundamental_fetcher import fetch_fundamental
 from peers_fetcher import get_peer_valuations, clear_peer_cache
 import vpn_switcher
 from indicators    import evaluate_all, score_indicators
+import storage
 from storage import (
     init_db, save_results, update_field,
     get_all_run_datetimes, get_latest_run_datetime,
@@ -1246,6 +1247,135 @@ def _scan_progress_autorefresh():
         render_scan_progress()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Detailed Analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+AI_MODEL       = "gemini-3.1-pro-preview"
+AI_MAX_TICKERS = 50
+AI_MAX_WORKERS = 3
+
+_ss("ai_progress",     None)   # shared progress dict (written by bg thread)
+_ss("ai_cancel_event", None)   # threading.Event to cancel
+_ss("ai_thread",       None)   # background Thread
+
+
+def _launch_ai_analysis(tickers: list[str]) -> None:
+    """Start a background thread to run AI analysis on up to AI_MAX_TICKERS tickers."""
+    from ai_analyzer import synthesize_analysis  # lazy import
+
+    run_dt      = _now_cst()
+    cancel_evt  = threading.Event()
+    lock        = threading.Lock()
+    progress: dict = {
+        "done":   0,
+        "total":  len(tickers),
+        "active": [],
+        "run_dt": run_dt,
+        "errors": [],
+        "status": "running",
+    }
+
+    def _analyze_one(ticker: str) -> None:
+        if cancel_evt.is_set():
+            with lock:
+                progress["done"] += 1
+            return
+        with lock:
+            progress["active"].append(ticker)
+        try:
+            report = synthesize_analysis(ticker, model=AI_MODEL)
+        except Exception as e:
+            report = f"Error analyzing {ticker}: {e}"
+            with lock:
+                progress["errors"].append(ticker)
+        try:
+            storage.save_ai_report(run_dt, ticker, report, AI_MODEL)
+        except Exception:
+            pass
+        with lock:
+            progress["done"] += 1
+            if ticker in progress["active"]:
+                progress["active"].remove(ticker)
+
+    def _run_all() -> None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=AI_MAX_WORKERS) as ex:
+            futures = [ex.submit(_analyze_one, t) for t in tickers]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+        with lock:
+            progress["status"] = "done"
+
+    st.session_state.ai_cancel_event = cancel_evt
+    st.session_state.ai_progress     = progress
+    t = threading.Thread(target=_run_all, daemon=True)
+    st.session_state.ai_thread = t
+    t.start()
+
+
+@st.fragment(run_every=2)
+def _ai_progress_autorefresh():
+    """Auto-refreshes AI analysis progress every 2 s."""
+    progress = st.session_state.get("ai_progress")
+    if not progress:
+        return
+
+    status  = progress.get("status", "running")
+    done    = progress.get("done", 0)
+    total   = progress.get("total", 1)
+    active  = progress.get("active", [])
+    run_dt  = progress.get("run_dt", "")
+    errors  = progress.get("errors", [])
+
+    if status == "done":
+        # First time we see "done": trigger a full-page rerun so tab_ai
+        # re-fetches reports from DB. Mark as "shown" to avoid looping.
+        if not progress.get("shown"):
+            progress["shown"] = True
+            st.rerun(scope="app")
+        msg = f"✅ AI analysis complete — {done} ticker(s) | Run: {run_dt}"
+        if errors:
+            msg += f" | ⚠️ Errors: {', '.join(errors)}"
+        st.success(msg)
+        if st.button("Clear", key="ai_clear_status"):
+            st.session_state.ai_progress = None
+            st.rerun(scope="app")
+        return
+
+    frac       = done / total if total else 0
+    active_str = ", ".join(active) if active else "queuing…"
+    st.progress(frac, text=f"🤖 AI analyzing… {done}/{total} complete | Active: {active_str}")
+    if st.button("⏹ Cancel AI Analysis", key="ai_cancel_btn"):
+        evt = st.session_state.get("ai_cancel_event")
+        if evt:
+            evt.set()
+
+
+@st.dialog("Confirm AI Analysis")
+def _ai_confirm_dialog(tickers: list[str]) -> None:
+    n       = len(tickers)
+    preview = ", ".join(tickers[:15]) + ("…" if n > 15 else "")
+    st.markdown(
+        f"**Run AI analysis on {n} ticker(s)?**\n\n"
+        f"{preview}\n\n"
+        f"Uses Gemini ({AI_MODEL}) with live web search. "
+        f"Up to {AI_MAX_WORKERS} tickers run in parallel.",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✅ Confirm", type="primary", use_container_width=True):
+            _launch_ai_analysis(tickers)
+            del st.session_state["ai_confirm_pending"]
+            st.rerun()
+    with c2:
+        if st.button("❌ Cancel", use_container_width=True):
+            del st.session_state["ai_confirm_pending"]
+            st.rerun()
+
+
 
 
 # ── Per-tab filter session-state key mapping ──────────────────────────────────
@@ -1593,6 +1723,8 @@ def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
     op, fv = spec["op"], spec["val"]
     if t == "date":
         sval = str(val)
+        if sval in ("N/A", "", "None", "nan"):
+            return False
         return (op == "=" and sval == fv) or (op == ">" and sval > fv) \
             or (op == "<" and sval < fv) or (op == ">=" and sval >= fv) \
             or (op == "<=" and sval <= fv)
@@ -1811,7 +1943,7 @@ st.caption("Evaluates stocks across 10 technical & fundamental indicators · Tim
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("🔍 Analyze Stocks")
+    st.header("📊 Market Scan")
     st.caption("Leave blank to scan all tickers from tickers.txt")
 
     ticker_input = st.text_input("Tickers (comma-separated)", placeholder="AAPL, TSLA, MU")
@@ -1834,7 +1966,7 @@ with st.sidebar:
         help="Rotates Mullvad server after each batch to avoid rate limiting. Requires Mullvad CLI.",
     )
 
-    run_btn  = st.button("▶ Run Analysis", type="primary", width="stretch")
+    run_btn  = st.button("▶ Run Market Scan", type="primary", width="stretch")
     st.divider()
 
     st.markdown("""
@@ -1874,7 +2006,30 @@ F3.1 Q Rev YoY>+10%
 F3.2 Q EPS YoY>+30%  
 F4.1 A Rev YoY>+10%  
 F4.2 A EPS YoY>+30%  
+F5 Fwd PE ≤ Peer Median  
+F6 P/B ≤ Peer Median  
     """)
+
+    st.divider()
+    st.markdown("**🤖 AI Analysis**")
+    ai_sidebar_input = st.text_area(
+        "Tickers (comma-separated)",
+        placeholder="MU, SNDK, LITE",
+        key="ai_sidebar_tickers",
+        height=80,
+        label_visibility="collapsed",
+    )
+    if st.button("Run AI Analysis", key="ai_sidebar_run", use_container_width=True):
+        raw_ai = ai_sidebar_input.strip()
+        if not raw_ai:
+            st.error("Enter at least one ticker.")
+        else:
+            ai_tickers = [t.strip().upper() for t in raw_ai.split(",") if t.strip()]
+            if len(ai_tickers) > AI_MAX_TICKERS:
+                st.error(f"Max {AI_MAX_TICKERS} tickers. You entered {len(ai_tickers)}.")
+            else:
+                st.session_state["ai_confirm_pending"] = {"tickers": ai_tickers}
+                st.rerun()
 
 # ── Handle Run button ─────────────────────────────────────────────────────────
 if run_btn:
@@ -1929,6 +2084,17 @@ if run_btn:
 _scan_progress_autorefresh()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AI Analysis progress (fragment — auto-refreshes every 2 s)
+# ─────────────────────────────────────────────────────────────────────────────
+_ai_progress_autorefresh()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Analysis confirmation dialog (modal — freezes page)
+# ─────────────────────────────────────────────────────────────────────────────
+if "ai_confirm_pending" in st.session_state:
+    _ai_confirm_dialog(st.session_state["ai_confirm_pending"]["tickers"])
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Apply any pending filter/column ops (must run before any filter widgets render)
 # ─────────────────────────────────────────────────────────────────────────────
 _process_pending_ops()
@@ -1936,170 +2102,11 @@ _process_pending_ops()
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_latest, tab_history = st.tabs(["📊 Latest Query", "🗂 All Queries"])
+tab_history, tab_ai = st.tabs(["📊 Market Scan", "🤖 AI Analysis"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1: Latest Query
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab_latest:
-    last_dt = st.session_state.last_analysis_dt or get_latest_run_datetime()
-
-    if last_dt is None:
-        st.info("No analysis run yet. Enter tickers or leave blank for a full scan.")
-        st.stop()
-
-    summary_rows = get_summary_for_run(last_dt)
-    detail_map   = st.session_state.last_detail_map
-    inds_live    = st.session_state.get("last_inds_live", {})
-    tickers      = st.session_state.last_tickers
-
-    # Scan mode: show top-50 in Latest Query
-    is_scan = not tickers and bool(summary_rows)
-    if is_scan:
-        tickers = [r["ticker"] for r in summary_rows]
-        # Score and sort: rank by score desc, then market_cap desc
-        scored = []
-        for r in summary_rows:
-            inds_dict = {ind: {"pass": r.get(ind, "NA")} for ind in MAIN_IND_COLS}
-            sc = score_indicators(inds_dict)
-            mc = r.get("market_cap") or 0
-            scored.append((sc, mc, r["ticker"], r))
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        top50_rows   = [s[3] for s in scored[:50]]
-        top50_tickers = [r["ticker"] for r in top50_rows]
-    else:
-        top50_rows    = summary_rows
-        top50_tickers = tickers or [r["ticker"] for r in summary_rows]
-
-    # Rebuild detail_map from DB if page reloaded
-    if not detail_map and summary_rows:
-        detail_map = get_detail_for_run(last_dt)
-        tickers    = top50_tickers
-
-    st.subheader(f"Analysis: {last_dt}")
-    if is_scan:
-        total_scanned = len(summary_rows)
-        st.caption(f"Scan mode — showing top 50 of {total_scanned} tickers "
-                   f"(ranked by score then market cap)")
-
-    # ── Fetch fund/tech data ───────────────────────────────────────────────────
-    fund_map_latest = get_all_fundamentals_for_run(top50_tickers)
-    tech_map_latest = get_tech_for_tickers(top50_tickers)
-    si_map_latest   = _extract_si(fund_map_latest)
-    ne_map_latest   = _extract_ne(fund_map_latest)
-
-    # Build sector→industries mapping for cascade
-    _s2i_l: dict[str, set[str]] = {}
-    for s, i in si_map_latest.values():
-        if s != "N/A" and i != "N/A":
-            _s2i_l.setdefault(s, set()).add(i)
-
-    # Pre-read sector selection for cascade
-    _f_sectors_l_pre = st.session_state.get("latest_f_sector", [])
-    all_sectors_l    = sorted({s for s, _ in si_map_latest.values() if s != "N/A"})
-    if _f_sectors_l_pre:
-        avail_industries_l = sorted({i for s in _f_sectors_l_pre for i in _s2i_l.get(s, set())})
-    else:
-        avail_industries_l = sorted({i for _, i in si_map_latest.values() if i != "N/A"})
-
-    # ── Row 1: ticker name | sector | industry ────────────────────────────────
-    lf1, lf2, lf3 = st.columns(3)
-    with lf1:
-        f_ticker_l = st.text_input("Filter by Ticker", placeholder="e.g. AAPL",
-                                   key="latest_f_ticker_name")
-    with lf2:
-        f_sectors_l = st.multiselect("Filter by Sector", options=all_sectors_l,
-                                     key="latest_f_sector")
-    with lf3:
-        f_industries_l = st.multiselect("Filter by Industry", options=avail_industries_l,
-                                        key="latest_f_industry")
-
-    # ── Market cap filter ─────────────────────────────────────────────────────
-    mc1, mc2 = st.columns(2)
-    with mc1:
-        mc_lo_l = st.number_input("Mkt Cap min ($B)", value=None, min_value=0.0,
-                                  placeholder="no min", key="latest_mc_lo",
-                                  format="%.2f", step=1.0)
-    with mc2:
-        mc_hi_l = st.number_input("Mkt Cap max ($B)", value=None, min_value=0.0,
-                                  placeholder="no max", key="latest_mc_hi",
-                                  format="%.2f", step=1.0)
-
-    # ── Indicator filter — always visible ─────────────────────────────────────
-    latest_ind_filter, latest_col_filter = render_indicator_filter("latest")
-
-    # ── Options below indicator filter ────────────────────────────────────────
-    show_sub = st.checkbox("Show sub-indicators", value=False, key="latest_show_sub")
-
-    # Apply filters
-    display_rows = top50_rows
-    if f_ticker_l:
-        display_rows = [r for r in display_rows
-                        if f_ticker_l.upper() in r["ticker"].upper()]
-    if f_sectors_l:
-        display_rows = [r for r in display_rows
-                        if si_map_latest.get(r["ticker"], ("N/A",))[0] in f_sectors_l]
-    if f_industries_l:
-        display_rows = [r for r in display_rows
-                        if si_map_latest.get(r["ticker"], ("N/A", "N/A"))[1] in f_industries_l]
-    if mc_lo_l is not None:
-        display_rows = [r for r in display_rows
-                        if _mkt_cap_b(r.get("market_cap")) is not None
-                        and _mkt_cap_b(r.get("market_cap")) >= mc_lo_l]
-    if mc_hi_l is not None:
-        display_rows = [r for r in display_rows
-                        if _mkt_cap_b(r.get("market_cap")) is not None
-                        and _mkt_cap_b(r.get("market_cap")) <= mc_hi_l]
-    display_rows = apply_indicator_filter(display_rows, latest_ind_filter)
-    display_tickers = [r["ticker"] for r in display_rows]
-    # Apply column value filter
-    if latest_col_filter:
-        all_rows_by_ticker_l = {r["ticker"]: r for r in top50_rows}
-        display_tickers = apply_col_filter(
-            display_tickers, latest_col_filter, detail_map,
-            all_rows_by_ticker_l, fund_map_latest, tech_map_latest,
-        )
-        display_rows = [r for r in display_rows if r["ticker"] in set(display_tickers)]
-
-    st.caption(f"Showing **{len(display_rows)}** / {len(top50_rows)} rows")
-
-    # ── Indicator Summary ─────────────────────────────────────────────────────
-    st.markdown("### 📊 Indicator Summary")
-    st.caption("✅ PASS · ⭕ PARTIAL · ❌ FAIL · ⚪️ N/A  —  Edit any cell and click **Save Edits**")
-
-    sum_df  = build_summary_df(display_rows, show_sub=show_sub,
-                               si_map=si_map_latest, ne_map=ne_map_latest,
-                               tech_map=tech_map_latest)
-    col_cfg = make_column_config(sum_df)
-
-    edited = st.data_editor(
-        sum_df, column_config=col_cfg,
-        width="stretch", hide_index=True,
-        key="latest_sum_editor",
-    )
-    if st.button("💾 Save Edits", key="save_latest"):
-        save_edits(display_rows, edited, include_datetime=False)
-        st.success("Saved.")
-
-    st.markdown("---")
-
-    # ── Value Table ───────────────────────────────────────────────────────────
-    rows_by_ticker_latest = {r["ticker"]: r for r in display_rows}
-    render_value_table(display_tickers, detail_map,
-                       rows_by_ticker_latest, fund_map_latest, "latest",
-                       tech_map=tech_map_latest)
-
-    st.markdown("---")
-
-    # ── Indicator Detail ──────────────────────────────────────────────────────
-    st.markdown("### 🔍 Indicator Detail")
-    render_detail_for_tickers(display_tickers, detail_map, inds_live or None, state_key="latest")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2: All Queries
+# TAB 1: Market Scan
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_history:
@@ -2109,8 +2116,8 @@ with tab_history:
         st.info("No historical data yet.")
         st.stop()
 
-    # ── All-Runs Summary ──────────────────────────────────────────────────────
-    st.markdown("### 🗂 All-Runs Summary")
+    # ── Market Scan Summary ───────────────────────────────────────────────────
+    st.markdown("### 📊 Market Scan")
     st.caption("Rows sorted: newest datetime first, then alphabetical ticker")
 
     # Pre-read widget states for data fetching before widget rendering
@@ -2252,6 +2259,20 @@ with tab_history:
         save_edits(filt_rows, all_edited, include_datetime=True)
         st.success("Saved.")
 
+    # AI Analysis button for filtered tickers
+    _hist_ai_tickers = list(dict.fromkeys(r["ticker"] for r in filt_rows))
+    _n_hist_ai = len(_hist_ai_tickers)
+    if _n_hist_ai > 0:
+        if st.button(
+            f"🤖 Run AI Analysis on {_n_hist_ai} filtered ticker(s)",
+            key="ai_run_history_btn",
+        ):
+            if _n_hist_ai > AI_MAX_TICKERS:
+                st.error(f"Too many tickers ({_n_hist_ai}). Max is {AI_MAX_TICKERS}.")
+            else:
+                st.session_state["ai_confirm_pending"] = {"tickers": _hist_ai_tickers}
+                st.rerun()
+
     st.markdown("---")
 
     # ── Value Table ───────────────────────────────────────────────────────────
@@ -2323,3 +2344,51 @@ with tab_history:
         )
     else:
         st.info("Select a ticker and/or datetime above to view detail.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2: AI Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_ai:
+    st.markdown("### 🤖 AI Analysis")
+    st.caption(
+        "Reports are generated by Gemini with live web search. "
+        "Use the sidebar or the Run AI Analysis buttons to start an analysis."
+    )
+
+    all_rpt_tickers = storage.get_ai_report_tickers()
+    all_rpt_run_dts = storage.get_ai_report_run_dts()
+
+    if not all_rpt_tickers:
+        st.info("No AI reports yet. Run an analysis from the sidebar or the emoji table buttons.")
+    else:
+        ai_col1, ai_col2 = st.columns(2)
+        with ai_col1:
+            ai_f_tickers = st.multiselect(
+                "Filter by ticker",
+                options=all_rpt_tickers,
+                key="ai_rpt_f_ticker",
+            )
+        with ai_col2:
+            ai_f_dt_opts = ["All"] + all_rpt_run_dts
+            ai_f_dt = st.selectbox(
+                "Filter by run datetime",
+                options=ai_f_dt_opts,
+                key="ai_rpt_f_dt",
+            )
+
+        filter_dts = [ai_f_dt] if ai_f_dt != "All" else None
+        reports = storage.get_ai_reports(
+            tickers=ai_f_tickers or None,
+            run_dts=filter_dts,
+        )
+
+        if not reports:
+            st.info("No reports match the current filter.")
+        else:
+            st.caption(f"Showing **{len(reports)}** report(s)")
+            for rep in reports:
+                hdr = f"**{rep['ticker']}** — {rep['run_dt']}  ·  model: {rep['model'] or 'unknown'}"
+                with st.expander(hdr, expanded=(len(reports) == 1)):
+                    st.markdown(rep["report"] or "_No content returned._")

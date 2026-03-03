@@ -240,6 +240,16 @@ CREATE TABLE IF NOT EXISTS peer_cache (
 """
 
 
+_DDL_AI_REPORTS = """
+CREATE TABLE IF NOT EXISTS ai_reports (
+    run_dt  TEXT NOT NULL,
+    ticker  TEXT NOT NULL,
+    report  TEXT,
+    model   TEXT,
+    PRIMARY KEY (run_dt, ticker)
+);
+"""
+
 _thread_local = threading.local()
 
 
@@ -257,6 +267,7 @@ def init_db() -> None:
     con.execute(_DDL_RUNS)
     con.execute(_DDL_DETAILS)
     con.execute(_DDL_PEERS)
+    con.execute(_DDL_AI_REPORTS)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
 
@@ -672,5 +683,57 @@ def get_tickers_for_datetime(analysis_dt: str) -> list[str]:
         "SELECT DISTINCT ticker FROM analysis_runs "
         "WHERE run_dt = ? ORDER BY ticker",
         [analysis_dt],
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+# ── AI Reports ────────────────────────────────────────────────────────────────
+
+def save_ai_report(run_dt: str, ticker: str, report: str, model: str) -> None:
+    """Upsert one AI report row."""
+    con = _conn()
+    con.execute(
+        "INSERT OR REPLACE INTO ai_reports (run_dt, ticker, report, model) VALUES (?, ?, ?, ?)",
+        [run_dt, ticker.upper(), report, model],
+    )
+
+
+def get_ai_reports(tickers: list[str] | None = None,
+                   run_dts: list[str] | None = None) -> list[dict]:
+    """Return ai_reports rows matching optional ticker/run_dt filters, newest first."""
+    where_clauses = []
+    params: list = []
+    if tickers:
+        placeholders = ", ".join(["?" for _ in tickers])
+        where_clauses.append(f"ticker IN ({placeholders})")
+        params.extend([t.upper() for t in tickers])
+    if run_dts:
+        placeholders = ", ".join(["?" for _ in run_dts])
+        where_clauses.append(f"run_dt IN ({placeholders})")
+        params.extend(run_dts)
+    where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    con = _conn()
+    rows = con.execute(
+        f"SELECT run_dt, ticker, report, model FROM ai_reports {where} "
+        "ORDER BY run_dt DESC, ticker ASC",
+        params,
+    ).fetchall()
+    return [{"run_dt": r[0], "ticker": r[1], "report": r[2], "model": r[3]} for r in rows]
+
+
+def get_ai_report_run_dts() -> list[str]:
+    """All distinct run_dt values in ai_reports, newest first."""
+    con = _conn()
+    rows = con.execute(
+        "SELECT DISTINCT run_dt FROM ai_reports ORDER BY run_dt DESC"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_ai_report_tickers() -> list[str]:
+    """All distinct ticker values in ai_reports, alphabetical."""
+    con = _conn()
+    rows = con.execute(
+        "SELECT DISTINCT ticker FROM ai_reports ORDER BY ticker"
     ).fetchall()
     return [r[0] for r in rows]
