@@ -43,13 +43,14 @@ import vpn_switcher
 from indicators    import evaluate_all, score_indicators
 import storage
 from storage import (
-    init_db, save_results, update_field,
+    init_db, save_results, update_field, save_comment_for_ticker,
     get_all_run_datetimes, get_latest_run_datetime,
     get_summary_for_run, get_detail_for_run, get_all_summaries,
     get_detail_filtered, get_all_tickers,
     get_datetimes_for_ticker, get_tickers_for_datetime,
     get_cached_peer_valuations, save_peer_valuations,
     get_all_fundamentals_for_run, get_tech_for_tickers,
+    get_latest_earnings_for_tickers,
     MAIN_IND_COLS, ALL_SUB_COLS, SUB_COLS,
 )
 
@@ -93,7 +94,34 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "Fwd PE", "Fwd PE vs Med%", "P/B", "P/B vs Med%",
     ],
     "Fundamentals": [
-        "Mkt Cap ($B)", "Sector", "Industry",
+        "Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
+    ],
+    "Earnings Detail": [
+        "Next Earnings Date", "Next Earnings Time",
+        "Last Earnings Date", "Last Earnings Time", "Last Earnings 1D Change",
+        "EPS Est", "EPS Act", "EPS Sur",
+        "EPS GAAP Est", "EPS GAAP Act", "EPS GAAP Sur",
+        "Rev Est ($M)", "Rev Act ($M)", "Rev Sur",
+    ],
+    "Score": ["Score"],
+    "Short Interest": [
+        "Short % Float (Y)", "Short % Float (Calc)",
+        "Short % Out (Y)", "Short % Out (Calc)", "Short % Impl Out",
+        "Days to Cover", "Shares Short (M)", "Float Shares (M)",
+        "Shares Out (M)", "Short MoM Chg%", "Short Interest Date", "Avg Vol (M)",
+    ],
+    "Insider Activity (6M)": [
+        "Ins Buy #", "Ins Sell #", "Ins Buy Shares (M)",
+        "Ins Sell Shares (M)", "Ins Net Shares (M)",
+        "Ins Buy %", "Ins Sell %", "Ins Net %",
+    ],
+    "Margins & Ratios": [
+        "Gross Margin%", "EBITDA Margin%", "Op Margin%", "Net Margin%",
+        "Current Ratio", "Quick Ratio", "D/E Ratio", "ROE%", "ROA%",
+    ],
+    "Analyst Targets": [
+        "Target Median", "Target High", "Target Low", "Target Mean",
+        "Price vs Target%", "Rec Score", "Rec Key", "Analyst Count",
     ],
     # ── tech_indicators groups ─────────────────────────────────────────────────
     "Price & 52W": [
@@ -246,14 +274,19 @@ ALL_VALUE_COLS = list(dict.fromkeys(c for cols in VALUE_COL_GROUPS.values() for 
 
 # ── Column filter classification ───────────────────────────────────────────────
 _COL_FILTER_SKIP = {
-    "Ticker", "Sector", "Industry", "Next Earnings Date", "Mkt Cap ($B)",
+    "Ticker", "Sector", "Industry", "Mkt Cap ($B)",
+    "Rec Key", "Company Name", "Company Description",
 }
 _COL_FILTER_EMOJI = {
     "MA10>20", "MA20>50", "MA50>150", "MA150>200",
     "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
     "Breakout 55D", "Breakout 3M", "Finalized",
 }
-_COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date"}
+_COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
+    "Last Earnings Time":  ["BMO", "AMC"],
+    "Next Earnings Time":  ["BMO", "AMC"],
+}
+_COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
 # All user-filterable value columns (ordered, deduplicated)
 _FILTERABLE_COLS  = [c for c in ALL_VALUE_COLS if c not in _COL_FILTER_SKIP]
@@ -284,7 +317,31 @@ SUB_DISPLAY = {
     "F4_sub_a_eps_yoy":   "F4.2",
 }
 
-init_db()
+try:
+    init_db()
+except Exception as _init_err:
+    print(f"[storage] init_db warning: {_init_err}")
+
+if "_startup_finalized" not in st.session_state:
+    st.session_state["_startup_finalized"] = True
+    try:
+        storage.mark_old_tech_finalized()
+    except Exception as _e:
+        print(f"[startup] mark_old_tech_finalized failed: {_e}")
+
+if "_earnings_fetched" not in st.session_state:
+    st.session_state["_earnings_fetched"] = True
+    try:
+        from earnings_fetcher import run_daily_fetch as _earnings_daily
+        from storage import get_latest_earnings_date as _get_latest_earnings_date
+        _since = _get_latest_earnings_date()
+        if _since:
+            print(f"[earnings] Latest earnings date in DB: {_since} — fetching from there")
+            _earnings_daily(since_date=_since)
+        else:
+            _earnings_daily(lookback_days=7)
+    except Exception as _e:
+        print(f"[earnings] Daily fetch failed: {_e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state init
@@ -357,6 +414,43 @@ def _f(v) -> float | None:
     except Exception:
         return None
 
+
+def compute_score(row: dict) -> float:
+    """Compute 0–100 composite score from analysis_runs sub-indicator columns.
+
+    Scoring rules (max 100):
+      T1/T2 pairs — price PASS → 2.5; price+vol both PASS → 5  (4 pairs × 5 = 20)
+      T3.1–T3.4   — each 5 pts                                  (4 × 5 = 20)
+      T4.1–T4.2   — each 5 pts                                  (2 × 5 = 10)
+      F1.1–F4.2   — each 5 pts                                  (8 × 5 = 40)
+      F5, F6      — each 5 pts                                  (2 × 5 = 10)
+    """
+    def p(col: str) -> bool:
+        return str(row.get(col, "NA")).upper() == "PASS"
+
+    s = 0.0
+    # T1 pairs: price only → 2.5; price + vol → 5
+    if p("T1_sub_3m_price"):  s += 2.5 + (2.5 if p("T1_sub_3m_vol") else 0)
+    if p("T1_sub_12m_price"): s += 2.5 + (2.5 if p("T1_sub_12m_vol") else 0)
+    # T2 pairs
+    if p("T2_sub_3m_price"):  s += 2.5 + (2.5 if p("T2_sub_3m_vol") else 0)
+    if p("T2_sub_12m_price"): s += 2.5 + (2.5 if p("T2_sub_12m_vol") else 0)
+    # T3 (each 5)
+    for c in ("T3_sub_ma10_20", "T3_sub_ma20_50", "T3_sub_ma50_150", "T3_sub_ma150_200"):
+        if p(c): s += 5
+    # T4 (each 5)
+    for c in ("T4_sub_has_big_up", "T4_sub_no_big_down"):
+        if p(c): s += 5
+    # F1–F4 sub-indicators (each 5)
+    for c in ("F1_sub_q_rev", "F1_sub_q_eps", "F2_sub_a_rev", "F2_sub_a_eps",
+              "F3_sub_q_rev_yoy", "F3_sub_q_eps_yoy", "F4_sub_a_rev_yoy", "F4_sub_a_eps_yoy"):
+        if p(c): s += 5
+    # F5, F6 main indicators (each 5)
+    for c in ("F5", "F6"):
+        if p(c): s += 5
+    return s
+
+
 def _mkt_cap_b(v) -> float | None:
     """Market cap in billions (2 dp) for readable display without clicking."""
     f = _f(v)
@@ -382,30 +476,63 @@ def _extract_si(fund_map: dict) -> dict[str, tuple[str, str]]:
         )
     return result
 
+def _extract_company(fund_map: dict) -> dict[str, tuple[str, str]]:
+    """Extract {ticker: (longName, longBusinessSummary)} from a fund_map dict."""
+    result: dict[str, tuple[str, str]] = {}
+    for ticker, f_db in fund_map.items():
+        raw_info = _parse_raw_info(f_db)
+        result[ticker] = (
+            raw_info.get("longName") or "N/A",
+            raw_info.get("longBusinessSummary") or "N/A",
+        )
+    return result
+
+
+def _earnings_ts_to_date_time(v) -> tuple[str, str]:
+    """Convert a Yahoo Finance epoch earnings timestamp to (date_str, time_str).
+
+    time_str is "BMO" if hour < 16 UTC (pre-market / before 4pm ET),
+    "AMC" if hour >= 16 UTC (after-hours / 4pm+ ET), or "N/A" on error.
+    """
+    from datetime import timezone as _tz
+    if v is None:
+        return "N/A", "N/A"
+    if isinstance(v, list):
+        v = v[0] if v else None
+    if v is None:
+        return "N/A", "N/A"
+    try:
+        dt = datetime.fromtimestamp(float(v), tz=_tz.utc)
+        date_str = dt.strftime("%Y-%m-%d")
+        time_str = "BMO" if dt.hour < 16 else "AMC"
+        return date_str, time_str
+    except Exception:
+        return "N/A", "N/A"
+
+
 def _extract_ne(fund_map: dict) -> dict[str, str]:
     """Extract {ticker: next_earnings_date_str} from a fund_map dict."""
-    from datetime import timezone
     result: dict[str, str] = {}
     for ticker, f_db in fund_map.items():
         raw_info = _parse_raw_info(f_db)
         v = raw_info.get("earningsDate") or raw_info.get("earningsTimestamp")
-        if v is None:
-            result[ticker] = "N/A"
-            continue
-        if isinstance(v, list):
-            v = v[0] if v else None
-        if v is None:
-            result[ticker] = "N/A"
-            continue
-        try:
-            result[ticker] = datetime.fromtimestamp(float(v), tz=timezone.utc).strftime("%Y-%m-%d")
-        except Exception:
-            result[ticker] = "N/A"
+        result[ticker], _ = _earnings_ts_to_date_time(v)
+    return result
+
+
+def _extract_net(fund_map: dict) -> dict[str, str]:
+    """Extract {ticker: next_earnings_time (BMO/AMC/N/A)} from a fund_map dict."""
+    result: dict[str, str] = {}
+    for ticker, f_db in fund_map.items():
+        raw_info = _parse_raw_info(f_db)
+        v = raw_info.get("earningsDate") or raw_info.get("earningsTimestamp")
+        _, result[ticker] = _earnings_ts_to_date_time(v)
     return result
 
 
 def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
-                        tech: dict | None = None) -> dict:
+                        tech: dict | None = None,
+                        earnings: dict | None = None) -> dict:
     """Build one value-table row. Numeric columns are native float for correct sorting."""
     t1 = detail.get("T1", {})
     t2 = detail.get("T2", {})
@@ -435,23 +562,14 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         except Exception:
             return None
 
-    def _next_earnings(info: dict) -> str:
+    def _next_earnings_both(info: dict) -> tuple[str, str]:
         v = info.get("earningsDate") or info.get("earningsTimestamp")
-        if v is None:
-            return "N/A"
-        # yfinance returns a list of epoch timestamps or a single timestamp
-        if isinstance(v, list):
-            v = v[0] if v else None
-        if v is None:
-            return "N/A"
-        try:
-            from datetime import timezone
-            return datetime.fromtimestamp(float(v), tz=timezone.utc).strftime("%Y-%m-%d")
-        except Exception:
-            return str(v)
+        return _earnings_ts_to_date_time(v)
 
     rec = {
         "Ticker":          ticker,
+        "Comments":        row.get("comments") or "",
+        "Score":           compute_score(row),
         # T1 — daily comparisons (float %)
         "3M Daily Px%":   _f(t1.get("3M Price Change %")),
         "3M Daily Vol%":  _f(t1.get("3M Volume Change %")),
@@ -495,10 +613,13 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "P/B vs Med%":    _f(f6.get("Ticker vs Median %")),
         # Fundamentals
         "Mkt Cap ($B)":   _mkt_cap_b(row.get("market_cap") or f_db.get("market_cap")),
-        "Sector":         raw_info.get("sector") or "N/A",
-        "Industry":       raw_info.get("industry") or "N/A",
-        # Next earnings
-        "Next Earnings Date": _next_earnings(raw_info),
+        "Sector":              raw_info.get("sector") or "N/A",
+        "Industry":            raw_info.get("industry") or "N/A",
+        "Company Name":        raw_info.get("longName") or "N/A",
+        "Company Description": raw_info.get("longBusinessSummary") or "N/A",
+        # Next earnings (date + BMO/AMC time from same timestamp)
+        "Next Earnings Date": _next_earnings_both(raw_info)[0],
+        "Next Earnings Time": _next_earnings_both(raw_info)[1],
         # ── tech_indicators columns ───────────────────────────────────────────
         "Close":           _f(tc.get("close")),
         "52W High":        _f(tc.get("high_52w")),
@@ -577,6 +698,84 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "Finalized":        _bi(tc.get("is_finalized")),
         "Change %":         _f(tc.get("daily_pct_change")),
     }
+    # ── Earnings columns (from earnings_history) ──────────────────────────────
+    e = earnings or {}
+    rec["Last Earnings Date"]      = e.get("earnings_date") or "N/A"
+    rec["Last Earnings Time"]      = e.get("earnings_time") or "N/A"
+    rec["Last Earnings 1D Change"] = _f(e.get("one_day_change"))
+    rec["EPS Est"]       = _f(e.get("eps_est"))
+    rec["EPS Act"]       = _f(e.get("eps_act"))
+    rec["EPS Sur"]       = _f(e.get("eps_sur"))
+    rec["EPS GAAP Est"]  = _f(e.get("eps_gaap_est"))
+    rec["EPS GAAP Act"]  = _f(e.get("eps_gaap_act"))
+    rec["EPS GAAP Sur"]  = _f(e.get("eps_gaap_sur"))
+    rec["Rev Est ($M)"]  = _f(e.get("rev_est_m"))
+    rec["Rev Act ($M)"]  = _f(e.get("rev_act_m"))
+    rec["Rev Sur"]       = _f(e.get("rev_sur"))
+
+    # ── Short interest (from fundamentals DB) ─────────────────────────────────
+    def _pct(v):
+        return round(_f(v) * 100, 2) if v is not None else None
+
+    sh      = f_db.get("shares_short")
+    sh_pm   = f_db.get("shares_short_pm")
+    fl      = f_db.get("float_shares")
+    so      = f_db.get("shares_out")
+    si      = f_db.get("implied_shares")
+    spf     = f_db.get("short_pct_float")
+    spo     = f_db.get("short_pct_out")
+    avgvol  = f_db.get("avg_volume")
+
+    rec["Short % Float (Y)"]    = _pct(spf)
+    rec["Short % Float (Calc)"] = round(_f(sh) / _f(fl) * 100, 2) if sh and fl else None
+    rec["Short % Out (Y)"]      = _pct(spo)
+    rec["Short % Out (Calc)"]   = round(_f(sh) / _f(so) * 100, 2) if sh and so else None
+    rec["Short % Impl Out"]     = round(_f(sh) / _f(si) * 100, 2) if sh and si else None
+    rec["Days to Cover"]        = _f(f_db.get("short_ratio"))
+    rec["Shares Short (M)"]     = round(_f(sh) / 1e6, 2) if sh else None
+    rec["Float Shares (M)"]     = round(_f(fl) / 1e6, 2) if fl else None
+    rec["Shares Out (M)"]       = round(_f(so) / 1e6, 2) if so else None
+    rec["Short MoM Chg%"]       = round((_f(sh) - _f(sh_pm)) / abs(_f(sh_pm)) * 100, 2) \
+                                  if sh and sh_pm else None
+    rec["Short Interest Date"]  = f_db.get("date_short_int") or "N/A"
+    rec["Avg Vol (M)"]          = round(_f(avgvol) / 1e6, 2) if avgvol else None
+
+    # ── Insider activity (6M) ─────────────────────────────────────────────────
+    rec["Ins Buy #"]           = f_db.get("ins_buy_count")
+    rec["Ins Sell #"]          = f_db.get("ins_sell_count")
+    rec["Ins Buy Shares (M)"]  = round(_f(f_db.get("ins_buy_shares"))  / 1e6, 3) \
+                                 if f_db.get("ins_buy_shares")  else None
+    rec["Ins Sell Shares (M)"] = round(_f(f_db.get("ins_sell_shares")) / 1e6, 3) \
+                                 if f_db.get("ins_sell_shares") else None
+    rec["Ins Net Shares (M)"]  = round(_f(f_db.get("ins_net_shares"))  / 1e6, 3) \
+                                 if f_db.get("ins_net_shares")  else None
+    rec["Ins Buy %"]           = _pct(f_db.get("ins_buy_pct"))
+    rec["Ins Sell %"]          = _pct(f_db.get("ins_sell_pct"))
+    rec["Ins Net %"]           = _pct(f_db.get("ins_net_pct"))
+
+    # ── Margins & ratios ──────────────────────────────────────────────────────
+    rec["Gross Margin%"]  = _pct(f_db.get("gross_margin"))
+    rec["EBITDA Margin%"] = _pct(f_db.get("ebitda_margin"))
+    rec["Op Margin%"]     = _pct(f_db.get("op_margin"))
+    rec["Net Margin%"]    = _pct(f_db.get("net_margin"))
+    rec["Current Ratio"]  = _f(f_db.get("current_ratio"))
+    rec["Quick Ratio"]    = _f(f_db.get("quick_ratio"))
+    rec["D/E Ratio"]      = _f(f_db.get("debt_to_equity"))
+    rec["ROE%"]           = _pct(f_db.get("roe"))
+    rec["ROA%"]           = _pct(f_db.get("roa"))
+
+    # ── Analyst targets ───────────────────────────────────────────────────────
+    t_med = _f(f_db.get("target_median"))
+    c_px  = _f(f_db.get("current_price_fd"))
+    rec["Target Median"]    = t_med
+    rec["Target High"]      = _f(f_db.get("target_high"))
+    rec["Target Low"]       = _f(f_db.get("target_low"))
+    rec["Target Mean"]      = _f(f_db.get("target_mean"))
+    rec["Price vs Target%"] = round((c_px / t_med - 1) * 100, 2) if c_px and t_med else None
+    rec["Rec Score"]        = _f(f_db.get("rec_mean"))
+    rec["Rec Key"]          = f_db.get("rec_key") or "N/A"
+    rec["Analyst Count"]    = f_db.get("analyst_count")
+
     return rec
 
 
@@ -649,7 +848,10 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                      fetch_peers: bool = True, vpn_rotate: bool = False):
     clear_peer_cache()   # fresh cache for each scan run
     total = len(tickers)
-    progress.update({"total": total, "done": 0, "current": "", "finished": False, "error": None})
+    progress.update({
+        "total": total, "done": 0, "current": "", "finished": False,
+        "error": None, "failures": {},  # {ticker: {reason, missing_fields}}
+    })
 
     done = 0
     for batch_start in range(0, total, SCAN_BATCH_SIZE):
@@ -669,12 +871,16 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
         progress["current"] = f"Batch {batch_num}: {batch[0]}…{batch[-1]} (bulk download)"
 
         # ── Step 1: one bulk download for the whole batch ─────────────────────
-        # Use V2 fetcher (stores extended indicators to DuckDB + returns legacy dicts)
-        # Fall back to old fetcher only when date cutoffs are specified (backtesting mode)
-        if daily_date or weekly_date:
+        # V2 fetcher stores extended indicators (Close/as_of_date/etc.) to DuckDB.
+        # Use V1 only when daily_date is set (historical backtest: Close itself is
+        # historical).  When only weekly_date is set, V2 is used so that Close /
+        # Last Close Date / Change % always reflect today's data; the weekly cutoff
+        # is passed through to limit only the T2 weekly comparison window.
+        if daily_date:
             bulk_tech = fetch_technical_bulk(batch, daily_date, weekly_date)
         else:
-            bulk_tech = fetch_technical_bulk_v2(batch, log=lambda m: None)
+            bulk_tech = fetch_technical_bulk_v2(batch, weekly_latest_date=weekly_date,
+                                                log=lambda m: None)
 
         # ── Step 2: parallel fund + peer fetches ──────────────────────────────
         progress["current"] = f"Batch {batch_num}: {batch[0]}…{batch[-1]} (fund + peers)"
@@ -701,6 +907,10 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
         valid_batch   = [t for t in batch if not _is_delisted(t)]
         skipped_count = len(batch) - len(valid_batch)
         if skipped_count:
+            for t in batch:
+                if _is_delisted(t):
+                    err = bulk_tech.get(t, {}).get("error", "no price data")
+                    progress["failures"][t] = {"reason": err, "missing": ["all tech data"]}
             done += skipped_count
             progress["done"] = done
 
@@ -715,16 +925,30 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                     if fund.get("rate_limited"):
                         consecutive_failures += 1
                         rate_limited_tickers.append(t)
+                        progress["failures"][t] = {"reason": "rate limited (fund fetch)", "missing": ["fundamentals", "peers"]}
                     else:
                         consecutive_failures = 0
                         tech = bulk_tech.get(t, {"error": "Not in bulk data"})
+                        # Collect missing fields for this ticker
+                        missing = []
+                        if tech.get("error"):
+                            missing.append(f"tech: {tech['error']}")
+                        for f_key, f_label in [("q_revenue","q_revenue"), ("q_eps","q_eps"),
+                                               ("a_revenue","a_revenue"), ("a_eps","a_eps"),
+                                               ("q_rev_yoy","q_rev_yoy"), ("q_eps_yoy","q_eps_yoy"),
+                                               ("a_rev_yoy","a_rev_yoy"), ("a_eps_yoy","a_eps_yoy"),
+                                               ("forward_pe","forward_pe"), ("pb_ratio","pb_ratio")]:
+                            if fund.get(f_key) is None:
+                                missing.append(f_label)
+                        if missing:
+                            progress["failures"][t] = {"reason": "partial data", "missing": missing}
                         indicators = evaluate_all(t, tech, fund, peer_data)
                         save_results(t, indicators, analysis_dt, fund.get("market_cap"))
                     # Reactive VPN switch: 3 consecutive auth blocks, once per batch
                     if vpn_rotate and consecutive_failures >= 3 and not vpn_switched_this_batch:
                         _do_vpn_switch("Persistent auth block detected")
-                except Exception:
-                    pass
+                except Exception as ex:
+                    progress["failures"][t] = {"reason": str(ex), "missing": ["all"]}
                 done += 1
                 progress["done"] = done
 
@@ -778,20 +1002,26 @@ def build_summary_df(rows: list[dict],
                      include_datetime: bool = False,
                      si_map: dict | None = None,
                      ne_map: dict | None = None,
-                     tech_map: dict | None = None) -> pd.DataFrame:
+                     net_map: dict | None = None,
+                     tech_map: dict | None = None,
+                     company_map: dict | None = None) -> pd.DataFrame:
     """
     Build the indicator summary DataFrame.
-    si_map: {ticker: (sector, industry)}
-    ne_map: {ticker: next_earnings_date_str}
-    tech_map: {ticker: tech_indicators dict} for Close / Change % / Last Close Date
+    si_map:      {ticker: (sector, industry)}
+    ne_map:      {ticker: next_earnings_date_str}
+    net_map:     {ticker: next_earnings_time ("BMO"/"AMC"/"N/A")}
+    tech_map:    {ticker: tech_indicators dict} for Close / Change % / Last Close Date
+    company_map: {ticker: (longName, longBusinessSummary)}
     """
     if not rows:
         return pd.DataFrame()
 
     inds_to_show = selected_inds if selected_inds else MAIN_IND_COLS
-    si = si_map or {}
-    ne = ne_map or {}
-    tm = tech_map or {}
+    si  = si_map      or {}
+    ne  = ne_map      or {}
+    net = net_map     or {}
+    tm  = tech_map    or {}
+    cm  = company_map or {}
 
     records = []
     for r in rows:
@@ -801,13 +1031,20 @@ def build_summary_df(rows: list[dict],
         rec["Ticker"] = r.get("ticker", "")
 
         for ind in inds_to_show:
-            rec[ind] = _e(r.get(ind, "NA"))
+            grade = r.get(ind, "NA")
+            subs  = SUB_COLS.get(ind, [])
+            # If ANY sub-indicator is NA, show ⚪️ for the parent (data incomplete)
+            if subs and any(r.get(sc, "NA") == "NA" for sc in subs):
+                rec[ind] = "⚪️"
+            else:
+                rec[ind] = _e(grade)
 
         if show_sub:
             for ind in inds_to_show:
                 for sc in SUB_COLS.get(ind, []):
                     rec[SUB_DISPLAY.get(sc, sc)] = _e(r.get(sc, "NA"))
 
+        rec["Score"]    = compute_score(r)
         rec["Comments"] = r.get("comments") or ""
 
         # Rightmost: Mkt Cap, Sector, Industry, Next Earnings, Close, Change %, Last Close Date
@@ -816,7 +1053,11 @@ def build_summary_df(rows: list[dict],
         sector, industry = si.get(ticker, ("N/A", "N/A"))
         rec["Sector"]          = sector
         rec["Industry"]        = industry
-        rec["Next Earnings"]   = ne.get(ticker, "N/A")
+        name, desc = cm.get(ticker, ("N/A", "N/A"))
+        rec["Company Name"]        = name
+        rec["Company Description"] = desc
+        rec["Next Earnings Date"] = ne.get(ticker, "N/A")
+        rec["Next Earnings Time"] = net.get(ticker, "N/A")
         tc = tm.get(ticker, {})
         rec["Close"]           = tc.get("close")
         rec["Change %"]        = tc.get("daily_pct_change")
@@ -844,8 +1085,8 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
     disp_to_db.update({ind: ind for ind in MAIN_IND_COLS})
     disp_to_db["Comments"] = "comments"
 
-    for _, row in edited_df.iterrows():
-        ticker = row.get("Ticker", "")
+    for ticker, row in edited_df.iterrows():
+        # ticker comes from the DataFrame index (set_index("Ticker"))
         if include_datetime:
             analysis_dt = row.get("Datetime", "")
         else:
@@ -859,7 +1100,7 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
         orig = orig_lookup.get(key, {})
 
         for col in row.index:
-            if col in ("Ticker", "Datetime"):
+            if col in ("Datetime", "Score"):
                 continue
             db_col = disp_to_db.get(col)
             if not db_col:
@@ -871,6 +1112,9 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
                 new_val = EMOJI_TO_DB.get(str(new_val), str(new_val))
 
             update_field(analysis_dt, ticker, db_col, str(new_val) if new_val is not None else "")
+            # Keep all rows for this ticker in sync when comments change
+            if db_col == "comments":
+                save_comment_for_ticker(str(ticker), str(new_val) if new_val is not None else "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -880,20 +1124,28 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
 def make_column_config(df: pd.DataFrame) -> dict:
     config = {}
     for col in df.columns:
-        if col in ("Ticker", "Datetime"):
+        if col == "#":
+            config[col] = st.column_config.NumberColumn("#", format="%d", disabled=True)
+        elif col in ("Ticker", "Datetime"):
             config[col] = st.column_config.TextColumn(col, disabled=True)
         elif col in MAIN_IND_COLS or col in SUB_DISPLAY.values():
             config[col] = st.column_config.SelectboxColumn(
                 col, options=EMOJI_OPTIONS, required=True
             )
+        elif col == "Score":
+            config[col] = st.column_config.NumberColumn("Score", format="%.1f", disabled=True)
         elif col == "Comments":
             config[col] = st.column_config.TextColumn("Comments", width="large")
         elif col == "Mkt Cap ($B)":
             config[col] = st.column_config.NumberColumn(
                 "Mkt Cap ($B)", format="%.2f", disabled=True
             )
-        elif col in ("Sector", "Industry", "Next Earnings", "Last Close Date"):
+        elif col in ("Sector", "Industry", "Next Earnings Date", "Next Earnings Time", "Last Close Date"):
             config[col] = st.column_config.TextColumn(col, disabled=True)
+        elif col == "Company Name":
+            config[col] = st.column_config.TextColumn("Company Name", width="medium", disabled=True)
+        elif col == "Company Description":
+            config[col] = st.column_config.TextColumn("Company Description", width="large", disabled=True)
         elif col == "Close":
             config[col] = st.column_config.NumberColumn("Close", format="%.2f", disabled=True)
         elif col == "Change %":
@@ -1219,7 +1471,17 @@ def render_scan_progress():
     paused    = prog.get("paused", False)
 
     if finished:
-        st.success(f"✅ Scan complete — {done} tickers processed")
+        failures = prog.get("failures", {})
+        st.success(f"✅ Scan complete — {done} tickers processed"
+                   + (f" | ⚠️ {len(failures)} with missing/failed data" if failures else ""))
+        if failures:
+            with st.expander(f"⚠️ Data issues ({len(failures)} tickers)", expanded=False):
+                for tkr, info in sorted(failures.items()):
+                    reason  = info.get("reason", "unknown")
+                    missing = info.get("missing", [])
+                    st.markdown(f"**{tkr}** — {reason}"
+                                + (f"  \n&nbsp;&nbsp;&nbsp;&nbsp;missing: `{', '.join(missing)}`"
+                                   if missing else ""))
         return
 
     frac = done / total if total else 0
@@ -1266,31 +1528,37 @@ def _launch_ai_analysis(tickers: list[str]) -> None:
 
     run_dt      = _now_cst()
     cancel_evt  = threading.Event()
+    error_evt   = threading.Event()   # set when any error occurs → stop new tasks
     lock        = threading.Lock()
     progress: dict = {
-        "done":   0,
-        "total":  len(tickers),
-        "active": [],
-        "run_dt": run_dt,
-        "errors": [],
-        "status": "running",
+        "done":       0,
+        "total":      len(tickers),
+        "active":     [],
+        "run_dt":     run_dt,
+        "errors":     [],       # list of "TICKER: message" strings
+        "status":     "running",
     }
 
     def _analyze_one(ticker: str) -> None:
-        if cancel_evt.is_set():
+        # Skip if cancelled or a prior task errored
+        if cancel_evt.is_set() or error_evt.is_set():
             with lock:
                 progress["done"] += 1
             return
         with lock:
             progress["active"].append(ticker)
+        report_status = "complete"
         try:
             report = synthesize_analysis(ticker, model=AI_MODEL)
         except Exception as e:
-            report = f"Error analyzing {ticker}: {e}"
+            err_msg = str(e)
+            report  = f"Error generating analysis: {err_msg}"
+            report_status = "error"
             with lock:
-                progress["errors"].append(ticker)
+                progress["errors"].append(f"{ticker}: {err_msg}")
+            error_evt.set()   # stop dispatching new tasks
         try:
-            storage.save_ai_report(run_dt, ticker, report, AI_MODEL)
+            storage.save_ai_report(run_dt, ticker, report, AI_MODEL, status=report_status)
         except Exception:
             pass
         with lock:
@@ -1336,10 +1604,13 @@ def _ai_progress_autorefresh():
         if not progress.get("shown"):
             progress["shown"] = True
             st.rerun(scope="app")
-        msg = f"✅ AI analysis complete — {done} ticker(s) | Run: {run_dt}"
         if errors:
-            msg += f" | ⚠️ Errors: {', '.join(errors)}"
-        st.success(msg)
+            st.warning(f"⚠️ AI analysis finished with errors — {done} ticker(s) processed | Run: {run_dt}")
+            with st.expander("Error details", expanded=True):
+                for err_line in errors:
+                    st.code(err_line)
+        else:
+            st.success(f"✅ AI analysis complete — {done} ticker(s) | Run: {run_dt}")
         if st.button("Clear", key="ai_clear_status"):
             st.session_state.ai_progress = None
             st.rerun(scope="app")
@@ -1347,7 +1618,12 @@ def _ai_progress_autorefresh():
 
     frac       = done / total if total else 0
     active_str = ", ".join(active) if active else "queuing…"
-    st.progress(frac, text=f"🤖 AI analyzing… {done}/{total} complete | Active: {active_str}")
+    is_stopped = bool(errors)   # error_evt fired → tasks being skipped
+    status_txt = (f"🛑 Error — waiting for active tasks ({done}/{total})" if is_stopped
+                  else f"🤖 AI analyzing… {done}/{total} complete | Active: {active_str}")
+    st.progress(frac, text=status_txt)
+    if errors and not is_stopped:
+        pass  # already shown above
     if st.button("⏹ Cancel AI Analysis", key="ai_cancel_btn"):
         evt = st.session_state.get("ai_cancel_event")
         if evt:
@@ -1455,7 +1731,7 @@ def _actually_apply_filter_group(tab_key: str, group: dict) -> None:
     # Column filter
     st.session_state[f"col_filt_cols_{tab_key}"] = group.get("col_filt_cols", [])
     for col in group.get("col_filt_cols", []):
-        if col in _COL_FILTER_EMOJI:
+        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
             st.session_state[f"col_filt_catvals_{tab_key}_{col}"] = group.get(f"_cfcatvals_{col}", [])
         else:
             st.session_state[f"col_filt_op_{tab_key}_{col}"]     = group.get(f"_cfop_{col}", ">=")
@@ -1485,7 +1761,9 @@ def _process_pending_ops() -> None:
         # Column group pending ops
         col_cols_key = f"_pending_col_cols_{tab_key}"
         if col_cols_key in st.session_state:
-            st.session_state[f"val_cols_{tab_key}"] = st.session_state.pop(col_cols_key)
+            cols = st.session_state.pop(col_cols_key)
+            st.session_state[f"val_cols_{tab_key}"] = cols
+            st.session_state[f"_val_cols_shadow_{tab_key}"] = cols
 
 
 def _snapshot_filter_group(tab_key: str) -> dict:
@@ -1504,7 +1782,7 @@ def _snapshot_filter_group(tab_key: str) -> dict:
     col_filt_cols = list(st.session_state.get(f"col_filt_cols_{tab_key}", []))
     group["col_filt_cols"] = col_filt_cols
     for col in col_filt_cols:
-        if col in _COL_FILTER_EMOJI:
+        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
             group[f"_cfcatvals_{col}"] = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
         else:
             group[f"_cfop_{col}"]  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
@@ -1584,6 +1862,12 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
                     options=["✅", "❌", "⚪️"],
                     key=f"col_filt_catvals_{tab_key}_{col}",
                 )
+            elif col in _COL_FILTER_TEXT_CAT:
+                st.multiselect(
+                    f"{col}",
+                    options=_COL_FILTER_TEXT_CAT[col],
+                    key=f"col_filt_catvals_{tab_key}_{col}",
+                )
             elif col in _COL_FILTER_DATES:
                 dc1, dc2, dc3 = st.columns([2, 1, 3])
                 with dc1:
@@ -1625,7 +1909,7 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
     # Build col_filter dict from current widget states
     col_filter: dict = {}
     for col in st.session_state.get(f"col_filt_cols_{tab_key}", []):
-        if col in _COL_FILTER_EMOJI:
+        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
             catvals = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
             if catvals:
                 col_filter[col] = {"type": "cat", "vals": set(catvals)}
@@ -1669,9 +1953,9 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
                 else:
                     st.warning("Enter a group name first.")
 
-        # Load / Set default / Delete existing groups
+        # Load / Set default / Rename / Delete existing groups
         if group_names:
-            gg1, gg2, gg3, gg4 = st.columns([3, 1, 1, 1])
+            gg1, gg2, gg3 = st.columns([3, 1, 1])
             with gg1:
                 sel_group = st.selectbox(
                     "Group:", options=group_names,
@@ -1688,7 +1972,24 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
                     _save_prefs(prefs)
                     st.success(f"'{sel_group}' set as default")
                     st.rerun()
-            with gg4:
+            rn1, rn2, rn3 = st.columns([3, 1, 1])
+            with rn1:
+                filt_new_name = st.text_input(
+                    "Rename to:",
+                    key=f"filt_rename_val_{tab_key}",
+                    label_visibility="collapsed",
+                    placeholder="New name…",
+                )
+            with rn2:
+                if st.button("Rename", key=f"filt_rename_{tab_key}"):
+                    new_n = filt_new_name.strip()
+                    if new_n and new_n != sel_group:
+                        fg[new_n] = fg.pop(sel_group)
+                        if prefs.get("filter_default", {}).get(tab_key) == sel_group:
+                            prefs["filter_default"][tab_key] = new_n
+                        _save_prefs(prefs)
+                        st.rerun()
+            with rn3:
                 if st.button("Delete", key=f"filt_del_{tab_key}"):
                     fg.pop(sel_group, None)
                     if prefs.get("filter_default", {}).get(tab_key) == sel_group:
@@ -1740,10 +2041,12 @@ def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
 
 def apply_col_filter(tickers: list[str], col_filter: dict,
                      detail_map: dict, rows_by_ticker: dict,
-                     fund_map: dict, tech_map: dict) -> list[str]:
+                     fund_map: dict, tech_map: dict,
+                     earnings_map: dict | None = None) -> list[str]:
     """Return subset of tickers whose value-table records pass all column filters."""
     if not col_filter:
         return tickers
+    em = earnings_map or {}
     out = []
     for t in tickers:
         rec = _build_value_record(
@@ -1752,6 +2055,7 @@ def apply_col_filter(tickers: list[str], col_filter: dict,
             rows_by_ticker.get(t, {}),
             fund_map.get(t, {}),
             tech_map.get(t, {}),
+            em.get(t),
         )
         if all(_col_filter_passes(rec, col, spec) for col, spec in col_filter.items()):
             out.append(t)
@@ -1763,7 +2067,9 @@ def _value_col_config(cols: list[str]) -> dict:
     cfg: dict = {}
     pct_suffix = {"%"}
     for col in cols:
-        if col == "Ticker":
+        if col == "#":
+            cfg[col] = st.column_config.NumberColumn("#", format="%d", disabled=True)
+        elif col == "Ticker":
             cfg[col] = st.column_config.TextColumn(col, disabled=True)
         elif col in ("Sector", "Industry", "Q End Date", "A End Date",
                      "Next Earnings Date", "Last Close Date",
@@ -1771,10 +2077,50 @@ def _value_col_config(cols: list[str]) -> dict:
                      "MA10>20", "MA20>50", "MA50>150", "MA150>200",
                      "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200"):
             cfg[col] = st.column_config.TextColumn(col, disabled=True)
+        elif col == "Score":
+            cfg[col] = st.column_config.NumberColumn(col, format="%.1f", disabled=True)
+        elif col == "Comments":
+            try:
+                cfg[col] = st.column_config.TextColumn("Comments", width="large", wrap_text=True)
+            except TypeError:
+                cfg[col] = st.column_config.TextColumn("Comments", width="large")
+        elif col in ("Last Earnings Date", "Last Earnings Time",
+                     "Next Earnings Time"):
+            cfg[col] = st.column_config.TextColumn(col, disabled=True)
+        elif col == "Company Name":
+            cfg[col] = st.column_config.TextColumn("Company Name", width="medium", disabled=True)
+        elif col == "Company Description":
+            cfg[col] = st.column_config.TextColumn("Company Description", width="large", disabled=True)
+        elif col in ("Last Earnings 1D Change", "EPS Sur", "EPS GAAP Sur", "Rev Sur"):
+            cfg[col] = st.column_config.NumberColumn(col, format="%.2f%%", disabled=True)
+        elif col in ("EPS Est", "EPS Act", "EPS GAAP Est", "EPS GAAP Act"):
+            cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
+        elif col in ("Rev Est ($M)", "Rev Act ($M)"):
+            cfg[col] = st.column_config.NumberColumn(col, format="%.1f", disabled=True)
         elif col == "Mkt Cap ($B)":
             cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
         elif col == "Volume":
             cfg[col] = st.column_config.NumberColumn(col, format="%d", disabled=True)
+        elif col in (
+            "Short % Float (Y)", "Short % Float (Calc)",
+            "Short % Out (Y)", "Short % Out (Calc)", "Short % Impl Out",
+            "Short MoM Chg%", "Ins Buy %", "Ins Sell %", "Ins Net %",
+            "Gross Margin%", "EBITDA Margin%", "Op Margin%", "Net Margin%",
+            "ROE%", "ROA%", "Price vs Target%",
+        ):
+            cfg[col] = st.column_config.NumberColumn(col, format="%.2f%%", disabled=True)
+        elif col in (
+            "Shares Short (M)", "Float Shares (M)", "Shares Out (M)", "Avg Vol (M)",
+            "Ins Buy Shares (M)", "Ins Sell Shares (M)", "Ins Net Shares (M)",
+            "Target Median", "Target High", "Target Low", "Target Mean",
+            "Days to Cover", "D/E Ratio", "Rec Score",
+            "Current Ratio", "Quick Ratio",
+        ):
+            cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
+        elif col in ("Ins Buy #", "Ins Sell #", "Analyst Count"):
+            cfg[col] = st.column_config.NumberColumn(col, format="%d", disabled=True)
+        elif col in ("Short Interest Date", "Rec Key"):
+            cfg[col] = st.column_config.TextColumn(col, disabled=True)
         elif col.endswith("%"):
             cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
         else:
@@ -1784,7 +2130,11 @@ def _value_col_config(cols: list[str]) -> dict:
 
 def render_value_table(tickers: list[str], detail_map: dict,
                        rows_by_ticker: dict, fund_map: dict,
-                       tab_key: str, tech_map: dict | None = None):
+                       tab_key: str, tech_map: dict | None = None,
+                       sort_col: str | None = None,
+                       pre_built_records: dict | None = None,
+                       pre_built_earnings: dict | None = None,
+                       rank_map: dict | None = None):
     """
     Render the Indicator Values Table with:
       - Group multiselect + individual column multiselect
@@ -1814,6 +2164,13 @@ def render_value_table(tickers: list[str], detail_map: dict,
             st.session_state[f"val_cols_{tab_key}"] = list(custom_col_groups[cd])
         st.session_state[_col_loaded_key] = True
 
+    # ── Shadow-key restore: protect col selection from Streamlit widget-key
+    # cleanup that can occur when st.rerun() fires before this widget renders
+    # (e.g. from render_indicator_filter which runs above render_value_table).
+    _shadow_key = f"_val_cols_shadow_{tab_key}"
+    if f"val_cols_{tab_key}" not in st.session_state and _shadow_key in st.session_state:
+        st.session_state[f"val_cols_{tab_key}"] = list(st.session_state[_shadow_key])
+
     # all_cols: every column across all groups (options for individual selector)
     # Computed here so button handlers can reference it before widgets are rendered.
     all_cols = list(dict.fromkeys(c for g in all_groups for c in effective_groups.get(g, [])))
@@ -1825,14 +2182,17 @@ def render_value_table(tickers: list[str], detail_map: dict,
     with vb1:
         if st.button("Select all columns", key=f"val_sel_all_{tab_key}"):
             st.session_state[f"val_cols_{tab_key}"] = list(all_cols)
+            st.session_state[_shadow_key] = list(all_cols)
     with vb2:
         if st.button("Clear all columns", key=f"val_clear_{tab_key}"):
             st.session_state[f"val_groups_{tab_key}"] = []
             st.session_state[f"val_cols_{tab_key}"] = []
+            st.session_state[_shadow_key] = []
     with vb3:
         if st.button("Reset to default", key=f"val_reset_{tab_key}"):
             st.session_state[f"val_groups_{tab_key}"] = DEFAULT_VALUE_GROUPS
             st.session_state[f"val_cols_{tab_key}"] = []
+            st.session_state[_shadow_key] = []
 
     # ── Column group selector ────────────────────────────────────────────────
     sel_groups = st.multiselect(
@@ -1854,6 +2214,8 @@ def render_value_table(tickers: list[str], detail_map: dict,
         default=[],
         key=f"val_cols_{tab_key}",
     )
+    # Keep shadow in sync with current multiselect value so future restores are correct
+    st.session_state[_shadow_key] = list(sel_cols)
 
     # ── Custom column group manager ───────────────────────────────────────────
     with st.expander("Manage column groups"):
@@ -1882,7 +2244,7 @@ def render_value_table(tickers: list[str], detail_map: dict,
 
         cg_names = list(custom_col_groups.keys())
         if cg_names:
-            cc1, cc2, cc3, cc4 = st.columns([3, 1, 1, 1])
+            cc1, cc2, cc3 = st.columns([3, 1, 1])
             with cc1:
                 sel_cg = st.selectbox(
                     "Column group:", options=cg_names,
@@ -1899,7 +2261,25 @@ def render_value_table(tickers: list[str], detail_map: dict,
                     _save_prefs(prefs)
                     st.success(f"'{sel_cg}' set as default")
                     st.rerun()
-            with cc4:
+            crn1, crn2, crn3 = st.columns([3, 1, 1])
+            with crn1:
+                col_new_name = st.text_input(
+                    "Rename to:",
+                    key=f"col_rename_val_{tab_key}",
+                    label_visibility="collapsed",
+                    placeholder="New name…",
+                )
+            with crn2:
+                if st.button("Rename", key=f"col_rename_{tab_key}"):
+                    new_cn = col_new_name.strip()
+                    if new_cn and new_cn != sel_cg:
+                        cg_store = prefs.setdefault("col_groups", {})
+                        cg_store[new_cn] = cg_store.pop(sel_cg)
+                        if prefs.get("col_default", {}).get(tab_key) == sel_cg:
+                            prefs["col_default"][tab_key] = new_cn
+                        _save_prefs(prefs)
+                        st.rerun()
+            with crn3:
                 if st.button("Delete", key=f"col_del_{tab_key}"):
                     prefs.get("col_groups", {}).pop(sel_cg, None)
                     if prefs.get("col_default", {}).get(tab_key) == sel_cg:
@@ -1909,26 +2289,72 @@ def render_value_table(tickers: list[str], detail_map: dict,
         else:
             st.caption("No saved column groups yet.")
 
-    _fixed_right = {"Mkt Cap ($B)", "Sector", "Industry", "Next Earnings Date"}
-    data_cols = [c for c in (sel_cols if sel_cols else group_cols) if c not in _fixed_right]
-    # Order: Ticker | data columns | Mkt Cap ($B) | Sector | Industry | Next Earnings Date
-    show_cols = ["Ticker"] + data_cols + ["Mkt Cap ($B)", "Sector", "Industry", "Next Earnings Date"]
+    _fixed_right = {"Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
+                    "Next Earnings Date", "Next Earnings Time",
+                    "Last Earnings Date", "Last Earnings Time", "Last Earnings 1D Change"}
+    data_cols = [c for c in (sel_cols if sel_cols else group_cols)
+                 if c not in _fixed_right and c != "Score" and c != "Comments"]
+    # Auto-inject sort col if not already visible and it's a value-table column
+    if (sort_col and sort_col not in data_cols
+            and sort_col not in _fixed_right
+            and sort_col not in ("Score", "Comments", "#", "Ticker")):
+        data_cols = [sort_col] + data_cols
+    # Order: Ticker | # | Score | data columns | Comments | fixed-right columns
+    show_cols = (
+        ["Ticker", "#", "Score"] + data_cols
+        + ["Comments", "Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
+           "Next Earnings Date", "Next Earnings Time",
+           "Last Earnings Date", "Last Earnings Time", "Last Earnings 1D Change"]
+    )
 
     # ── Build records ────────────────────────────────────────────────────────
+    if pre_built_records is None:
+        earnings_map = pre_built_earnings or (get_latest_earnings_for_tickers(tickers) if tickers else {})
+    else:
+        earnings_map = pre_built_earnings or {}
     records = []
     for ticker in tickers:
-        detail = detail_map.get(ticker, {})
-        row    = rows_by_ticker.get(ticker, {})
-        f_db   = fund_map.get(ticker, {})
-        tc     = tm.get(ticker, {})
-        rec    = _build_value_record(ticker, detail, row, f_db, tc)
+        if pre_built_records is not None and ticker in pre_built_records:
+            rec = pre_built_records[ticker]
+        else:
+            detail = detail_map.get(ticker, {})
+            row    = rows_by_ticker.get(ticker, {})
+            f_db   = fund_map.get(ticker, {})
+            tc     = tm.get(ticker, {})
+            rec    = _build_value_record(ticker, detail, row, f_db, tc, earnings_map.get(ticker))
         records.append({c: rec.get(c) for c in show_cols})
 
     if records:
-        df = pd.DataFrame(records)
+        # ── Build + assign # (order comes from caller's pre-sorted tickers list) ──
+        ordered_cols = [c for c in show_cols if c != "Ticker"]
+        df = pd.DataFrame(records)[show_cols].set_index("Ticker")
+        if rank_map:
+            df["#"] = [rank_map.get(t, i + 1) for i, t in enumerate(df.index)]
+        else:
+            df["#"] = range(1, len(df) + 1)
+
         st.caption(f"{len(df)} rows")
-        st.dataframe(df, column_config=_value_col_config(show_cols),
-                     width="stretch", hide_index=True)
+        col_cfg = _value_col_config(ordered_cols)
+        try:
+            val_edited = st.data_editor(
+                df, column_config=col_cfg, column_order=ordered_cols,
+                use_container_width=True, hide_index=False,
+                key=f"val_editor_{tab_key}", row_height=80,
+            )
+        except TypeError:
+            val_edited = st.data_editor(
+                df, column_config=col_cfg, column_order=ordered_cols,
+                use_container_width=True, hide_index=False,
+                key=f"val_editor_{tab_key}",
+            )
+        if st.button("💾 Save Comments", key=f"save_val_comments_{tab_key}"):
+            for ticker, vrow in val_edited.iterrows():
+                new_comment = str(vrow.get("Comments") or "")
+                orig_comment = str(df.loc[ticker, "Comments"]) if ticker in df.index else ""
+                if new_comment != orig_comment:
+                    save_comment_for_ticker(str(ticker), new_comment)
+            st.success("Comments saved.")
+            st.rerun()
     else:
         st.info("No data available.")
 
@@ -1966,7 +2392,12 @@ with st.sidebar:
         help="Rotates Mullvad server after each batch to avoid rate limiting. Requires Mullvad CLI.",
     )
 
-    run_btn  = st.button("▶ Run Market Scan", type="primary", width="stretch")
+    run_btn      = st.button("▶ Run Market Scan", type="primary", width="stretch")
+    run_unseen_btn = st.button(
+        "▶ Run Unseen Today",
+        width="stretch",
+        help="Scans only tickers whose last run was before today 3 pm CST (not yet run today after market close).",
+    )
     st.divider()
 
     st.markdown("""
@@ -2031,52 +2462,77 @@ F6 P/B ≤ Peer Median
                 st.session_state["ai_confirm_pending"] = {"tickers": ai_tickers}
                 st.rerun()
 
-# ── Handle Run button ─────────────────────────────────────────────────────────
-if run_btn:
-    raw = ticker_input.strip()
+# ── Handle Run buttons ────────────────────────────────────────────────────────
+
+def _launch_scan(ticker_list: list[str], label: str) -> None:
+    """Start a scan thread for the given ticker list."""
+    if not ticker_list:
+        st.sidebar.error("No tickers to process. Enter tickers or check tickers.txt.")
+        return
     daily_str   = str(daily_date_input)  if daily_date_input  else None
     weekly_str  = str(weekly_date_input) if weekly_date_input else None
     analysis_dt = _now_cst()
     fetch_peers = st.session_state.get("fetch_peers", True)
     vpn_rotate  = st.session_state.get("vpn_rotate",  False)
 
-    # Determine ticker list — manual input or full tickers.txt
+    if st.session_state.scan_stop_event:
+        st.session_state.scan_stop_event.set()
+        time.sleep(0.2)
+
+    pause_event = threading.Event()
+    stop_event  = threading.Event()
+    progress    = {}
+
+    st.session_state.scan_pause_event  = pause_event
+    st.session_state.scan_stop_event   = stop_event
+    st.session_state.scan_progress     = progress
+    st.session_state.last_analysis_dt  = analysis_dt
+    st.session_state.last_tickers      = []
+    st.session_state.last_detail_map   = {}
+    st.session_state["last_inds_live"] = {}
+
+    t = threading.Thread(
+        target=scan_thread_func,
+        args=(ticker_list, analysis_dt, daily_str, weekly_str,
+              pause_event, stop_event, progress, fetch_peers, vpn_rotate),
+        daemon=True,
+    )
+    st.session_state.scan_thread = t
+    t.start()
+    st.sidebar.success(label)
+
+
+if run_btn:
+    raw = ticker_input.strip()
     if raw:
         ticker_list = [t.strip().upper() for t in raw.split(",") if t.strip()]
         label = f"Analyzing {len(ticker_list)} ticker(s): {', '.join(ticker_list)}"
     else:
         ticker_list = load_ticker_list()
         label = f"Scan started — {len(ticker_list)} tickers"
+    _launch_scan(ticker_list, label)
 
-    if not ticker_list:
-        st.sidebar.error("No tickers to process. Enter tickers or check tickers.txt.")
+if run_unseen_btn:
+    # Build cutoff: today at 15:00 CST in the same format as run_dt
+    _cutoff = datetime.now(CST).replace(hour=15, minute=0, second=0, microsecond=0)
+    cutoff_str = _cutoff.strftime("%Y-%m-%d %H:%M:%S CST")
+    already_done = storage.get_tickers_run_since(cutoff_str)
+
+    raw = ticker_input.strip()
+    if raw:
+        all_tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
     else:
-        # Stop any existing scan/run
-        if st.session_state.scan_stop_event:
-            st.session_state.scan_stop_event.set()
-            time.sleep(0.2)
+        all_tickers = load_ticker_list()
 
-        pause_event = threading.Event()
-        stop_event  = threading.Event()
-        progress    = {}
-
-        st.session_state.scan_pause_event  = pause_event
-        st.session_state.scan_stop_event   = stop_event
-        st.session_state.scan_progress     = progress
-        st.session_state.last_analysis_dt  = analysis_dt
-        st.session_state.last_tickers      = []
-        st.session_state.last_detail_map   = {}
-        st.session_state["last_inds_live"] = {}
-
-        t = threading.Thread(
-            target=scan_thread_func,
-            args=(ticker_list, analysis_dt, daily_str, weekly_str,
-                  pause_event, stop_event, progress, fetch_peers, vpn_rotate),
-            daemon=True,
+    ticker_list = [t for t in all_tickers if t not in already_done]
+    if not ticker_list:
+        st.sidebar.info("All tickers already scanned today after 3 pm CST.")
+    else:
+        label = (
+            f"Unseen scan — {len(ticker_list)} tickers "
+            f"({len(already_done)} already run today skipped)"
         )
-        st.session_state.scan_thread = t
-        t.start()
-        st.sidebar.success(label)
+        _launch_scan(ticker_list, label)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scan progress (fragment — auto-refreshes every 2 s without full-page rerun)
@@ -2161,6 +2617,8 @@ with tab_history:
     hist_tech_map     = get_tech_for_tickers(_hist_tickers_pre)
     si_map_hist       = _extract_si(hist_fund_map)
     ne_map_hist       = _extract_ne(hist_fund_map)
+    net_map_hist      = _extract_net(hist_fund_map)
+    company_map_hist  = _extract_company(hist_fund_map)
 
     # Build sector→industries cascade mapping
     _s2i_h: dict[str, set[str]] = {}
@@ -2237,27 +2695,117 @@ with tab_history:
     # Apply column value filter
     if hist_col_filter:
         hist_rows_by_ticker_all = {r["ticker"]: r for r in filt_rows}
+        _hist_earnings_map = get_latest_earnings_for_tickers(
+            [r["ticker"] for r in filt_rows]
+        ) if filt_rows else {}
         _hist_pass = set(apply_col_filter(
             [r["ticker"] for r in filt_rows], hist_col_filter, hist_detail_map,
             hist_rows_by_ticker_all, hist_fund_map, hist_tech_map,
+            earnings_map=_hist_earnings_map,
         ))
         filt_rows = [r for r in filt_rows if r["ticker"] in _hist_pass]
 
     st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
 
+    # ── Pre-build value records for all-column sort support ───────────────────
+    _pre_rows_by_ticker = {r["ticker"]: r for r in filt_rows}
+    _pre_earnings_map   = get_latest_earnings_for_tickers(list(_pre_rows_by_ticker)) if filt_rows else {}
+    _pre_val_records: dict[str, dict] = {
+        t: _build_value_record(
+            t,
+            hist_detail_map.get(t, {}),
+            _pre_rows_by_ticker[t],
+            hist_fund_map.get(t, {}),
+            hist_tech_map.get(t, {}),
+            _pre_earnings_map.get(t),
+        )
+        for t in _pre_rows_by_ticker
+    }
+
     all_df = build_summary_df(filt_rows, show_sub=all_show_sub,
                               include_datetime=True, si_map=si_map_hist,
-                              ne_map=ne_map_hist, tech_map=hist_tech_map)
-    all_col_cfg = make_column_config(all_df)
+                              ne_map=ne_map_hist, net_map=net_map_hist,
+                              company_map=company_map_hist,
+                              tech_map=hist_tech_map)
+
+    # ── Sort controls + Find Ranking (shared: applies to both tables) ─────────
+    _sort_rank = pd.Series(dtype=int)  # default; populated below when df non-empty
+    if not all_df.empty:
+        sc1, sc2, sc3 = st.columns([2, 1, 2])
+        with sc1:
+            _sort_col = st.selectbox(
+                "Sort by", _FILTERABLE_COLS,
+                index=_FILTERABLE_COLS.index("Score") if "Score" in _FILTERABLE_COLS else 0,
+                key="sort_col_history",
+            )
+        with sc2:
+            _sort_asc = st.radio(
+                "Order", ["Desc", "Asc"], key="sort_dir_history", horizontal=True,
+            ) == "Asc"
+        with sc3:
+            _find_ticker = st.text_input(
+                "Find ranking", placeholder="e.g. AAPL", key="find_rank_history",
+            ).upper().strip()
+
+        # Sort using pre-built records (covers all value-table columns)
+        _sort_vals = pd.Series({t: _pre_val_records.get(t, {}).get(_sort_col)
+                                 for t in all_df["Ticker"]})
+        # Treat "N/A" strings as missing so they always sort last regardless of direction
+        _sort_vals = _sort_vals.replace("N/A", None)
+        # Compute SQL RANK() (tied rows share same rank) before sorting
+        _sort_rank = _sort_vals.rank(method="min", ascending=_sort_asc, na_option="bottom").astype(int)
+        _sort_vals = _sort_vals.sort_values(ascending=_sort_asc, na_position="last")
+        _sorted_tickers = list(_sort_vals.index)
+        _t_order_map = {t: i for i, t in enumerate(_sorted_tickers)}
+        all_df = (all_df
+                  .assign(_si=all_df["Ticker"].map(_t_order_map))
+                  .sort_values("_si")
+                  .drop(columns=["_si"])
+                  .reset_index(drop=True))
+
+        # Auto-inject sort col into emoji table if not already present
+        if _sort_col not in all_df.columns:
+            all_df[_sort_col] = all_df["Ticker"].map(
+                lambda t: _pre_val_records.get(t, {}).get(_sort_col)
+            )
+
+        all_df.insert(0, "#", all_df["Ticker"].map(_sort_rank))
+
+        if _find_ticker:
+            _match = all_df[all_df["Ticker"] == _find_ticker]
+            if not _match.empty:
+                st.info(f"**{_find_ticker}** is ranked **#{int(_match['#'].iloc[0])}** "
+                        f"out of {len(all_df)} "
+                        f"(sorted by {_sort_col} {'↑' if _sort_asc else '↓'})")
+            else:
+                st.warning(f"**{_find_ticker}** not found in current filtered results")
+    else:
+        _sort_col = st.session_state.get("sort_col_history", "Score")
+        _sorted_tickers = []
+
+    # CSS: make Comments cells honour newline characters (\n → visual line break)
+    st.markdown(
+        """<style>
+        .stDataEditor [col-id="Comments"] .ag-cell-value,
+        .stDataEditor [col-id="Comments"] .ag-group-value {
+            white-space: pre-wrap !important;
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
+    all_df_disp = all_df.set_index("Ticker") if "Ticker" in all_df.columns else all_df
+    all_col_cfg = make_column_config(all_df_disp)
 
     all_edited = st.data_editor(
-        all_df, column_config=all_col_cfg,
-        width="stretch", hide_index=True,
+        all_df_disp, column_config=all_col_cfg,
+        width="stretch", hide_index=False,
         key="all_sum_editor",
     )
     if st.button("💾 Save Edits", key="save_all"):
         save_edits(filt_rows, all_edited, include_datetime=True)
         st.success("Saved.")
+        st.rerun()
 
     # AI Analysis button for filtered tickers
     _hist_ai_tickers = list(dict.fromkeys(r["ticker"] for r in filt_rows))
@@ -2276,11 +2824,18 @@ with tab_history:
     st.markdown("---")
 
     # ── Value Table ───────────────────────────────────────────────────────────
-    hist_tickers = [r["ticker"] for r in filt_rows]
-    hist_rows_by_ticker = {r["ticker"]: r for r in filt_rows}
+    # Use sorted order from emoji table so both tables share the same ranking
+    hist_tickers = (
+        _sorted_tickers if _sorted_tickers
+        else [r["ticker"] for r in filt_rows]
+    )
     render_value_table(hist_tickers, hist_detail_map,
-                       hist_rows_by_ticker, hist_fund_map, "history",
-                       tech_map=hist_tech_map)
+                       _pre_rows_by_ticker, hist_fund_map, "history",
+                       tech_map=hist_tech_map,
+                       sort_col=_sort_col,
+                       pre_built_records=_pre_val_records,
+                       pre_built_earnings=_pre_earnings_map,
+                       rank_map=dict(_sort_rank) if not _sort_rank.empty else None)
 
     st.markdown("---")
 
@@ -2378,10 +2933,26 @@ with tab_ai:
                 key="ai_rpt_f_dt",
             )
 
+        ai_cb1, ai_cb2 = st.columns(2)
+        with ai_cb1:
+            ai_completed_only = st.checkbox(
+                "Show completed analysis only",
+                value=True,
+                key="ai_rpt_completed_only",
+            )
+        with ai_cb2:
+            ai_latest_only = st.checkbox(
+                "Latest entry per ticker only",
+                value=False,
+                key="ai_rpt_latest_only",
+            )
+
         filter_dts = [ai_f_dt] if ai_f_dt != "All" else None
         reports = storage.get_ai_reports(
             tickers=ai_f_tickers or None,
             run_dts=filter_dts,
+            status="complete" if ai_completed_only else None,
+            latest_per_ticker=ai_latest_only,
         )
 
         if not reports:
@@ -2389,6 +2960,13 @@ with tab_ai:
         else:
             st.caption(f"Showing **{len(reports)}** report(s)")
             for rep in reports:
-                hdr = f"**{rep['ticker']}** — {rep['run_dt']}  ·  model: {rep['model'] or 'unknown'}"
+                rep_status = rep.get("status", "complete")
+                status_icon = "✅" if rep_status == "complete" else "❌"
+                hdr = (f"{status_icon} **{rep['ticker']}** — {rep['run_dt']}"
+                       f"  ·  model: {rep['model'] or 'unknown'}")
                 with st.expander(hdr, expanded=(len(reports) == 1)):
-                    st.markdown(rep["report"] or "_No content returned._")
+                    content = rep["report"] or "_No content returned._"
+                    if rep_status == "error":
+                        st.error(content)
+                    else:
+                        st.markdown(content)

@@ -119,10 +119,15 @@ def _rolling_streaks(up_series: pd.Series) -> tuple[int, int]:
 
 # ── Core computation ──────────────────────────────────────────────────────────
 
-def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame) -> dict:
+def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
+                             weekly_latest_date: str | None = None) -> dict:
     """
     Given 3y+ of OHLCV data, compute all technical indicators.
     Returns a flat dict matching tech_indicators column names.
+
+    weekly_latest_date: if set (e.g. '2026-03-13'), the weekly series is
+    truncated at that date before computing T2 (weekly_vs_3m / weekly_vs_12m).
+    Daily indicators and Close/as_of_date are always based on the full data.
     """
     try:
         df = df_raw.copy()
@@ -370,8 +375,9 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame) -> dict:
         )
         daily_3m   = _compare_averages(df, 63,  "RC", 5)
         daily_12m  = _compare_averages(df, 252, "RC", 5)
-        weekly_3m  = _compare_averages(weekly, 13, "RC", 4)
-        weekly_12m = _compare_averages(weekly, 52, "RC", 4)
+        weekly_cut = weekly.loc[:weekly_latest_date] if weekly_latest_date else weekly
+        weekly_3m  = _compare_averages(weekly_cut, 13, "RC", 4)
+        weekly_12m = _compare_averages(weekly_cut, 52, "RC", 4)
 
         # ── Assemble flat dict ────────────────────────────────────────────────
         return {
@@ -515,6 +521,7 @@ def _load_json(v, default=None):
 # ── Bulk fetch + store ────────────────────────────────────────────────────────
 
 def fetch_and_store_bulk(tickers: list[str],
+                         weekly_latest_date: str | None = None,
                          log=print) -> dict[str, dict]:
     """
     Download 3y OHLCV for `tickers` in batches of 100, compute all indicators,
@@ -523,6 +530,9 @@ def fetch_and_store_bulk(tickers: list[str],
     Returns {ticker: legacy_tech_dict | {"error": ...}}.
     The legacy_tech_dict format is what indicators.py / evaluate_all() expects
     (ma_checks, daily_vs_3m, big_up_events, etc.).
+
+    weekly_latest_date: if set, limits the weekly comparison window (T2) to
+    that date. Close / as_of_date always reflect the latest available data.
     """
     is_final = nyse_close_passed_today()
     results: dict[str, dict] = {}
@@ -562,7 +572,7 @@ def fetch_and_store_bulk(tickers: list[str],
                     results[ticker] = {"error": f"No price data for {ticker}"}
                     continue
 
-                fields = _compute_all_indicators(ticker, df)
+                fields = _compute_all_indicators(ticker, df, weekly_latest_date)
                 if "error" in fields:
                     results[ticker] = {"error": fields["error"]}
                     continue
