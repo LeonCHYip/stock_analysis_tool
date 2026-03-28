@@ -37,6 +37,7 @@ import streamlit as st
 
 from data_fetcher  import fetch_technical, fetch_technical_bulk
 from technical_fetcher import fetch_and_store_bulk as fetch_technical_bulk_v2
+import fundamental_fetcher
 from fundamental_fetcher import fetch_fundamental
 from peers_fetcher import get_peer_valuations, clear_peer_cache
 import vpn_switcher
@@ -846,6 +847,7 @@ def _run_fund_and_peers(ticker: str, fetch_peers: bool = True) -> tuple[dict, di
 def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                      pause_event, stop_event, progress,
                      fetch_peers: bool = True, vpn_rotate: bool = False):
+    fundamental_fetcher.set_stop_event(stop_event)
     clear_peer_cache()   # fresh cache for each scan run
     total = len(tickers)
     progress.update({
@@ -914,8 +916,9 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
             done += skipped_count
             progress["done"] = done
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_FUND_WORKERS) as pool:
-            future_map = {pool.submit(_run_fund_and_peers, t, fetch_peers): t for t in valid_batch}
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_FUND_WORKERS)
+        future_map = {pool.submit(_run_fund_and_peers, t, fetch_peers): t for t in valid_batch}
+        try:
             for future in concurrent.futures.as_completed(future_map):
                 if stop_event.is_set():
                     break
@@ -951,6 +954,8 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                     progress["failures"][t] = {"reason": str(ex), "missing": ["all"]}
                 done += 1
                 progress["done"] = done
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         # ── Step 2b: re-queue rate-limited tickers after VPN switch ───────────
         if rate_limited_tickers and vpn_switched_this_batch and not stop_event.is_set():
@@ -958,11 +963,12 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                 f"Re-processing {len(rate_limited_tickers)} rate-limited tickers on new IP…"
             )
             # Use 2 workers — gentle on the freshly switched IP
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as retry_pool:
-                retry_map = {
-                    retry_pool.submit(_run_fund_and_peers, t, fetch_peers): t
-                    for t in rate_limited_tickers
-                }
+            retry_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            retry_map = {
+                retry_pool.submit(_run_fund_and_peers, t, fetch_peers): t
+                for t in rate_limited_tickers
+            }
+            try:
                 for future in concurrent.futures.as_completed(retry_map):
                     if stop_event.is_set():
                         break
@@ -975,6 +981,8 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                             save_results(t, indicators, analysis_dt, fund.get("market_cap"))
                     except Exception:
                         pass
+            finally:
+                retry_pool.shutdown(wait=False, cancel_futures=True)
 
         # ── Step 3: cooldown + optional proactive VPN switch ──────────────────
         if batch_start + SCAN_BATCH_SIZE < total and not stop_event.is_set():
@@ -988,6 +996,7 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
             if vpn_rotate and not stop_event.is_set() and not vpn_switched_this_batch:
                 _do_vpn_switch("Batch complete")
 
+    fundamental_fetcher.set_stop_event(None)
     progress["finished"] = True
     progress["current"]  = ""
 

@@ -24,6 +24,7 @@ Two HTTP requests (down from the original 3):
 
 from __future__ import annotations
 import json
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -35,6 +36,23 @@ import storage
 
 CST = ZoneInfo("America/Chicago")
 _RETRY_DELAYS = [5, 10, 20]
+
+# Set this to a threading.Event to make retry sleeps interruptible.
+# When the event is set, sleeps return immediately (scan stopped).
+_stop_event: threading.Event | None = None
+
+
+def set_stop_event(evt: threading.Event | None) -> None:
+    global _stop_event
+    _stop_event = evt
+
+
+def _sleep(secs: float) -> None:
+    """Sleep for `secs` seconds, returning early if _stop_event is set."""
+    if _stop_event is not None:
+        _stop_event.wait(timeout=secs)
+    else:
+        time.sleep(secs)
 
 # ── Call 1: quoteSummary modules ───────────────────────────────────────────────
 _MODULES = ",".join([
@@ -178,7 +196,7 @@ def _fetch_quote_summary(stock) -> dict:
                 if _is_auth_err(e):
                     raise
         print(f"  [fund] Empty quoteSummary for {sym} (attempt {attempt}), waiting {delay}s…")
-        time.sleep(delay)
+        _sleep(delay)
     return {}
 
 
@@ -216,7 +234,7 @@ def _fetch_timeseries(stock, sym: str) -> dict[str, list]:
                 if _is_auth_err(e):
                     raise
         print(f"  [fund] Empty timeseries for {sym} (attempt {attempt}), waiting {delay}s…")
-        time.sleep(delay)
+        _sleep(delay)
     return {}
 
 

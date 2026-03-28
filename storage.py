@@ -320,23 +320,43 @@ CREATE TABLE IF NOT EXISTS earnings_fetch_log (
 );
 """
 
-_db_lock   = threading.Lock()
-_write_lock = threading.RLock()   # serialise all DB write operations
+_init_lock = threading.Lock()
+_db_lock   = threading.RLock()    # serialises ALL DB operations (reads + writes)
 _global_conn: duckdb.DuckDBPyConnection | None = None
 
 
-def _conn() -> duckdb.DuckDBPyConnection:
-    """Return a thread-safe cursor from the shared DB connection.
+class _LockedCursor:
+    """Proxy for a DuckDB cursor that holds _db_lock for its entire lifetime.
 
-    DuckDB only allows one file-level connection per process; using cursor()
-    gives each caller its own execution context without re-opening the file.
+    Acquires _db_lock on construction; releases it in __del__ when the cursor
+    goes out of scope.  Because _db_lock is an RLock, nested calls from the
+    same thread (e.g. get_latest_run_datetime → get_all_run_datetimes) work
+    correctly without deadlocking.
     """
+    __slots__ = ("_cur",)
+
+    def __init__(self) -> None:
+        _db_lock.acquire()
+        self._cur = _global_conn.cursor()  # type: ignore[union-attr]
+
+    def __del__(self) -> None:
+        try:
+            _db_lock.release()
+        except RuntimeError:
+            pass  # already released (shouldn't happen)
+
+    def __getattr__(self, name: str):
+        return getattr(self._cur, name)
+
+
+def _conn() -> "_LockedCursor":
+    """Return a locked cursor proxy. _db_lock is held until the proxy is GC'd."""
     global _global_conn
     if _global_conn is None:
-        with _db_lock:
+        with _init_lock:
             if _global_conn is None:
                 _global_conn = duckdb.connect(str(DB_PATH))
-    return _global_conn.cursor()
+    return _LockedCursor()
 
 
 def init_db() -> None:
@@ -467,11 +487,10 @@ def save_tech_indicators(ticker: str, as_of_date: str, fields: dict,
     vals = list(fields.values()) + [ticker, as_of_date, is_finalized, now]
     placeholders = ", ".join(["?" for _ in vals])
     col_str = ", ".join(cols)
-    with _write_lock:
-        con.execute(
-            f"INSERT OR REPLACE INTO tech_indicators ({col_str}) VALUES ({placeholders})",
-            vals,
-        )
+    con.execute(
+        f"INSERT OR REPLACE INTO tech_indicators ({col_str}) VALUES ({placeholders})",
+        vals,
+    )
 
 
 def get_latest_tech_date(ticker: str) -> str | None:
@@ -496,12 +515,11 @@ def get_unfinalized_tickers() -> list[tuple[str, str]]:
 
 def mark_tech_finalized(ticker: str, as_of_date: str) -> None:
     con = _conn()
-    with _write_lock:
-        con.execute(
-            "UPDATE tech_indicators SET is_finalized = TRUE "
-            "WHERE ticker = ? AND as_of_date = ?",
-            [ticker, as_of_date],
-        )
+    con.execute(
+        "UPDATE tech_indicators SET is_finalized = TRUE "
+        "WHERE ticker = ? AND as_of_date = ?",
+        [ticker, as_of_date],
+    )
 
 
 def mark_old_tech_finalized() -> None:
@@ -512,12 +530,11 @@ def mark_old_tech_finalized() -> None:
     from datetime import date
     today = date.today().isoformat()
     con = _conn()
-    with _write_lock:
-        con.execute(
-            "UPDATE tech_indicators SET is_finalized = TRUE "
-            "WHERE is_finalized = FALSE AND CAST(as_of_date AS TEXT) < ?",
-            [today],
-        )
+    con.execute(
+        "UPDATE tech_indicators SET is_finalized = TRUE "
+        "WHERE is_finalized = FALSE AND CAST(as_of_date AS TEXT) < ?",
+        [today],
+    )
 
 
 def get_tech_for_ticker(ticker: str, as_of_date: str | None = None) -> dict | None:
@@ -582,11 +599,10 @@ def save_fundamental(ticker: str, fetch_date: str, fields: dict) -> None:
     placeholders = ", ".join(["?" for _ in vals])
     col_str = ", ".join(cols)
     con = _conn()
-    with _write_lock:
-        con.execute(
-            f"INSERT OR REPLACE INTO fundamentals ({col_str}) VALUES ({placeholders})",
-            vals,
-        )
+    con.execute(
+        f"INSERT OR REPLACE INTO fundamentals ({col_str}) VALUES ({placeholders})",
+        vals,
+    )
 
 
 def get_latest_fundamental(ticker: str) -> dict | None:
@@ -672,21 +688,20 @@ def save_peer_valuations(ticker: str, peer_data: dict) -> None:
     """Persist peer valuations to peer_cache table."""
     now = datetime.now(CST)
     con = _conn()
-    with _write_lock:
-        con.execute(
-            "INSERT OR REPLACE INTO peer_cache "
-            "(ticker, peers_json, pe_median, pb_median, pe_values_json, pb_values_json, fetched_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [
-                ticker.upper(),
-                json.dumps(peer_data.get("peers", [])),
-                peer_data.get("pe_median"),
-                peer_data.get("pb_median"),
-                json.dumps(peer_data.get("peer_forward_pe_values", [])),
-                json.dumps(peer_data.get("peer_pb_values", [])),
-                now,
-            ],
-        )
+    con.execute(
+        "INSERT OR REPLACE INTO peer_cache "
+        "(ticker, peers_json, pe_median, pb_median, pe_values_json, pb_values_json, fetched_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ticker.upper(),
+            json.dumps(peer_data.get("peers", [])),
+            peer_data.get("pe_median"),
+            peer_data.get("pb_median"),
+            json.dumps(peer_data.get("peer_forward_pe_values", [])),
+            json.dumps(peer_data.get("peer_pb_values", [])),
+            now,
+        ],
+    )
 
 
 # ── Analysis runs (mirrors db.py public API) ──────────────────────────────────
@@ -694,11 +709,10 @@ def save_peer_valuations(ticker: str, peer_data: dict) -> None:
 def save_comment_for_ticker(ticker: str, comment: str) -> None:
     """Update comments for ALL analysis_runs rows of this ticker."""
     con = _conn()
-    with _write_lock:
-        con.execute(
-            "UPDATE analysis_runs SET comments = ? WHERE ticker = ?",
-            [comment, ticker],
-        )
+    con.execute(
+        "UPDATE analysis_runs SET comments = ? WHERE ticker = ?",
+        [comment, ticker],
+    )
 
 
 def save_results(ticker: str, indicators: dict, analysis_dt: str,
@@ -722,17 +736,16 @@ def save_results(ticker: str, indicators: dict, analysis_dt: str,
 
     col_names = "run_dt, ticker, " + ", ".join(SUMMARY_COLS)
     placeholders = ", ".join(["?" for _ in row_vals])
-    with _write_lock:
+    con.execute(
+        f"INSERT OR IGNORE INTO analysis_runs ({col_names}) VALUES ({placeholders})",
+        row_vals,
+    )
+    for ind_id, ind_data in indicators.items():
         con.execute(
-            f"INSERT OR IGNORE INTO analysis_runs ({col_names}) VALUES ({placeholders})",
-            row_vals,
+            "INSERT OR REPLACE INTO analysis_details VALUES (?, ?, ?, ?)",
+            (analysis_dt, ticker, ind_id,
+             json.dumps(ind_data.get("detail", {}), default=str)),
         )
-        for ind_id, ind_data in indicators.items():
-            con.execute(
-                "INSERT OR REPLACE INTO analysis_details VALUES (?, ?, ?, ?)",
-                (analysis_dt, ticker, ind_id,
-                 json.dumps(ind_data.get("detail", {}), default=str)),
-            )
 
 
 def update_field(analysis_dt: str, ticker: str, column: str, value: str) -> bool:
@@ -740,12 +753,11 @@ def update_field(analysis_dt: str, ticker: str, column: str, value: str) -> bool
     if column not in allowed:
         return False
     con = _conn()
-    with _write_lock:
-        con.execute(
-            f"UPDATE analysis_runs SET {column} = ? "
-            "WHERE run_dt = ? AND ticker = ?",
-            [value, analysis_dt, ticker],
-        )
+    con.execute(
+        f"UPDATE analysis_runs SET {column} = ? "
+        "WHERE run_dt = ? AND ticker = ?",
+        [value, analysis_dt, ticker],
+    )
     return True
 
 
@@ -892,12 +904,11 @@ def save_ai_report(run_dt: str, ticker: str, report: str, model: str,
                    status: str = "complete") -> None:
     """Upsert one AI report row."""
     con = _conn()
-    with _write_lock:
-        con.execute(
-            "INSERT OR REPLACE INTO ai_reports (run_dt, ticker, report, model, status) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [run_dt, ticker.upper(), report, model, status],
-        )
+    con.execute(
+        "INSERT OR REPLACE INTO ai_reports (run_dt, ticker, report, model, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [run_dt, ticker.upper(), report, model, status],
+    )
 
 
 def get_ai_reports(tickers: list[str] | None = None,
@@ -968,11 +979,10 @@ def save_earnings(ticker: str, fields: dict) -> None:
     vals = list(fields.values()) + [ticker]
     placeholders = ", ".join(["?" for _ in vals])
     col_str = ", ".join(cols)
-    with _write_lock:
-        con.execute(
-            f"INSERT OR REPLACE INTO earnings_history ({col_str}) VALUES ({placeholders})",
-            vals,
-        )
+    con.execute(
+        f"INSERT OR REPLACE INTO earnings_history ({col_str}) VALUES ({placeholders})",
+        vals,
+    )
 
 
 def get_latest_earnings(ticker: str) -> dict | None:
@@ -1019,12 +1029,11 @@ def mark_earnings_date_fetched(fetch_date: str, ticker_count: int) -> None:
     """Record that a trading-day has been scraped."""
     con = _conn()
     now = datetime.now(CST)
-    with _write_lock:
-        con.execute(
-            "INSERT OR REPLACE INTO earnings_fetch_log (fetch_date, scraped_at, ticker_count) "
-            "VALUES (?, ?, ?)",
-            [fetch_date, now, ticker_count],
-        )
+    con.execute(
+        "INSERT OR REPLACE INTO earnings_fetch_log (fetch_date, scraped_at, ticker_count) "
+        "VALUES (?, ?, ?)",
+        [fetch_date, now, ticker_count],
+    )
 
 
 def get_fetched_earnings_dates() -> set[str]:
@@ -1075,12 +1084,11 @@ def get_earnings_dates_with_null_change(min_date: str | None = None) -> list[str
 def update_earnings_1d_change(ticker: str, earnings_date: str, change: float) -> None:
     """Update one_day_change for an existing earnings_history row."""
     con = _conn()
-    with _write_lock:
-        con.execute(
-            "UPDATE earnings_history SET one_day_change = ? "
-            "WHERE ticker = ? AND earnings_date = ?",
-            [change, ticker, earnings_date],
-        )
+    con.execute(
+        "UPDATE earnings_history SET one_day_change = ? "
+        "WHERE ticker = ? AND earnings_date = ?",
+        [change, ticker, earnings_date],
+    )
 
 
 def get_earnings_for_date(earnings_date: str) -> dict[str, dict]:

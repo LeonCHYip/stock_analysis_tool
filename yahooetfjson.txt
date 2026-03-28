@@ -1,0 +1,769 @@
+{
+    "quoteSummary": {
+        "result": [
+            {
+                "assetProfile": {
+                    "phone": "(414) 299-2295",
+                    "longBusinessSummary": "Under normal market circumstances, the fund will maintain at least 80% exposure to financial instruments that provide two times leveraged exposure to the daily performance of LITE. This may include LITE stock in addition to financial instruments. The fund is non-diversified.",
+                    "companyOfficers": [],
+                    "executiveTeam": [],
+                    "maxAge": 86400
+                },
+                "fundProfile": {
+                    "maxAge": 1,
+                    "styleBoxUrl": null,
+                    "family": "AXS",
+                    "categoryName": "Trading--Leveraged Equity",
+                    "legalType": "Exchange Traded Fund",
+                    "managementInfo": {
+                        "managerName": null,
+                        "managerBio": null,
+                        "startdate": {}
+                    },
+                    "feesExpensesInvestment": {
+                        "annualReportExpenseRatio": {
+                            "raw": 0.0149,
+                            "fmt": "1.49%"
+                        },
+                        "frontEndSalesLoad": {},
+                        "deferredSalesLoad": {},
+                        "twelveBOne": {},
+                        "netExpRatio": {},
+                        "grossExpRatio": {},
+                        "annualHoldingsTurnover": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "totalNetAssets": {
+                            "raw": 0.0,
+                            "fmt": "0.00"
+                        },
+                        "projectionValues": {}
+                    },
+                    "feesExpensesInvestmentCat": {
+                        "annualReportExpenseRatio": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "frontEndSalesLoad": {},
+                        "deferredSalesLoad": {},
+                        "twelveBOne": {},
+                        "annualHoldingsTurnover": {},
+                        "totalNetAssets": {
+                            "raw": 0.0,
+                            "fmt": "0.00"
+                        },
+                        "projectionValuesCat": {}
+                    },
+                    "initInvestment": {},
+                    "initIraInvestment": {},
+                    "initAipInvestment": {},
+                    "subseqInvestment": {},
+                    "subseqIraInvestment": {},
+                    "subseqAipInvestment": {},
+                    "brokerages": []
+                },
+                "summaryDetail": {
+                    "maxAge": 1,
+                    "priceHint": {
+                        "raw": 2,
+                        "fmt": "2",
+                        "longFmt": "2"
+                    },
+                    "previousClose": {
+                        "raw": 26.71,
+                        "fmt": "26.71"
+                    },
+                    "open": {
+                        "raw": 31.58,
+                        "fmt": "31.58"
+                    },
+                    "dayLow": {
+                        "raw": 30.625,
+                        "fmt": "30.62"
+                    },
+                    "dayHigh": {
+                        "raw": 34.57,
+                        "fmt": "34.57"
+                    },
+                    "regularMarketPreviousClose": {
+                        "raw": 26.71,
+                        "fmt": "26.71"
+                    },
+                    "regularMarketOpen": {
+                        "raw": 31.58,
+                        "fmt": "31.58"
+                    },
+                    "regularMarketDayLow": {
+                        "raw": 30.625,
+                        "fmt": "30.62"
+                    },
+                    "regularMarketDayHigh": {
+                        "raw": 34.57,
+                        "fmt": "34.57"
+                    },
+                    "dividendRate": {},
+                    "dividendYield": {},
+                    "exDividendDate": {},
+                    "payoutRatio": {},
+                    "fiveYearAvgDividendYield": {},
+                    "beta": {},
+                    "forwardPE": {},
+                    "volume": {
+                        "raw": 5308604,
+                        "fmt": "5.31M",
+                        "longFmt": "5,308,604"
+                    },
+                    "regularMarketVolume": {
+                        "raw": 5308604,
+                        "fmt": "5.31M",
+                        "longFmt": "5,308,604"
+                    },
+                    "averageVolume": {
+                        "raw": 2784745,
+                        "fmt": "2.78M",
+                        "longFmt": "2,784,745"
+                    },
+                    "averageVolume10days": {
+                        "raw": 4130010,
+                        "fmt": "4.13M",
+                        "longFmt": "4,130,010"
+                    },
+                    "averageDailyVolume10Day": {
+                        "raw": 4130010,
+                        "fmt": "4.13M",
+                        "longFmt": "4,130,010"
+                    },
+                    "bid": {
+                        "raw": 31.51,
+                        "fmt": "31.51"
+                    },
+                    "ask": {
+                        "raw": 31.24,
+                        "fmt": "31.24"
+                    },
+                    "bidSize": {
+                        "raw": 100000,
+                        "fmt": "100k",
+                        "longFmt": "100,000"
+                    },
+                    "askSize": {
+                        "raw": 30000,
+                        "fmt": "30k",
+                        "longFmt": "30,000"
+                    },
+                    "marketCap": {},
+                    "nonDilutedMarketCap": {},
+                    "yield": {},
+                    "ytdReturn": {},
+                    "qtdReturn": {},
+                    "totalAssets": {
+                        "raw": 210574288,
+                        "fmt": "210.57M",
+                        "longFmt": "210,574,288"
+                    },
+                    "expireDate": {},
+                    "strikePrice": {},
+                    "openInterest": {},
+                    "fiftyTwoWeekLow": {
+                        "raw": 9.232333,
+                        "fmt": "9.23"
+                    },
+                    "fiftyTwoWeekHigh": {
+                        "raw": 42.280334,
+                        "fmt": "42.28"
+                    },
+                    "allTimeHigh": {
+                        "raw": 42.280334,
+                        "fmt": "42.28"
+                    },
+                    "allTimeLow": {
+                        "raw": 9.232333,
+                        "fmt": "9.23"
+                    },
+                    "priceToSalesTrailing12Months": {},
+                    "fiftyDayAverage": {
+                        "raw": 24.700457,
+                        "fmt": "24.70"
+                    },
+                    "twoHundredDayAverage": {
+                        "raw": 24.700457,
+                        "fmt": "24.70"
+                    },
+                    "trailingAnnualDividendRate": {
+                        "raw": 0.0,
+                        "fmt": "0.00"
+                    },
+                    "trailingAnnualDividendYield": {
+                        "raw": 0.0,
+                        "fmt": "0.00%"
+                    },
+                    "navPrice": {
+                        "raw": 26.7811,
+                        "fmt": "26.78"
+                    },
+                    "currency": "USD",
+                    "fromCurrency": null,
+                    "toCurrency": null,
+                    "lastMarket": null,
+                    "coinMarketCapLink": null,
+                    "volume24Hr": {},
+                    "volumeAllCurrencies": {},
+                    "circulatingSupply": {},
+                    "algorithm": null,
+                    "maxSupply": {},
+                    "totalSupply": {},
+                    "startDate": {},
+                    "tradeable": false,
+                    "fullyDilutedValue": {},
+                    "volume24HrMarketCapPercent": {}
+                },
+                "price": {
+                    "maxAge": 1,
+                    "preMarketChange": {},
+                    "preMarketPrice": {},
+                    "preMarketSource": "FREE_REALTIME",
+                    "postMarketChangePercent": {
+                        "raw": 0.010299314,
+                        "fmt": "1.03%"
+                    },
+                    "postMarketChange": {
+                        "raw": 0.3199997,
+                        "fmt": "0.32"
+                    },
+                    "postMarketTime": 1773878385,
+                    "postMarketPrice": {
+                        "raw": 31.39,
+                        "fmt": "31.39"
+                    },
+                    "postMarketSource": "FREE_REALTIME",
+                    "regularMarketChangePercent": {
+                        "raw": 0.163235,
+                        "fmt": "16.32%"
+                    },
+                    "regularMarketChange": {
+                        "raw": 4.36,
+                        "fmt": "4.36"
+                    },
+                    "regularMarketTime": 1773864000,
+                    "priceHint": {
+                        "raw": 2,
+                        "fmt": "2",
+                        "longFmt": "2"
+                    },
+                    "regularMarketPrice": {
+                        "raw": 31.07,
+                        "fmt": "31.07"
+                    },
+                    "regularMarketDayHigh": {
+                        "raw": 34.57,
+                        "fmt": "34.57"
+                    },
+                    "regularMarketDayLow": {
+                        "raw": 30.625,
+                        "fmt": "30.62"
+                    },
+                    "regularMarketVolume": {
+                        "raw": 5308604,
+                        "fmt": "5.31M",
+                        "longFmt": "5,308,604.00"
+                    },
+                    "averageDailyVolume10Day": {
+                        "raw": 4130010,
+                        "fmt": "4.13M",
+                        "longFmt": "4,130,010"
+                    },
+                    "averageDailyVolume3Month": {
+                        "raw": 2784745,
+                        "fmt": "2.78M",
+                        "longFmt": "2,784,745"
+                    },
+                    "regularMarketPreviousClose": {
+                        "raw": 26.71,
+                        "fmt": "26.71"
+                    },
+                    "regularMarketSource": "FREE_REALTIME",
+                    "regularMarketOpen": {
+                        "raw": 31.58,
+                        "fmt": "31.58"
+                    },
+                    "strikePrice": {},
+                    "openInterest": {},
+                    "exchange": "BTS",
+                    "exchangeName": "Cboe US",
+                    "exchangeDataDelayedBy": 0,
+                    "marketState": "POSTPOST",
+                    "quoteType": "ETF",
+                    "symbol": "LITX",
+                    "underlyingSymbol": null,
+                    "shortName": "Tradr 2X Long LITE Daily ETF",
+                    "longName": "Tradr 2X Long Lite Daily ETF",
+                    "currency": "USD",
+                    "quoteSourceName": "Nasdaq Real Time Price",
+                    "currencySymbol": "$",
+                    "fromCurrency": null,
+                    "toCurrency": null,
+                    "lastMarket": null,
+                    "volume24Hr": {},
+                    "volumeAllCurrencies": {},
+                    "circulatingSupply": {},
+                    "marketCap": {}
+                },
+                "defaultKeyStatistics": {
+                    "maxAge": 1,
+                    "priceHint": {
+                        "raw": 2,
+                        "fmt": "2",
+                        "longFmt": "2"
+                    },
+                    "enterpriseValue": {},
+                    "forwardPE": {},
+                    "profitMargins": {},
+                    "morningStarOverallRating": {},
+                    "morningStarRiskRating": {},
+                    "category": "Trading--Leveraged Equity",
+                    "bookValue": {},
+                    "priceToBook": {},
+                    "annualReportExpenseRatio": {},
+                    "ytdReturn": {},
+                    "qtdReturn": {},
+                    "beta3Year": {
+                        "raw": 0.0,
+                        "fmt": "0.00"
+                    },
+                    "totalAssets": {
+                        "raw": 210574288,
+                        "fmt": "210.57M",
+                        "longFmt": "210,574,288"
+                    },
+                    "yield": {},
+                    "fundFamily": "AXS",
+                    "fundInceptionDate": {
+                        "raw": 1769385600,
+                        "fmt": "2026-01-26"
+                    },
+                    "legalType": "Exchange Traded Fund",
+                    "threeYearAverageReturn": {},
+                    "fiveYearAverageReturn": {},
+                    "priceToSalesTrailing12Months": {},
+                    "lastFiscalYearEnd": {},
+                    "nextFiscalYearEnd": {},
+                    "mostRecentQuarter": {},
+                    "earningsQuarterlyGrowth": {},
+                    "revenueQuarterlyGrowth": {},
+                    "netIncomeToCommon": {},
+                    "trailingEps": {},
+                    "forwardEps": {},
+                    "pegRatio": {},
+                    "lastSplitFactor": null,
+                    "lastSplitDate": {},
+                    "enterpriseToRevenue": {},
+                    "enterpriseToEbitda": {},
+                    "52WeekChange": {},
+                    "SandP52WeekChange": {},
+                    "lastDividendValue": {},
+                    "lastDividendDate": {},
+                    "lastCapGain": {},
+                    "annualHoldingsTurnover": {},
+                    "latestFundingDate": {},
+                    "latestAmountRaised": {},
+                    "latestImpliedValuation": {},
+                    "latestShareClass": null,
+                    "leadInvestor": null,
+                    "fundingToDate": {},
+                    "totalFundingRounds": {}
+                },
+                "summaryProfile": {
+                    "phone": "(414) 299-2295",
+                    "longBusinessSummary": "Under normal market circumstances, the fund will maintain at least 80% exposure to financial instruments that provide two times leveraged exposure to the daily performance of LITE. This may include LITE stock in addition to financial instruments. The fund is non-diversified.",
+                    "companyOfficers": [],
+                    "executiveTeam": [],
+                    "maxAge": 86400
+                },
+                "topHoldings": {
+                    "maxAge": 1,
+                    "cashPosition": {
+                        "raw": 0.3325,
+                        "fmt": "33.25%"
+                    },
+                    "stockPosition": {
+                        "raw": 0.5381,
+                        "fmt": "53.81%"
+                    },
+                    "bondPosition": {
+                        "raw": 0.0,
+                        "fmt": "0.00%"
+                    },
+                    "otherPosition": {
+                        "raw": 0.1294,
+                        "fmt": "12.94%"
+                    },
+                    "preferredPosition": {
+                        "raw": 0.0,
+                        "fmt": "0.00%"
+                    },
+                    "convertiblePosition": {
+                        "raw": 0.0,
+                        "fmt": "0.00%"
+                    },
+                    "holdings": [],
+                    "equityHoldings": {
+                        "priceToEarnings": {
+                            "raw": 0.0,
+                            "fmt": "0"
+                        },
+                        "priceToBook": {
+                            "raw": 0.0,
+                            "fmt": "0"
+                        },
+                        "priceToSales": {
+                            "raw": 0.0,
+                            "fmt": "0"
+                        },
+                        "priceToCashflow": {
+                            "raw": 0.0,
+                            "fmt": "0"
+                        },
+                        "medianMarketCap": {},
+                        "threeYearEarningsGrowth": {},
+                        "priceToEarningsCat": {},
+                        "priceToBookCat": {},
+                        "priceToSalesCat": {},
+                        "priceToCashflowCat": {},
+                        "medianMarketCapCat": {},
+                        "threeYearEarningsGrowthCat": {}
+                    },
+                    "bondHoldings": {
+                        "maturity": {},
+                        "duration": {},
+                        "creditQuality": {},
+                        "maturityCat": {},
+                        "durationCat": {},
+                        "creditQualityCat": {}
+                    },
+                    "bondRatings": [
+                        {
+                            "us_government": {
+                                "raw": 0.0,
+                                "fmt": "0.00%"
+                            }
+                        }
+                    ],
+                    "sectorWeightings": []
+                },
+                "fundPerformance": {
+                    "maxAge": 1,
+                    "fundCategoryName": "Trading--Leveraged Equity",
+                    "performanceOverview": {
+                        "asOfDate": {
+                            "raw": 1773705600,
+                            "fmt": "2026-03-17"
+                        },
+                        "morningStarReturnRating": {},
+                        "ytdReturnPct": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "fiveYrAvgReturnPct": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "numYearsUp": {},
+                        "numYearsDown": {},
+                        "bestOneYrTotalReturn": {},
+                        "worstOneYrTotalReturn": {},
+                        "bestThreeYrTotalReturn": {},
+                        "worstThreeYrTotalReturn": {},
+                        "oneYearTotalReturn": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "threeYearTotalReturn": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        }
+                    },
+                    "performanceOverviewCat": {
+                        "asOfDate": {},
+                        "morningStarReturnRating": {},
+                        "ytdReturnPct": {},
+                        "fiveYrAvgReturnPct": {},
+                        "numYearsUp": {},
+                        "numYearsDown": {},
+                        "bestOneYrTotalReturn": {},
+                        "worstOneYrTotalReturn": {},
+                        "bestThreeYrTotalReturn": {},
+                        "worstThreeYrTotalReturn": {},
+                        "oneYearTotalReturn": {},
+                        "threeYearTotalReturn": {}
+                    },
+                    "trailingReturns": {
+                        "asOfDate": {
+                            "raw": 1773705600,
+                            "fmt": "2026-03-17"
+                        },
+                        "ytd": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "oneMonth": {
+                            "raw": 1.9988992,
+                            "fmt": "199.89%"
+                        },
+                        "threeMonth": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "oneYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "threeYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "fiveYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "tenYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "lastBullMkt": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "lastBearMkt": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        }
+                    },
+                    "trailingReturnsNav": {
+                        "ytd": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "oneMonth": {
+                            "raw": 1.9988992,
+                            "fmt": "199.89%"
+                        },
+                        "threeMonth": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "oneYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "threeYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "fiveYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "tenYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        }
+                    },
+                    "trailingReturnsCat": {
+                        "ytd": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "oneMonth": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "threeMonth": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "oneYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "threeYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "fiveYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "tenYear": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "lastBullMkt": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        },
+                        "lastBearMkt": {
+                            "raw": 0.0,
+                            "fmt": "0.00%"
+                        }
+                    },
+                    "annualTotalReturns": {
+                        "returns": [],
+                        "returnsCat": []
+                    },
+                    "pastQuarterlyReturns": {
+                        "returns": []
+                    },
+                    "riskOverviewStatistics": {
+                        "riskRating": {},
+                        "riskStatistics": [
+                            {
+                                "year": "5y",
+                                "alpha": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "beta": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "meanAnnualReturn": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "rSquared": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "stdDev": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "sharpeRatio": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "treynorRatio": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                }
+                            },
+                            {
+                                "year": "3y",
+                                "alpha": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "beta": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "meanAnnualReturn": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "rSquared": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "stdDev": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "sharpeRatio": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "treynorRatio": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                }
+                            },
+                            {
+                                "year": "10y",
+                                "alpha": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "beta": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "meanAnnualReturn": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "rSquared": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "stdDev": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "sharpeRatio": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                },
+                                "treynorRatio": {
+                                    "raw": 0.0,
+                                    "fmt": "0"
+                                }
+                            }
+                        ]
+                    },
+                    "riskOverviewStatisticsCat": {
+                        "riskStatisticsCat": [
+                            {
+                                "year": "5y",
+                                "alpha": {},
+                                "beta": {},
+                                "meanAnnualReturn": {},
+                                "rSquared": {},
+                                "stdDev": {},
+                                "sharpeRatio": {},
+                                "treynorRatio": {}
+                            },
+                            {
+                                "year": "3y",
+                                "alpha": {},
+                                "beta": {},
+                                "meanAnnualReturn": {},
+                                "rSquared": {},
+                                "stdDev": {},
+                                "sharpeRatio": {},
+                                "treynorRatio": {}
+                            },
+                            {
+                                "year": "10y",
+                                "alpha": {},
+                                "beta": {},
+                                "meanAnnualReturn": {},
+                                "rSquared": {},
+                                "stdDev": {},
+                                "sharpeRatio": {},
+                                "treynorRatio": {}
+                            }
+                        ]
+                    }
+                },
+                "quoteType": {
+                    "exchange": "BTS",
+                    "quoteType": "ETF",
+                    "symbol": "LITX",
+                    "underlyingSymbol": "LITX",
+                    "shortName": "Tradr 2X Long LITE Daily ETF",
+                    "longName": "Tradr 2X Long Lite Daily ETF",
+                    "firstTradeDateEpochUtc": 1769524200,
+                    "timeZoneFullName": "America/New_York",
+                    "timeZoneShortName": "EDT",
+                    "uuid": "2e8edd23-af58-3d19-b3d6-30cffeaf90f5",
+                    "messageBoardId": "finmb_1976413604",
+                    "gmtOffSetMilliseconds": -14400000,
+                    "maxAge": 1
+                }
+            }
+        ],
+        "error": null
+    }
+}
