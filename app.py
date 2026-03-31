@@ -44,7 +44,8 @@ import vpn_switcher
 from indicators    import evaluate_all, score_indicators
 import storage
 from storage import (
-    init_db, save_results, update_field, save_comment_for_ticker,
+    init_db, save_results, update_field, save_comment_for_ticker, save_status_for_ticker,
+    save_user_field_for_ticker,
     get_all_run_datetimes, get_latest_run_datetime,
     get_summary_for_run, get_detail_for_run, get_all_summaries,
     get_detail_filtered, get_all_tickers,
@@ -64,17 +65,44 @@ CST = ZoneInfo("America/Chicago")
 EMOJI = {"PASS": "✅", "PARTIAL": "⭕", "FAIL": "❌", "NA": "⚪️"}
 EMOJI_TO_DB = {v: k for k, v in EMOJI.items()}
 EMOJI_OPTIONS = ["✅", "⭕", "❌", "⚪️"]
+STATUS_OPTIONS = ["", "必買", "買", "等", "研究", "X"]
 
 TICKERS_FILE = Path(__file__).parent / "tickers.txt"
 
 # ── Value table column groups ──────────────────────────────────────────────────
 VALUE_COL_GROUPS: dict[str, list[str]] = {
+    "User": ["Status"],
     # ── Indicator-derived groups (from analysis detail JSON) ──────────────────
     "Price & Volume — Daily (T1)": [
-        "3M Daily Px%", "3M Daily Vol%", "12M Daily Px%", "12M Daily Vol%",
+        "3M Avg Px%", "3M Avg Vol%", "12M Avg Px%", "12M Avg Vol%",
     ],
     "Price & Volume — Weekly (T2)": [
-        "3M Wkly Px%", "3M Wkly Vol%", "12M Wkly Px%", "12M Wkly Vol%",
+        "3M Wkly Avg Px%", "3M Wkly Avg Vol%", "12M Wkly Avg Px%", "12M Wkly Avg Vol%",
+    ],
+    # ── price_history-derived groups ──────────────────────────────────────────
+    "Spot Returns": [
+        "5D Px%", "5D Vol%",
+        "1M Px%", "1M Vol%",
+        "3M Px%", "3M Vol%",
+        "6M Px%", "6M Vol%",
+        "12M Px%", "12M Vol%",
+        "2Y Px%", "2Y Vol%",
+        "3Y Px%", "3Y Vol%",
+    ],
+    "Rolling Returns (Daily)": [
+        "1M Avg Px%", "1M Avg Vol%",
+        "6M Avg Px%", "6M Avg Vol%",
+        "2Y Avg Px%", "2Y Avg Vol%",
+        "3Y Avg Px%", "3Y Avg Vol%",
+    ],
+    "Rolling Returns (Weekly)": [
+        "1M Wkly Avg Px%", "1M Wkly Avg Vol%",
+        "6M Wkly Avg Px%", "6M Wkly Avg Vol%",
+        "2Y Wkly Avg Px%", "2Y Wkly Avg Vol%",
+        "3Y Wkly Avg Px%", "3Y Wkly Avg Vol%",
+    ],
+    "Custom Period Returns": [
+        "Cust Px%", "Cust Vol%", "Cust Avg Px%", "Cust Avg Vol%",
     ],
     "MA Checks (T3)": [
         "MA10>20", "MA20>50", "MA50>150", "MA150>200",
@@ -99,10 +127,14 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     ],
     "Earnings Detail": [
         "Next Earnings Date", "Next Earnings Time",
-        "Last Earnings Date", "Last Earnings Time", "Last Earnings 1D Change",
+        "Last Earnings Date", "Last Earnings Time", "Earns 1D Px%",
         "EPS Est", "EPS Act", "EPS Sur",
         "EPS GAAP Est", "EPS GAAP Act", "EPS GAAP Sur",
         "Rev Est ($M)", "Rev Act ($M)", "Rev Sur",
+    ],
+    "Earnings Extended": [
+        "Earns 1D Px%", "Earns 1D Vol%", "Earns 5D Px%", "Earns 5D Vol%",
+        "Earns 5D Roll Px%", "Earns 5D Roll Vol%",
     ],
     "Score": ["Score"],
     "Short Interest": [
@@ -274,10 +306,15 @@ DEFAULT_VALUE_GROUPS = [
 ALL_VALUE_COLS = list(dict.fromkeys(c for cols in VALUE_COL_GROUPS.values() for c in cols))
 
 # ── Column filter classification ───────────────────────────────────────────────
-_COL_FILTER_SKIP = {
-    "Ticker", "Sector", "Industry", "Mkt Cap ($B)",
-    "Rec Key", "Company Name", "Company Description",
+_USER_NOTE_COLS = {
+    "Company Summary", "Revenue Composition",
+    "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
 }
+
+_COL_FILTER_SKIP = {
+    "Ticker", "Sector", "Industry",
+    "Rec Key", "Company Name", "Company Description",
+} | _USER_NOTE_COLS
 _COL_FILTER_EMOJI = {
     "MA10>20", "MA20>50", "MA50>150", "MA150>200",
     "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
@@ -286,6 +323,7 @@ _COL_FILTER_EMOJI = {
 _COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
     "Last Earnings Time":  ["BMO", "AMC"],
     "Next Earnings Time":  ["BMO", "AMC"],
+    "Status":              ["", "必買", "買", "等", "研究", "X"],
 }
 _COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
@@ -533,7 +571,8 @@ def _extract_net(fund_map: dict) -> dict[str, str]:
 
 def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
                         tech: dict | None = None,
-                        earnings: dict | None = None) -> dict:
+                        earnings: dict | None = None,
+                        returns: dict | None = None) -> dict:
     """Build one value-table row. Numeric columns are native float for correct sorting."""
     t1 = detail.get("T1", {})
     t2 = detail.get("T2", {})
@@ -569,18 +608,25 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
 
     rec = {
         "Ticker":          ticker,
+        "Company Summary":     row.get("company_summary") or "",
+        "Revenue Composition": row.get("revenue_composition") or "",
+        "Status":              row.get("status") or "",
         "Comments":        row.get("comments") or "",
+        "technical +ve":   row.get("tech_pos") or "",
+        "fundamental +ve": row.get("fund_pos") or "",
+        "technical -ve":   row.get("tech_neg") or "",
+        "fundamental -ve": row.get("fund_neg") or "",
         "Score":           compute_score(row),
-        # T1 — daily comparisons (float %)
-        "3M Daily Px%":   _f(t1.get("3M Price Change %")),
-        "3M Daily Vol%":  _f(t1.get("3M Volume Change %")),
-        "12M Daily Px%":  _f(t1.get("12M Price Change %")),
-        "12M Daily Vol%": _f(t1.get("12M Volume Change %")),
-        # T2 — weekly comparisons (float %)
-        "3M Wkly Px%":    _f(t2.get("3M Price Change %")),
-        "3M Wkly Vol%":   _f(t2.get("3M Volume Change %")),
-        "12M Wkly Px%":   _f(t2.get("12M Price Change %")),
-        "12M Wkly Vol%":  _f(t2.get("12M Volume Change %")),
+        # T1 — daily comparisons (float %) — renamed from "3M Daily Px%" etc.
+        "3M Avg Px%":    _f(t1.get("3M Price Change %")),
+        "3M Avg Vol%":   _f(t1.get("3M Volume Change %")),
+        "12M Avg Px%":   _f(t1.get("12M Price Change %")),
+        "12M Avg Vol%":  _f(t1.get("12M Volume Change %")),
+        # T2 — weekly comparisons (float %) — renamed from "3M Wkly Px%" etc.
+        "3M Wkly Avg Px%":  _f(t2.get("3M Price Change %")),
+        "3M Wkly Avg Vol%": _f(t2.get("3M Volume Change %")),
+        "12M Wkly Avg Px%": _f(t2.get("12M Price Change %")),
+        "12M Wkly Avg Vol%":_f(t2.get("12M Volume Change %")),
         # T3 — MA booleans
         "MA10>20":        _bi(sub3.get("MA10>MA20")),
         "MA20>50":        _bi(sub3.get("MA20>MA50")),
@@ -703,7 +749,7 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     e = earnings or {}
     rec["Last Earnings Date"]      = e.get("earnings_date") or "N/A"
     rec["Last Earnings Time"]      = e.get("earnings_time") or "N/A"
-    rec["Last Earnings 1D Change"] = _f(e.get("one_day_change"))
+    rec["Earns 1D Px%"] = _f(e.get("one_day_change"))
     rec["EPS Est"]       = _f(e.get("eps_est"))
     rec["EPS Act"]       = _f(e.get("eps_act"))
     rec["EPS Sur"]       = _f(e.get("eps_sur"))
@@ -713,6 +759,12 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     rec["Rev Est ($M)"]  = _f(e.get("rev_est_m"))
     rec["Rev Act ($M)"]  = _f(e.get("rev_act_m"))
     rec["Rev Sur"]       = _f(e.get("rev_sur"))
+    # ── Earnings extended columns ─────────────────────────────────────────────
+    rec["Earns 1D Vol%"]       = _f(e.get("earns_1d_vol_pct"))
+    rec["Earns 5D Px%"]        = _f(e.get("earns_5d_px_pct"))
+    rec["Earns 5D Vol%"]       = _f(e.get("earns_5d_vol_pct"))
+    rec["Earns 5D Roll Px%"]   = _f(e.get("earns_5d_roll_px_pct"))
+    rec["Earns 5D Roll Vol%"]  = _f(e.get("earns_5d_roll_vol_pct"))
 
     # ── Short interest (from fundamentals DB) ─────────────────────────────────
     def _pct(v):
@@ -776,6 +828,27 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     rec["Rec Score"]        = _f(f_db.get("rec_mean"))
     rec["Rec Key"]          = f_db.get("rec_key") or "N/A"
     rec["Analyst Count"]    = f_db.get("analyst_count")
+
+    # ── Price-history returns (spot, rolling avg, custom period) ──────────────
+    ph = returns or {}
+    # Spot
+    for col in ("5D Px%", "5D Vol%", "1M Px%", "1M Vol%", "3M Px%", "3M Vol%",
+                "6M Px%", "6M Vol%", "12M Px%", "12M Vol%", "2Y Px%", "2Y Vol%",
+                "3Y Px%", "3Y Vol%"):
+        rec[col] = _f(ph.get(col))
+    # Daily rolling avg (new periods)
+    for col in ("1M Avg Px%", "1M Avg Vol%", "6M Avg Px%", "6M Avg Vol%",
+                "2Y Avg Px%", "2Y Avg Vol%", "3Y Avg Px%", "3Y Avg Vol%"):
+        rec[col] = _f(ph.get(col))
+    # Weekly rolling avg (new periods)
+    for col in ("1M Wkly Avg Px%", "1M Wkly Avg Vol%",
+                "6M Wkly Avg Px%", "6M Wkly Avg Vol%",
+                "2Y Wkly Avg Px%", "2Y Wkly Avg Vol%",
+                "3Y Wkly Avg Px%", "3Y Wkly Avg Vol%"):
+        rec[col] = _f(ph.get(col))
+    # Custom period
+    for col in ("Cust Px%", "Cust Vol%", "Cust Avg Px%", "Cust Avg Vol%"):
+        rec[col] = _f(ph.get(col))
 
     return rec
 
@@ -1053,8 +1126,15 @@ def build_summary_df(rows: list[dict],
                 for sc in SUB_COLS.get(ind, []):
                     rec[SUB_DISPLAY.get(sc, sc)] = _e(r.get(sc, "NA"))
 
-        rec["Score"]    = compute_score(r)
-        rec["Comments"] = r.get("comments") or ""
+        rec["Score"]           = compute_score(r)
+        rec["Company Summary"]     = r.get("company_summary") or ""
+        rec["Revenue Composition"] = r.get("revenue_composition") or ""
+        rec["Status"]              = r.get("status") or ""
+        rec["Comments"]        = r.get("comments") or ""
+        rec["technical +ve"]   = r.get("tech_pos") or ""
+        rec["fundamental +ve"] = r.get("fund_pos") or ""
+        rec["technical -ve"]   = r.get("tech_neg") or ""
+        rec["fundamental -ve"] = r.get("fund_neg") or ""
 
         # Rightmost: Mkt Cap, Sector, Industry, Next Earnings, Close, Change %, Last Close Date
         ticker = r.get("ticker", "")
@@ -1092,7 +1172,14 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
     # Build reverse col name map: display → DB col
     disp_to_db = {v: k for k, v in SUB_DISPLAY.items()}
     disp_to_db.update({ind: ind for ind in MAIN_IND_COLS})
-    disp_to_db["Comments"] = "comments"
+    disp_to_db["Comments"]        = "comments"
+    disp_to_db["Status"]          = "status"
+    disp_to_db["Company Summary"]     = "company_summary"
+    disp_to_db["Revenue Composition"] = "revenue_composition"
+    disp_to_db["technical +ve"]       = "tech_pos"
+    disp_to_db["fundamental +ve"] = "fund_pos"
+    disp_to_db["technical -ve"]   = "tech_neg"
+    disp_to_db["fundamental -ve"] = "fund_neg"
 
     for ticker, row in edited_df.iterrows():
         # ticker comes from the DataFrame index (set_index("Ticker"))
@@ -1121,9 +1208,13 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
                 new_val = EMOJI_TO_DB.get(str(new_val), str(new_val))
 
             update_field(analysis_dt, ticker, db_col, str(new_val) if new_val is not None else "")
-            # Keep all rows for this ticker in sync when comments change
+            # Keep all rows for this ticker in sync when comments or status change
             if db_col == "comments":
                 save_comment_for_ticker(str(ticker), str(new_val) if new_val is not None else "")
+            elif db_col == "status":
+                save_status_for_ticker(str(ticker), str(new_val) if new_val is not None else "")
+            elif db_col in ("company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg"):
+                save_user_field_for_ticker(str(ticker), db_col, str(new_val) if new_val is not None else "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1143,8 +1234,16 @@ def make_column_config(df: pd.DataFrame) -> dict:
             )
         elif col == "Score":
             config[col] = st.column_config.NumberColumn("Score", format="%.1f", disabled=True)
+        elif col == "Status":
+            config[col] = st.column_config.SelectboxColumn(
+                "Status", options=STATUS_OPTIONS, required=False
+            )
         elif col == "Comments":
             config[col] = st.column_config.TextColumn("Comments", width="large")
+        elif col in ("Company Summary", "Revenue Composition"):
+            config[col] = st.column_config.TextColumn(col, width="medium")
+        elif col in ("technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve"):
+            config[col] = st.column_config.TextColumn(col, width="medium")
         elif col == "Mkt Cap ($B)":
             config[col] = st.column_config.NumberColumn(
                 "Mkt Cap ($B)", format="%.2f", disabled=True
@@ -1608,11 +1707,10 @@ def _ai_progress_autorefresh():
     errors  = progress.get("errors", [])
 
     if status == "done":
-        # First time we see "done": trigger a full-page rerun so tab_ai
-        # re-fetches reports from DB. Mark as "shown" to avoid looping.
+        # When done: show a refresh button instead of auto-rerunning the full app,
+        # which would clear all widget states (unsaved comments, filter thresholds, etc.)
         if not progress.get("shown"):
             progress["shown"] = True
-            st.rerun(scope="app")
         if errors:
             st.warning(f"⚠️ AI analysis finished with errors — {done} ticker(s) processed | Run: {run_dt}")
             with st.expander("Error details", expanded=True):
@@ -1651,12 +1749,12 @@ def _ai_confirm_dialog(tickers: list[str]) -> None:
     )
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("✅ Confirm", type="primary", use_container_width=True):
+        if st.button("✅ Confirm", type="primary", width="stretch"):
             _launch_ai_analysis(tickers)
             del st.session_state["ai_confirm_pending"]
             st.rerun()
     with c2:
-        if st.button("❌ Cancel", use_container_width=True):
+        if st.button("❌ Cancel", width="stretch"):
             del st.session_state["ai_confirm_pending"]
             st.rerun()
 
@@ -1816,17 +1914,6 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
         st.session_state[_loaded_key] = True
         if fd and fd in fg:
             _queue_filter_group(tab_key, fg[fd])
-            st.rerun()
-
-    # ── Action buttons ────────────────────────────────────────────────────────
-    bc1, bc2 = st.columns(2)
-    with bc1:
-        if st.button("Clear all filters", key=f"filt_clear_{tab_key}"):
-            _queue_filter_clear(tab_key)
-            st.rerun()
-    with bc2:
-        if st.button("Reset to default", key=f"filt_reset_{tab_key}"):
-            _queue_filter_clear(tab_key)
             st.rerun()
 
     # ── Indicator filter ──────────────────────────────────────────────────────
@@ -2008,6 +2095,17 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
         else:
             st.caption("No saved groups yet.")
 
+    # ── Action buttons (after manage groups) ──────────────────────────────────
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        if st.button("Clear all filters", key=f"filt_clear_{tab_key}"):
+            _queue_filter_clear(tab_key)
+            st.rerun()
+    with bc2:
+        if st.button("Reset to default", key=f"filt_reset_{tab_key}"):
+            _queue_filter_clear(tab_key)
+            st.rerun()
+
     return ind_filters, col_filter
 
 
@@ -2093,6 +2191,10 @@ def _value_col_config(cols: list[str]) -> dict:
                 cfg[col] = st.column_config.TextColumn("Comments", width="large", wrap_text=True)
             except TypeError:
                 cfg[col] = st.column_config.TextColumn("Comments", width="large")
+        elif col in ("Company Summary", "Revenue Composition"):
+            cfg[col] = st.column_config.TextColumn(col, width="medium")
+        elif col in ("technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve"):
+            cfg[col] = st.column_config.TextColumn(col, width="medium")
         elif col in ("Last Earnings Date", "Last Earnings Time",
                      "Next Earnings Time"):
             cfg[col] = st.column_config.TextColumn(col, disabled=True)
@@ -2100,7 +2202,11 @@ def _value_col_config(cols: list[str]) -> dict:
             cfg[col] = st.column_config.TextColumn("Company Name", width="medium", disabled=True)
         elif col == "Company Description":
             cfg[col] = st.column_config.TextColumn("Company Description", width="large", disabled=True)
-        elif col in ("Last Earnings 1D Change", "EPS Sur", "EPS GAAP Sur", "Rev Sur"):
+        elif col == "Status":
+            cfg[col] = st.column_config.SelectboxColumn(
+                "Status", options=STATUS_OPTIONS, required=False, disabled=False
+            )
+        elif col in ("Earns 1D Px%", "EPS Sur", "EPS GAAP Sur", "Rev Sur"):
             cfg[col] = st.column_config.NumberColumn(col, format="%.2f%%", disabled=True)
         elif col in ("EPS Est", "EPS Act", "EPS GAAP Est", "EPS GAAP Act"):
             cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
@@ -2143,7 +2249,8 @@ def render_value_table(tickers: list[str], detail_map: dict,
                        sort_col: str | None = None,
                        pre_built_records: dict | None = None,
                        pre_built_earnings: dict | None = None,
-                       rank_map: dict | None = None):
+                       rank_map: dict | None = None,
+                       returns_map: dict | None = None):
     """
     Render the Indicator Values Table with:
       - Group multiselect + individual column multiselect
@@ -2300,20 +2407,24 @@ def render_value_table(tickers: list[str], detail_map: dict,
 
     _fixed_right = {"Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
                     "Next Earnings Date", "Next Earnings Time",
-                    "Last Earnings Date", "Last Earnings Time", "Last Earnings 1D Change"}
+                    "Last Earnings Date", "Last Earnings Time", "Earns 1D Px%"}
     data_cols = [c for c in (sel_cols if sel_cols else group_cols)
-                 if c not in _fixed_right and c != "Score" and c != "Comments"]
+                 if c not in _fixed_right and c != "Score" and c != "Status" and c != "Comments"
+                 and c not in _USER_NOTE_COLS]
     # Auto-inject sort col if not already visible and it's a value-table column
     if (sort_col and sort_col not in data_cols
             and sort_col not in _fixed_right
-            and sort_col not in ("Score", "Comments", "#", "Ticker")):
+            and sort_col not in ("Score", "Comments", "#", "Ticker")
+            and sort_col not in _USER_NOTE_COLS):
         data_cols = [sort_col] + data_cols
-    # Order: Ticker | # | Score | data columns | Comments | fixed-right columns
+    # Order: Ticker | # | Score | data columns | Company Summary | Status | Comments | note cols | fixed-right columns
     show_cols = (
         ["Ticker", "#", "Score"] + data_cols
-        + ["Comments", "Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
+        + ["Company Summary", "Revenue Composition", "Status", "Comments",
+           "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
+           "Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
            "Next Earnings Date", "Next Earnings Time",
-           "Last Earnings Date", "Last Earnings Time", "Last Earnings 1D Change"]
+           "Last Earnings Date", "Last Earnings Time", "Earns 1D Px%"]
     )
 
     # ── Build records ────────────────────────────────────────────────────────
@@ -2330,7 +2441,9 @@ def render_value_table(tickers: list[str], detail_map: dict,
             row    = rows_by_ticker.get(ticker, {})
             f_db   = fund_map.get(ticker, {})
             tc     = tm.get(ticker, {})
-            rec    = _build_value_record(ticker, detail, row, f_db, tc, earnings_map.get(ticker))
+            rm = returns_map or {}
+            rec    = _build_value_record(ticker, detail, row, f_db, tc,
+                                         earnings_map.get(ticker), rm.get(ticker))
         records.append({c: rec.get(c) for c in show_cols})
 
     if records:
@@ -2347,22 +2460,39 @@ def render_value_table(tickers: list[str], detail_map: dict,
         try:
             val_edited = st.data_editor(
                 df, column_config=col_cfg, column_order=ordered_cols,
-                use_container_width=True, hide_index=False,
+                width="stretch", hide_index=False,
                 key=f"val_editor_{tab_key}", row_height=80,
             )
         except TypeError:
             val_edited = st.data_editor(
                 df, column_config=col_cfg, column_order=ordered_cols,
-                use_container_width=True, hide_index=False,
+                width="stretch", hide_index=False,
                 key=f"val_editor_{tab_key}",
             )
-        if st.button("💾 Save Comments", key=f"save_val_comments_{tab_key}"):
+        if st.button("💾 Save", key=f"save_val_comments_{tab_key}"):
+            _user_note_map = {
+                "Company Summary":     "company_summary",
+                "Revenue Composition": "revenue_composition",
+                "technical +ve":       "tech_pos",
+                "fundamental +ve": "fund_pos",
+                "technical -ve":   "tech_neg",
+                "fundamental -ve": "fund_neg",
+            }
             for ticker, vrow in val_edited.iterrows():
                 new_comment = str(vrow.get("Comments") or "")
                 orig_comment = str(df.loc[ticker, "Comments"]) if ticker in df.index else ""
                 if new_comment != orig_comment:
                     save_comment_for_ticker(str(ticker), new_comment)
-            st.success("Comments saved.")
+                new_status = str(vrow.get("Status") or "")
+                orig_status = str(df.loc[ticker, "Status"]) if ticker in df.index else ""
+                if new_status != orig_status:
+                    save_status_for_ticker(str(ticker), new_status)
+                for disp_col, db_col in _user_note_map.items():
+                    new_val = str(vrow.get(disp_col) or "")
+                    orig_val = str(df.loc[ticker, disp_col]) if ticker in df.index else ""
+                    if new_val != orig_val:
+                        save_user_field_for_ticker(str(ticker), db_col, new_val)
+            st.success("Saved.")
             st.rerun()
     else:
         st.info("No data available.")
@@ -2459,7 +2589,7 @@ F6 P/B ≤ Peer Median
         height=80,
         label_visibility="collapsed",
     )
-    if st.button("Run AI Analysis", key="ai_sidebar_run", use_container_width=True):
+    if st.button("Run AI Analysis", key="ai_sidebar_run", width="stretch"):
         raw_ai = ai_sidebar_input.strip()
         if not raw_ai:
             st.error("Enter at least one ticker.")
@@ -2589,9 +2719,12 @@ with tab_history:
     _f_tickers_pre   = st.session_state.get("hist_f_tick", [])
     _f_dts_pre       = st.session_state.get("hist_f_dt", [])
     _only_latest_pre = st.session_state.get("hist_only_latest", True)   # default True
+    _show_sub_pre    = st.session_state.get("all_queries_show_sub", False)
     _f_sectors_pre   = st.session_state.get("hist_f_sector", [])
     _mc_lo_pre       = st.session_state.get("hist_mc_lo", None)
     _mc_hi_pre       = st.session_state.get("hist_mc_hi", None)
+    _cust_start_pre  = st.session_state.get("hist_cust_start", "").strip()
+    _cust_end_pre    = st.session_state.get("hist_cust_end", "").strip()
 
     # ── Fetch rows ────────────────────────────────────────────────────────────
     filt_rows = get_all_summaries(
@@ -2655,8 +2788,8 @@ with tab_history:
         f_industries_h = st.multiselect("Filter by Industry", options=avail_industries_h,
                                         key="hist_f_industry")
 
-    # ── Market cap filter ─────────────────────────────────────────────────────
-    mc1, mc2 = st.columns(2)
+    # ── Row 2: Mkt cap + custom period dates ──────────────────────────────────
+    mc1, mc2, cp1, cp2 = st.columns(4)
     with mc1:
         mc_lo_h = st.number_input("Mkt Cap min ($B)", value=None, min_value=0.0,
                                   placeholder="no min", key="hist_mc_lo",
@@ -2665,18 +2798,19 @@ with tab_history:
         mc_hi_h = st.number_input("Mkt Cap max ($B)", value=None, min_value=0.0,
                                   placeholder="no max", key="hist_mc_hi",
                                   format="%.2f", step=1.0)
+    with cp1:
+        _cust_start_val = st.text_input(
+            "Custom Period Start (YYYY-MM-DD)", value="",
+            placeholder="e.g. 2024-01-01", key="hist_cust_start",
+        ).strip()
+    with cp2:
+        _cust_end_val = st.text_input(
+            "Custom Period End (YYYY-MM-DD)", value="",
+            placeholder="e.g. 2024-12-31", key="hist_cust_end",
+        ).strip()
 
     # ── Indicator filter — always visible ─────────────────────────────────────
     hist_ind_filter, hist_col_filter = render_indicator_filter("history")
-
-    # ── Options below indicator filter ────────────────────────────────────────
-    oc1, oc2 = st.columns(2)
-    with oc1:
-        all_show_sub = st.checkbox("Show sub-indicators", value=False,
-                                   key="all_queries_show_sub")
-    with oc2:
-        only_latest = st.checkbox("Latest entry per ticker only", value=True,
-                                  key="hist_only_latest")
 
     # Apply remaining filters using current-run widget values
     if f_sectors_h:
@@ -2714,11 +2848,26 @@ with tab_history:
         ))
         filt_rows = [r for r in filt_rows if r["ticker"] in _hist_pass]
 
-    st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
-
     # ── Pre-build value records for all-column sort support ───────────────────
     _pre_rows_by_ticker = {r["ticker"]: r for r in filt_rows}
     _pre_earnings_map   = get_latest_earnings_for_tickers(list(_pre_rows_by_ticker)) if filt_rows else {}
+
+    # ── Price-history returns (spot + rolling avg) ────────────────────────────
+    _ph_tickers = list(_pre_rows_by_ticker.keys())
+    _ph_returns: dict[str, dict] = storage.compute_returns_for_tickers(_ph_tickers) if _ph_tickers else {}
+
+    # ── Custom period returns ─────────────────────────────────────────────────
+    from datetime import date as _date, timedelta as _td
+    _today_str = _date.today().isoformat()
+    # Default when blank: 22 trading days back (same reference as "1M Avg Px%")
+    _cust_s = _cust_start_pre or storage.get_nth_trading_day_back(_ph_tickers, 22) or (
+        _date.today() - _td(days=31)
+    ).isoformat()
+    _cust_e = _cust_end_pre or _today_str
+    _cust_returns = storage.get_custom_period_returns(_ph_tickers, _cust_s, _cust_e) if _ph_tickers else {}
+    for _t, _cr in _cust_returns.items():
+        _ph_returns.setdefault(_t, {}).update(_cr)
+
     _pre_val_records: dict[str, dict] = {
         t: _build_value_record(
             t,
@@ -2727,11 +2876,12 @@ with tab_history:
             hist_fund_map.get(t, {}),
             hist_tech_map.get(t, {}),
             _pre_earnings_map.get(t),
+            _ph_returns.get(t),
         )
         for t in _pre_rows_by_ticker
     }
 
-    all_df = build_summary_df(filt_rows, show_sub=all_show_sub,
+    all_df = build_summary_df(filt_rows, show_sub=_show_sub_pre,
                               include_datetime=True, si_map=si_map_hist,
                               ne_map=ne_map_hist, net_map=net_map_hist,
                               company_map=company_map_hist,
@@ -2759,8 +2909,8 @@ with tab_history:
         # Sort using pre-built records (covers all value-table columns)
         _sort_vals = pd.Series({t: _pre_val_records.get(t, {}).get(_sort_col)
                                  for t in all_df["Ticker"]})
-        # Treat "N/A" strings as missing so they always sort last regardless of direction
-        _sort_vals = _sort_vals.replace("N/A", None)
+        # Treat "N/A" and empty strings as missing so they always sort last regardless of direction
+        _sort_vals = _sort_vals.replace({"N/A": None, "": None})
         # Compute SQL RANK() (tied rows share same rank) before sorting
         _sort_rank = _sort_vals.rank(method="min", ascending=_sort_asc, na_option="bottom").astype(int)
         _sort_vals = _sort_vals.sort_values(ascending=_sort_asc, na_position="last")
@@ -2792,11 +2942,34 @@ with tab_history:
         _sort_col = st.session_state.get("sort_col_history", "Score")
         _sorted_tickers = []
 
-    # CSS: make Comments cells honour newline characters (\n → visual line break)
+    # ── Row 8: Show sub-indicators | Latest per ticker | Showing X rows ───────
+    row8c1, row8c2, row8c3 = st.columns(3)
+    with row8c1:
+        all_show_sub = st.checkbox("Show sub-indicators", value=False,
+                                   key="all_queries_show_sub")
+    with row8c2:
+        only_latest = st.checkbox("Latest entry per ticker only", value=True,
+                                  key="hist_only_latest")
+    with row8c3:
+        st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
+
+    # CSS: make user-note cells honour newline characters (\n → visual line break)
     st.markdown(
         """<style>
         .stDataEditor [col-id="Comments"] .ag-cell-value,
-        .stDataEditor [col-id="Comments"] .ag-group-value {
+        .stDataEditor [col-id="Comments"] .ag-group-value,
+        .stDataEditor [col-id="Company Summary"] .ag-cell-value,
+        .stDataEditor [col-id="Company Summary"] .ag-group-value,
+        .stDataEditor [col-id="Revenue Composition"] .ag-cell-value,
+        .stDataEditor [col-id="Revenue Composition"] .ag-group-value,
+        .stDataEditor [col-id="technical +ve"] .ag-cell-value,
+        .stDataEditor [col-id="technical +ve"] .ag-group-value,
+        .stDataEditor [col-id="fundamental +ve"] .ag-cell-value,
+        .stDataEditor [col-id="fundamental +ve"] .ag-group-value,
+        .stDataEditor [col-id="technical -ve"] .ag-cell-value,
+        .stDataEditor [col-id="technical -ve"] .ag-group-value,
+        .stDataEditor [col-id="fundamental -ve"] .ag-cell-value,
+        .stDataEditor [col-id="fundamental -ve"] .ag-group-value {
             white-space: pre-wrap !important;
         }
         </style>""",
@@ -2811,7 +2984,7 @@ with tab_history:
         width="stretch", hide_index=False,
         key="all_sum_editor",
     )
-    if st.button("💾 Save Edits", key="save_all"):
+    if st.button("💾 Save", key="save_all"):
         save_edits(filt_rows, all_edited, include_datetime=True)
         st.success("Saved.")
         st.rerun()
@@ -2844,7 +3017,8 @@ with tab_history:
                        sort_col=_sort_col,
                        pre_built_records=_pre_val_records,
                        pre_built_earnings=_pre_earnings_map,
-                       rank_map=dict(_sort_rank) if not _sort_rank.empty else None)
+                       rank_map=dict(_sort_rank) if not _sort_rank.empty else None,
+                       returns_map=_ph_returns)
 
     st.markdown("---")
 

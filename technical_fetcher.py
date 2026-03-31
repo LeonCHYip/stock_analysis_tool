@@ -35,6 +35,18 @@ _BATCH_SIZE = 100   # yf.download tickers per call
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _extract_price_rows(df: pd.DataFrame) -> list[tuple]:
+    """Extract (date_str, close, volume) tuples from an OHLCV DataFrame."""
+    sub = df[["Close", "Volume"]].dropna(subset=["Close"])
+    rows = []
+    for idx, row in sub.iterrows():
+        d = idx.date().isoformat() if hasattr(idx, "date") else str(idx)[:10]
+        c = _safe(row["Close"], 4)
+        v = _safe_int(row["Volume"])
+        if c is not None:
+            rows.append((d, c, v))
+    return rows
+
 def _safe(v, ndigits=2):
     try:
         f = float(v)
@@ -579,6 +591,7 @@ def fetch_and_store_bulk(tickers: list[str],
 
                 as_of = fields.pop("_as_of_date", today_str)
                 storage.save_tech_indicators(ticker, as_of, fields, is_final)
+                storage.save_price_history(ticker, _extract_price_rows(df))
 
                 # Convert flat fields dict → legacy nested dict for indicators.py
                 fields["_as_of_date"] = as_of  # restore for conversion
@@ -677,6 +690,7 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
                     continue
                 as_of = fields.pop("_as_of_date", today_str)
                 storage.save_tech_indicators(ticker, as_of, fields, is_final)
+                storage.save_price_history(ticker, _extract_price_rows(df))
                 # Mark old unfinalized rows as finalized (they've been replaced)
                 storage.mark_tech_finalized(ticker, as_of)
             except Exception as e:

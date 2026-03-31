@@ -18,7 +18,6 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import requests
-import yfinance as yf
 from bs4 import BeautifulSoup
 
 import storage
@@ -213,13 +212,31 @@ def get_missing_dates(lookback_days: int = 30,
     return all_dates
 
 
+def _pct_chg(new_val, old_val) -> float | None:
+    """Return (new-old)/old*100 rounded to 4dp, or None if inputs invalid."""
+    try:
+        if new_val is None or old_val is None or old_val == 0:
+            return None
+        return round((new_val - old_val) / old_val * 100, 4)
+    except Exception:
+        return None
+
+
+def _avg(values: list) -> float | None:
+    vals = [v for v in values if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
 def _compute_1d_changes(date_str: str, earnings_dict: dict) -> None:
-    """Fetch Yahoo Finance prices and compute actual 1-day post-earnings change %.
+    """Compute earnings return metrics from price_history (no external API calls).
 
-    BMO: change% = (close_on_earnings_date - close_prior_day) / close_prior_day * 100
-    AMC: change% = (close_next_trading_day - close_earnings_date) / close_earnings_date * 100
+    Updates:
+      - earnings_history.one_day_change  (existing)
+      - earns_1d_vol_pct, earns_5d_px_pct, earns_5d_vol_pct,
+        earns_5d_roll_px_pct, earns_5d_roll_vol_pct  (new)
 
-    Updates earnings_history.one_day_change in-place for each ticker where data exists.
+    BMO windows: pre = [-5..-1], post = [0..4]
+    AMC windows: pre = [-4..0],  post = [1..5]
     """
     if not earnings_dict:
         return
@@ -227,84 +244,86 @@ def _compute_1d_changes(date_str: str, earnings_dict: dict) -> None:
     tickers = list(earnings_dict.keys())
     d = date.fromisoformat(date_str)
 
-    # Get a window of trading days to find prev/next day
-    window_start = d - timedelta(days=7)
-    window_end   = d + timedelta(days=7)
-    try:
-        trading_days = _get_trading_days(window_start, window_end)
-    except Exception:
-        # fallback: weekdays
-        trading_days = [
-            (window_start + timedelta(days=i)).isoformat()
-            for i in range((window_end - window_start).days + 1)
-            if (window_start + timedelta(days=i)).weekday() < 5
-        ]
-
-    prev_day = next_day = None
-    for i, td in enumerate(trading_days):
-        if td == date_str:
-            if i > 0:
-                prev_day = trading_days[i - 1]
-            if i + 1 < len(trading_days):
-                next_day = trading_days[i + 1]
-            break
-
-    # Determine the date range we need price data for
-    fetch_start = prev_day or date_str
-    fetch_end_dt = date.fromisoformat(next_day) if next_day else d
-    fetch_end_str = (fetch_end_dt + timedelta(days=1)).isoformat()  # yf end is exclusive
-
-    print(f"  [1D change] Fetching prices {fetch_start}→{fetch_end_dt} for {len(tickers)} tickers…", flush=True)
-    try:
-        raw = yf.download(
-            tickers if len(tickers) > 1 else tickers[0],
-            start=fetch_start,
-            end=fetch_end_str,
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        if raw.empty:
-            print("  [1D change] No price data returned — skipping")
-            return
-        closes = raw["Close"] if "Close" in raw.columns else raw
-    except Exception as e:
-        print(f"  [1D change] Price fetch error: {e}")
-        return
-
-    # Normalise to a DataFrame with ticker columns
-    if hasattr(closes, "columns"):
-        close_df = closes
-    else:
-        # Single-ticker Series → single-column DataFrame
-        close_df = closes.to_frame(name=tickers[0])
-
-    # Build date→close lookup per ticker
-    close_df.index = close_df.index.strftime("%Y-%m-%d")
+    # Query price_history — ±14 calendar days gives enough trading days on both sides
+    window_start = (d - timedelta(days=14)).isoformat()
+    window_end   = (d + timedelta(days=14)).isoformat()
+    price_data = storage.get_price_history_range(tickers, window_start, window_end)
 
     updated = 0
     for ticker, rec in earnings_dict.items():
         etime = rec.get("earnings_time", "BMO")
+        earn_date = rec.get("earnings_date", date_str)
         try:
-            if ticker not in close_df.columns:
+            ticker_data = price_data.get(ticker, {})
+            if not ticker_data:
                 continue
-            series = close_df[ticker].dropna()
-            closes_map = series.to_dict()  # {date_str: price}
+
+            # Per-ticker sorted trading days from price_history
+            trading_days = sorted(ticker_data.keys())
+            if date_str not in trading_days:
+                continue
+            earnings_idx = trading_days.index(date_str)
+
+            c_map = {d: ticker_data[d]["close"]  for d in trading_days if ticker_data[d]["close"]  is not None}
+            v_map = {d: ticker_data[d]["volume"] for d in trading_days if ticker_data[d]["volume"] is not None}
+            prev_day = trading_days[earnings_idx - 1] if earnings_idx > 0 else None
 
             if etime == "BMO":
-                if prev_day and date_str in closes_map and prev_day in closes_map:
-                    chg = (closes_map[date_str] - closes_map[prev_day]) / closes_map[prev_day] * 100
-                    storage.update_earnings_1d_change(ticker, rec.get("earnings_date", date_str), round(chg, 4))
+                # ── 1D change ────────────────────────────────────────────────
+                if prev_day and date_str in c_map and prev_day in c_map:
+                    storage.update_earnings_1d_change(
+                        ticker, earn_date,
+                        round((c_map[date_str] - c_map[prev_day]) / c_map[prev_day] * 100, 4),
+                    )
                     updated += 1
+
+                # ── Extended metrics ─────────────────────────────────────────
+                ext = {}
+                if v_map and prev_day and date_str in v_map and prev_day in v_map:
+                    ext["earns_1d_vol_pct"] = _pct_chg(v_map[date_str], v_map[prev_day])
+                if earnings_idx + 4 < len(trading_days):
+                    d4 = trading_days[earnings_idx + 4]
+                    ext["earns_5d_px_pct"]  = _pct_chg(c_map.get(d4), c_map.get(date_str))
+                    ext["earns_5d_vol_pct"] = _pct_chg(v_map.get(d4), v_map.get(prev_day)) if v_map and prev_day else None
+                pre_days  = [trading_days[i] for i in range(earnings_idx - 5, earnings_idx)      if 0 <= i < len(trading_days)]
+                post_days = [trading_days[i] for i in range(earnings_idx,     earnings_idx + 5)  if 0 <= i < len(trading_days)]
+                ext["earns_5d_roll_px_pct"]  = _pct_chg(_avg([c_map.get(d) for d in post_days]), _avg([c_map.get(d) for d in pre_days]))
+                if v_map:
+                    ext["earns_5d_roll_vol_pct"] = _pct_chg(_avg([v_map.get(d) for d in post_days]), _avg([v_map.get(d) for d in pre_days]))
+                if ext:
+                    storage.update_earnings_extended(ticker, earn_date, ext)
+
             else:  # AMC
-                if next_day and next_day in closes_map and date_str in closes_map:
-                    chg = (closes_map[next_day] - closes_map[date_str]) / closes_map[date_str] * 100
-                    storage.update_earnings_1d_change(ticker, rec.get("earnings_date", date_str), round(chg, 4))
+                next_day = trading_days[earnings_idx + 1] if earnings_idx + 1 < len(trading_days) else None
+
+                # ── 1D change ────────────────────────────────────────────────
+                if next_day and next_day in c_map and date_str in c_map:
+                    storage.update_earnings_1d_change(
+                        ticker, earn_date,
+                        round((c_map[next_day] - c_map[date_str]) / c_map[date_str] * 100, 4),
+                    )
                     updated += 1
+
+                # ── Extended metrics ─────────────────────────────────────────
+                ext = {}
+                if v_map and prev_day and next_day and next_day in v_map and prev_day in v_map:
+                    ext["earns_1d_vol_pct"] = _pct_chg(v_map[next_day], v_map[prev_day])
+                if earnings_idx + 5 < len(trading_days):
+                    d5 = trading_days[earnings_idx + 5]
+                    ext["earns_5d_px_pct"]  = _pct_chg(c_map.get(d5), c_map.get(date_str))
+                    ext["earns_5d_vol_pct"] = _pct_chg(v_map.get(d5), v_map.get(prev_day)) if v_map and prev_day else None
+                pre_days  = [trading_days[i] for i in range(earnings_idx - 4, earnings_idx + 1) if 0 <= i < len(trading_days)]
+                post_days = [trading_days[i] for i in range(earnings_idx + 1, earnings_idx + 6) if 0 <= i < len(trading_days)]
+                ext["earns_5d_roll_px_pct"]  = _pct_chg(_avg([c_map.get(d) for d in post_days]), _avg([c_map.get(d) for d in pre_days]))
+                if v_map:
+                    ext["earns_5d_roll_vol_pct"] = _pct_chg(_avg([v_map.get(d) for d in post_days]), _avg([v_map.get(d) for d in pre_days]))
+                if ext:
+                    storage.update_earnings_extended(ticker, earn_date, ext)
+
         except Exception:
             pass  # silently skip individual ticker failures
 
-    print(f"  [1D change] Updated {updated}/{len(tickers)} tickers")
+    print(f"  [earnings ext] {date_str}: updated {updated}/{len(tickers)} tickers from price_history")
 
 
 def store_earnings_batch(date_str: str, earnings_dict: dict) -> int:
@@ -353,21 +372,30 @@ def backfill_from_json(json_path: str) -> int:
     return stored
 
 
-def compute_missing_1d_changes() -> int:
-    """Compute Yahoo 1D price changes for earnings records already in DB but missing change %.
+def compute_missing_1d_changes(extended_lookback_days: int = 10) -> int:
+    """Compute Yahoo 1D price changes for recent earnings records missing change % or extended columns.
 
-    Called for dates that are in earnings_fetch_log (Finviz data exists) but still have
-    null one_day_change — e.g., backfilled records or AMC earnings where next-day price
-    wasn't available at fetch time.
-    Returns number of tickers updated.
+    Daily check: covers the last `extended_lookback_days` calendar days (~7 trading days),
+    which is enough to catch AMC next-day prices and 5D post-earnings data settling.
+
+    For a one-time historical backfill of older records use backfill_extended_columns().
+    Returns number of tickers processed.
     """
-    fetched   = storage.get_fetched_earnings_dates()
-    null_dates = storage.get_earnings_dates_with_null_change()
-    # Only process dates where we already have Finviz earnings data in DB
-    dates = [d for d in null_dates if d in fetched]
+    fetched = storage.get_fetched_earnings_dates()
+
+    # Dates missing one_day_change — only recent (same window)
+    recent_cutoff = (date.today() - timedelta(days=extended_lookback_days)).isoformat()
+    null_change_dates = set(storage.get_earnings_dates_with_null_change(min_date=recent_cutoff))
+
+    # Dates missing extended columns — same recent window
+    null_ext_dates = set(storage.get_earnings_dates_with_null_extended(min_date=recent_cutoff))
+
+    # Union: process any date that needs work AND has Finviz data
+    dates = sorted((null_change_dates | null_ext_dates) & fetched)
     if not dates:
         return 0
-    print(f"[earnings] Computing Yahoo 1D change for {len(dates)} already-fetched date(s)…")
+
+    print(f"[earnings] Computing 1D/extended changes for {len(dates)} date(s)…")
     total = 0
     for date_str in dates:
         try:
@@ -377,6 +405,34 @@ def compute_missing_1d_changes() -> int:
                 total += len(records)
         except Exception as e:
             print(f"  [1D change] Failed for {date_str}: {e}")
+    return total
+
+
+def backfill_extended_columns() -> int:
+    """One-time backfill: compute extended earnings columns for ALL historical records.
+
+    Uses price_history (no external API calls). Covers all earnings records with valid
+    earnings_date/time where any extended column is NULL — no date cutoff.
+    Returns number of tickers processed.
+    """
+    # Get all earnings records with null extended columns, grouped by date
+    by_date = storage.get_all_earnings_with_null_extended()
+    if not by_date:
+        print("[earnings backfill] Nothing to backfill.")
+        return 0
+
+    dates = sorted(by_date.keys())
+    print(f"[earnings backfill] Backfilling {len(dates)} date(s) from price_history…")
+    total = 0
+    for date_str in dates:
+        try:
+            # Convert list of row dicts to {ticker: rec} format expected by _compute_1d_changes
+            records = {r["ticker"]: r for r in by_date[date_str]}
+            _compute_1d_changes(date_str, records)
+            total += len(records)
+        except Exception as e:
+            print(f"  [backfill] Failed for {date_str}: {e}")
+    print(f"[earnings backfill] Done: {total} tickers processed.")
     return total
 
 
@@ -421,6 +477,8 @@ if __name__ == "__main__":
                         help="Run daily fetch with gap-filling")
     parser.add_argument("--lookback", type=int, default=30,
                         help="Days to look back for gaps (default: 30)")
+    parser.add_argument("--backfill-extended", action="store_true",
+                        help="One-time backfill of extended earnings columns for all historical records")
     args = parser.parse_args()
 
     init_db()
@@ -429,6 +487,9 @@ if __name__ == "__main__":
         for path in args.backfill:
             n = backfill_from_json(path)
             print(f"Backfilled {n} records from {path}")
+
+    if args.backfill_extended:
+        backfill_extended_columns()
 
     if args.daily:
         run_daily_fetch(args.lookback)

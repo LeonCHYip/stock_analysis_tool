@@ -63,7 +63,10 @@ SUB_KEY_MAP: dict[str, str] = {
 }
 
 ALL_SUB_COLS = [c for cols in SUB_COLS.values() for c in cols]
-SUMMARY_COLS = MAIN_IND_COLS + ALL_SUB_COLS + ["market_cap", "comments"]
+SUMMARY_COLS = MAIN_IND_COLS + ALL_SUB_COLS + [
+    "market_cap", "comments", "status",
+    "company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg",
+]
 
 
 # ── DDL ───────────────────────────────────────────────────────────────────────
@@ -251,7 +254,14 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     F3_sub_q_rev_yoy TEXT, F3_sub_q_eps_yoy TEXT,
     F4_sub_a_rev_yoy TEXT, F4_sub_a_eps_yoy TEXT,
     market_cap DOUBLE,
-    comments   TEXT,
+    comments         TEXT,
+    status           TEXT DEFAULT '',
+    company_summary      TEXT,
+    revenue_composition  TEXT,
+    tech_pos             TEXT,
+    fund_pos         TEXT,
+    tech_neg         TEXT,
+    fund_neg         TEXT,
     PRIMARY KEY (run_dt, ticker)
 );
 """
@@ -320,6 +330,16 @@ CREATE TABLE IF NOT EXISTS earnings_fetch_log (
 );
 """
 
+_DDL_PRICE_HISTORY = """
+CREATE TABLE IF NOT EXISTS price_history (
+    ticker  TEXT   NOT NULL,
+    date    DATE   NOT NULL,
+    close   DOUBLE,
+    volume  BIGINT,
+    PRIMARY KEY (ticker, date)
+);
+"""
+
 _init_lock = threading.Lock()
 _db_lock   = threading.RLock()    # serialises ALL DB operations (reads + writes)
 _global_conn: duckdb.DuckDBPyConnection | None = None
@@ -370,6 +390,7 @@ def init_db() -> None:
     con.execute(_DDL_AI_REPORTS)
     con.execute(_DDL_EARNINGS)
     con.execute(_DDL_EARNINGS_LOG)
+    con.execute(_DDL_PRICE_HISTORY)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
 
@@ -387,6 +408,16 @@ def _migrate_add_columns(con) -> None:
             con.execute(f"ALTER TABLE tech_indicators ADD COLUMN {col} {dtype}")
 
     _migrate_earnings_surprise_to_double(con)
+
+    # Add status column to analysis_runs if missing
+    runs_cols = {row[0] for row in con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'analysis_runs'"
+    ).fetchall()}
+    if "status" not in runs_cols:
+        con.execute("ALTER TABLE analysis_runs ADD COLUMN status TEXT DEFAULT ''")
+    for _col in ("company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg"):
+        if _col not in runs_cols:
+            con.execute(f"ALTER TABLE analysis_runs ADD COLUMN {_col} TEXT")
 
     # Add status column to ai_reports if missing
     ai_cols = {row[0] for row in con.execute(
@@ -423,6 +454,21 @@ def _migrate_add_columns(con) -> None:
     for col, dtype in new_fund_cols:
         if col not in existing_fund:
             con.execute(f"ALTER TABLE fundamentals ADD COLUMN {col} {dtype}")
+
+    # Add 5 new earnings extended columns
+    new_earn_cols = [
+        ("earns_1d_vol_pct",      "DOUBLE"),
+        ("earns_5d_px_pct",       "DOUBLE"),
+        ("earns_5d_vol_pct",      "DOUBLE"),
+        ("earns_5d_roll_px_pct",  "DOUBLE"),
+        ("earns_5d_roll_vol_pct", "DOUBLE"),
+    ]
+    existing_earn = {row[0] for row in con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'earnings_history'"
+    ).fetchall()}
+    for col, dtype in new_earn_cols:
+        if col not in existing_earn:
+            con.execute(f"ALTER TABLE earnings_history ADD COLUMN {col} {dtype}")
 
 
 def _migrate_earnings_surprise_to_double(con) -> None:
@@ -715,6 +761,27 @@ def save_comment_for_ticker(ticker: str, comment: str) -> None:
     )
 
 
+def save_status_for_ticker(ticker: str, status: str) -> None:
+    """Update status for ALL analysis_runs rows of this ticker."""
+    con = _conn()
+    con.execute(
+        "UPDATE analysis_runs SET status = ? WHERE ticker = ?",
+        [status, ticker],
+    )
+
+
+def save_user_field_for_ticker(ticker: str, column: str, value: str) -> None:
+    """Update a user-editable note field for ALL analysis_runs rows of this ticker."""
+    _allowed = {"company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg"}
+    if column not in _allowed:
+        return
+    con = _conn()
+    con.execute(
+        f"UPDATE analysis_runs SET {column} = ? WHERE ticker = ?",
+        [value, ticker],
+    )
+
+
 def save_results(ticker: str, indicators: dict, analysis_dt: str,
                  market_cap: float | None = None) -> None:
     """Persist indicator results to analysis_runs + analysis_details."""
@@ -726,13 +793,21 @@ def save_results(ticker: str, indicators: dict, analysis_dt: str,
         row_vals.append(_sub_val(indicators, parent, sub_col))
     row_vals.append(market_cap)
 
-    # Carry forward the most recent comment for this ticker (if any)
+    # Carry forward the most recent comment and status for this ticker (if any)
     con = _conn()
     prev = con.execute(
-        "SELECT comments FROM analysis_runs WHERE ticker = ? ORDER BY run_dt DESC LIMIT 1",
+        "SELECT comments, status, company_summary, revenue_composition, tech_pos, fund_pos, tech_neg, fund_neg "
+        "FROM analysis_runs WHERE ticker = ? ORDER BY run_dt DESC LIMIT 1",
         [ticker],
     ).fetchone()
-    row_vals.append(prev[0] if prev and prev[0] else None)
+    row_vals.append(prev[0] if prev and prev[0] else None)  # comments
+    row_vals.append(prev[1] if prev and prev[1] else "")    # status
+    row_vals.append(prev[2] if prev and prev[2] else None)  # company_summary
+    row_vals.append(prev[3] if prev and prev[3] else None)  # revenue_composition
+    row_vals.append(prev[4] if prev and prev[4] else None)  # tech_pos
+    row_vals.append(prev[5] if prev and prev[5] else None)  # fund_pos
+    row_vals.append(prev[6] if prev and prev[6] else None)  # tech_neg
+    row_vals.append(prev[7] if prev and prev[7] else None)  # fund_neg
 
     col_names = "run_dt, ticker, " + ", ".join(SUMMARY_COLS)
     placeholders = ", ".join(["?" for _ in row_vals])
@@ -749,7 +824,10 @@ def save_results(ticker: str, indicators: dict, analysis_dt: str,
 
 
 def update_field(analysis_dt: str, ticker: str, column: str, value: str) -> bool:
-    allowed = set(MAIN_IND_COLS + ALL_SUB_COLS + ["comments"])
+    allowed = set(MAIN_IND_COLS + ALL_SUB_COLS + [
+        "comments", "status",
+        "company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg",
+    ])
     if column not in allowed:
         return False
     con = _conn()
@@ -1059,6 +1137,32 @@ def get_latest_earnings_date() -> str | None:
     return str(row[0]) if row and row[0] else None
 
 
+def get_earnings_dates_with_null_extended(min_date: str | None = None) -> list[str]:
+    """Distinct earnings_dates where at least one ticker has any extended column NULL.
+
+    Only returns dates >= min_date (if given).
+    """
+    con = _conn()
+    null_cond = (
+        "earns_1d_vol_pct IS NULL OR earns_5d_px_pct IS NULL OR "
+        "earns_5d_vol_pct IS NULL OR earns_5d_roll_px_pct IS NULL OR "
+        "earns_5d_roll_vol_pct IS NULL"
+    )
+    if min_date:
+        rows = con.execute(
+            f"SELECT DISTINCT earnings_date FROM earnings_history "
+            f"WHERE ({null_cond}) AND earnings_date >= ? "
+            f"ORDER BY earnings_date",
+            [min_date],
+        ).fetchall()
+    else:
+        rows = con.execute(
+            f"SELECT DISTINCT earnings_date FROM earnings_history "
+            f"WHERE ({null_cond}) ORDER BY earnings_date"
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
 def get_earnings_dates_with_null_change(min_date: str | None = None) -> list[str]:
     """Distinct earnings_dates where at least one ticker has one_day_change IS NULL.
 
@@ -1091,6 +1195,62 @@ def update_earnings_1d_change(ticker: str, earnings_date: str, change: float) ->
     )
 
 
+def get_price_history_range(tickers: list[str], start_date: str, end_date: str) -> dict:
+    """Return {ticker: {date_str: {"close": float, "volume": int}}} from price_history.
+
+    Used by earnings_fetcher to compute extended metrics without external API calls.
+    """
+    if not tickers:
+        return {}
+    con = _conn()
+    placeholders = ",".join("?" * len(tickers))
+    rows = con.execute(
+        f"SELECT ticker, date::TEXT, close, volume FROM price_history "
+        f"WHERE ticker IN ({placeholders}) AND date >= ? AND date <= ? "
+        f"ORDER BY ticker, date",
+        tickers + [start_date, end_date],
+    ).fetchall()
+    result: dict = {}
+    for ticker, date_str, close, volume in rows:
+        if ticker not in result:
+            result[ticker] = {}
+        result[ticker][date_str] = {"close": close, "volume": volume}
+    return result
+
+
+def get_all_earnings_with_null_extended() -> dict[str, list[dict]]:
+    """Return {earnings_date: [row_dict, ...]} for ALL earnings_history records
+    where any extended column is NULL and earnings_date/earnings_time are set.
+
+    Used by backfill_extended_columns — no date limit.
+    """
+    con = _conn()
+    null_cond = (
+        "earns_1d_vol_pct IS NULL OR earns_5d_px_pct IS NULL OR "
+        "earns_5d_vol_pct IS NULL OR earns_5d_roll_px_pct IS NULL OR "
+        "earns_5d_roll_vol_pct IS NULL"
+    )
+    rows = con.execute(
+        f"SELECT ticker, earnings_date::TEXT, earnings_time, eps_est, eps_act, eps_sur, "
+        f"eps_gaap_est, eps_gaap_act, eps_gaap_sur, rev_est_m, rev_act_m, rev_sur, "
+        f"one_day_change, earns_1d_vol_pct, earns_5d_px_pct, earns_5d_vol_pct, "
+        f"earns_5d_roll_px_pct, earns_5d_roll_vol_pct, fetch_date "
+        f"FROM earnings_history "
+        f"WHERE ({null_cond}) AND earnings_date IS NOT NULL AND earnings_time IS NOT NULL "
+        f"ORDER BY earnings_date"
+    ).fetchall()
+    cols = ["ticker","earnings_date","earnings_time","eps_est","eps_act","eps_sur",
+            "eps_gaap_est","eps_gaap_act","eps_gaap_sur","rev_est_m","rev_act_m","rev_sur",
+            "one_day_change","earns_1d_vol_pct","earns_5d_px_pct","earns_5d_vol_pct",
+            "earns_5d_roll_px_pct","earns_5d_roll_vol_pct","fetch_date"]
+    by_date: dict = {}
+    for row in rows:
+        rec = dict(zip(cols, row))
+        d = rec["earnings_date"]
+        by_date.setdefault(d, []).append(rec)
+    return by_date
+
+
 def get_earnings_for_date(earnings_date: str) -> dict[str, dict]:
     """Return {ticker: row_dict} for all tickers with the given earnings_date."""
     con = _conn()
@@ -1105,3 +1265,367 @@ def get_earnings_for_date(earnings_date: str) -> dict[str, dict]:
         "WHERE table_name = 'earnings_history' ORDER BY ordinal_position"
     ).fetchall()]
     return {dict(zip(cols, r))["ticker"]: dict(zip(cols, r)) for r in rows}
+
+
+# ── Price history ──────────────────────────────────────────────────────────────
+
+def save_price_history(ticker: str, rows: list[tuple]) -> None:
+    """Upsert price history rows for a ticker.
+
+    Args:
+        ticker: ticker symbol
+        rows: list of (date_str, close, volume) tuples, date_str as 'YYYY-MM-DD'
+    """
+    if not rows:
+        return
+    con = _conn()
+    con.executemany(
+        "INSERT OR REPLACE INTO price_history (ticker, date, close, volume) VALUES (?, ?, ?, ?)",
+        [(ticker, r[0], r[1], r[2]) for r in rows],
+    )
+
+
+def _pct(new_val, old_val) -> float | None:
+    """Return percentage change from old_val to new_val, or None if either is missing."""
+    if new_val is None or old_val is None or old_val == 0:
+        return None
+    return (new_val - old_val) / old_val * 100.0
+
+
+def compute_returns_for_tickers(tickers: list[str]) -> dict[str, dict]:
+    """Compute spot and rolling-average returns for each ticker from price_history.
+
+    Returns {ticker: {col_name: float_or_None}} where col_names are the display
+    column names used in VALUE_COL_GROUPS.
+
+    Daily spot (single-day vs single-day):
+        "5D Px%", "5D Vol%", "1M Px%", "1M Vol%", "3M Px%", "3M Vol%",
+        "6M Px%", "6M Vol%", "12M Px%", "12M Vol%", "2Y Px%", "2Y Vol%",
+        "3Y Px%", "3Y Vol%"
+
+    Daily rolling avg (5-day avg vs 5-day avg):
+        "1M Avg Px%", "1M Avg Vol%", "3M Avg Px%", "3M Avg Vol%",
+        "6M Avg Px%", "6M Avg Vol%", "12M Avg Px%", "12M Avg Vol%",
+        "2Y Avg Px%", "2Y Avg Vol%", "3Y Avg Px%", "3Y Avg Vol%"
+
+    Weekly rolling avg (4-week avg vs 4-week avg):
+        "1M Wkly Avg Px%", "1M Wkly Avg Vol%", "3M Wkly Avg Px%", "3M Wkly Avg Vol%",
+        "6M Wkly Avg Px%", "6M Wkly Avg Vol%", "12M Wkly Avg Px%", "12M Wkly Avg Vol%",
+        "2Y Wkly Avg Px%", "2Y Wkly Avg Vol%", "3Y Wkly Avg Px%", "3Y Wkly Avg Vol%"
+    """
+    if not tickers:
+        return {}
+
+    placeholders = ", ".join(["?" for _ in tickers])
+
+    # ── Daily: spot + 5-day rolling avg ───────────────────────────────────────
+    daily_sql = f"""
+    WITH daily AS (
+        SELECT ticker, date, close, volume,
+            AVG(close) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            ) AS close_5d_avg,
+            AVG(volume) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            ) AS vol_5d_avg,
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn_desc,
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date ASC)  AS rn_asc
+        FROM price_history
+        WHERE ticker IN ({placeholders})
+    )
+    SELECT ticker,
+        MAX(CASE WHEN rn_desc = 1   THEN close        END) AS c_now,
+        MAX(CASE WHEN rn_desc = 1   THEN volume       END) AS v_now,
+        MAX(CASE WHEN rn_desc = 1   THEN close_5d_avg END) AS c5a_now,
+        MAX(CASE WHEN rn_desc = 1   THEN vol_5d_avg   END) AS v5a_now,
+        MAX(CASE WHEN rn_desc = 6   THEN close        END) AS c_5d,
+        MAX(CASE WHEN rn_desc = 6   THEN volume       END) AS v_5d,
+        MAX(CASE WHEN rn_desc = 22  THEN close        END) AS c_1m,
+        MAX(CASE WHEN rn_desc = 22  THEN volume       END) AS v_1m,
+        MAX(CASE WHEN rn_desc = 22  THEN close_5d_avg END) AS c5a_1m,
+        MAX(CASE WHEN rn_desc = 22  THEN vol_5d_avg   END) AS v5a_1m,
+        MAX(CASE WHEN rn_desc = 64  THEN close        END) AS c_3m,
+        MAX(CASE WHEN rn_desc = 64  THEN volume       END) AS v_3m,
+        MAX(CASE WHEN rn_desc = 64  THEN close_5d_avg END) AS c5a_3m,
+        MAX(CASE WHEN rn_desc = 64  THEN vol_5d_avg   END) AS v5a_3m,
+        MAX(CASE WHEN rn_desc = 127 THEN close        END) AS c_6m,
+        MAX(CASE WHEN rn_desc = 127 THEN volume       END) AS v_6m,
+        MAX(CASE WHEN rn_desc = 127 THEN close_5d_avg END) AS c5a_6m,
+        MAX(CASE WHEN rn_desc = 127 THEN vol_5d_avg   END) AS v5a_6m,
+        MAX(CASE WHEN rn_desc = 253 THEN close        END) AS c_12m,
+        MAX(CASE WHEN rn_desc = 253 THEN volume       END) AS v_12m,
+        MAX(CASE WHEN rn_desc = 253 THEN close_5d_avg END) AS c5a_12m,
+        MAX(CASE WHEN rn_desc = 253 THEN vol_5d_avg   END) AS v5a_12m,
+        MAX(CASE WHEN rn_desc = 505 THEN close        END) AS c_2y,
+        MAX(CASE WHEN rn_desc = 505 THEN volume       END) AS v_2y,
+        MAX(CASE WHEN rn_desc = 505 THEN close_5d_avg END) AS c5a_2y,
+        MAX(CASE WHEN rn_desc = 505 THEN vol_5d_avg   END) AS v5a_2y,
+        MAX(CASE WHEN rn_asc  = 1   THEN close        END) AS c_3y,
+        MAX(CASE WHEN rn_asc  = 1   THEN volume       END) AS v_3y,
+        MAX(CASE WHEN rn_asc  = 5   THEN close_5d_avg END) AS c5a_3y,
+        MAX(CASE WHEN rn_asc  = 5   THEN vol_5d_avg   END) AS v5a_3y
+    FROM daily
+    GROUP BY ticker
+    """
+
+    # ── Weekly: 4-week rolling avg ─────────────────────────────────────────────
+    weekly_sql = f"""
+    WITH last_of_week AS (
+        SELECT ticker,
+            DATE_TRUNC('week', date) AS week_start,
+            ARG_MAX(close, date)     AS close_w,
+            ARG_MAX(volume, date)    AS vol_w
+        FROM price_history
+        WHERE ticker IN ({placeholders})
+        GROUP BY ticker, DATE_TRUNC('week', date)
+    ),
+    weekly AS (
+        SELECT ticker, week_start, close_w, vol_w,
+            AVG(close_w) OVER (
+                PARTITION BY ticker ORDER BY week_start
+                ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+            ) AS close_4w_avg,
+            AVG(vol_w) OVER (
+                PARTITION BY ticker ORDER BY week_start
+                ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
+            ) AS vol_4w_avg,
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY week_start DESC) AS wn_desc,
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY week_start ASC)  AS wn_asc
+        FROM last_of_week
+    )
+    SELECT ticker,
+        MAX(CASE WHEN wn_desc = 1  THEN close_4w_avg END) AS wc4a_now,
+        MAX(CASE WHEN wn_desc = 1  THEN vol_4w_avg   END) AS wv4a_now,
+        MAX(CASE WHEN wn_desc = 5  THEN close_4w_avg END) AS wc4a_1m,
+        MAX(CASE WHEN wn_desc = 5  THEN vol_4w_avg   END) AS wv4a_1m,
+        MAX(CASE WHEN wn_desc = 13 THEN close_4w_avg END) AS wc4a_3m,
+        MAX(CASE WHEN wn_desc = 13 THEN vol_4w_avg   END) AS wv4a_3m,
+        MAX(CASE WHEN wn_desc = 26 THEN close_4w_avg END) AS wc4a_6m,
+        MAX(CASE WHEN wn_desc = 26 THEN vol_4w_avg   END) AS wv4a_6m,
+        MAX(CASE WHEN wn_desc = 52 THEN close_4w_avg END) AS wc4a_12m,
+        MAX(CASE WHEN wn_desc = 52 THEN vol_4w_avg   END) AS wv4a_12m,
+        MAX(CASE WHEN wn_desc = 105 THEN close_4w_avg END) AS wc4a_2y,
+        MAX(CASE WHEN wn_desc = 105 THEN vol_4w_avg   END) AS wv4a_2y,
+        MAX(CASE WHEN wn_asc  = 4  THEN close_4w_avg END) AS wc4a_3y,
+        MAX(CASE WHEN wn_asc  = 4  THEN vol_4w_avg   END) AS wv4a_3y
+    FROM weekly
+    GROUP BY ticker
+    """
+
+    con = _conn()
+    daily_rows = con.execute(daily_sql, tickers).fetchall()
+    weekly_rows = con.execute(weekly_sql, tickers).fetchall()
+
+    # Index weekly by ticker
+    weekly_map: dict[str, tuple] = {r[0]: r for r in weekly_rows}
+
+    result: dict[str, dict] = {}
+    for r in daily_rows:
+        t = r[0]
+        (c_now, v_now, c5a_now, v5a_now,
+         c_5d, v_5d,
+         c_1m, v_1m, c5a_1m, v5a_1m,
+         c_3m, v_3m, c5a_3m, v5a_3m,
+         c_6m, v_6m, c5a_6m, v5a_6m,
+         c_12m, v_12m, c5a_12m, v5a_12m,
+         c_2y, v_2y, c5a_2y, v5a_2y,
+         c_3y, v_3y, c5a_3y, v5a_3y) = r[1:]
+
+        wr = weekly_map.get(t)
+        if wr:
+            (wc4a_now, wv4a_now,
+             wc4a_1m, wv4a_1m,
+             wc4a_3m, wv4a_3m,
+             wc4a_6m, wv4a_6m,
+             wc4a_12m, wv4a_12m,
+             wc4a_2y, wv4a_2y,
+             wc4a_3y, wv4a_3y) = wr[1:]
+        else:
+            (wc4a_now, wv4a_now,
+             wc4a_1m, wv4a_1m,
+             wc4a_3m, wv4a_3m,
+             wc4a_6m, wv4a_6m,
+             wc4a_12m, wv4a_12m,
+             wc4a_2y, wv4a_2y,
+             wc4a_3y, wv4a_3y) = (None,) * 14
+
+        result[t] = {
+            # Spot (single-day vs single-day)
+            "5D Px%":   _pct(c_now, c_5d),
+            "5D Vol%":  _pct(v_now, v_5d),
+            "1M Px%":   _pct(c_now, c_1m),
+            "1M Vol%":  _pct(v_now, v_1m),
+            "3M Px%":   _pct(c_now, c_3m),
+            "3M Vol%":  _pct(v_now, v_3m),
+            "6M Px%":   _pct(c_now, c_6m),
+            "6M Vol%":  _pct(v_now, v_6m),
+            "12M Px%":  _pct(c_now, c_12m),
+            "12M Vol%": _pct(v_now, v_12m),
+            "2Y Px%":   _pct(c_now, c_2y),
+            "2Y Vol%":  _pct(v_now, v_2y),
+            "3Y Px%":   _pct(c_now, c_3y),
+            "3Y Vol%":  _pct(v_now, v_3y),
+            # Daily rolling avg — NEW periods only (3M/12M come from T1 indicator)
+            "1M Avg Px%":  _pct(c5a_now, c5a_1m),
+            "1M Avg Vol%": _pct(v5a_now, v5a_1m),
+            "6M Avg Px%":  _pct(c5a_now, c5a_6m),
+            "6M Avg Vol%": _pct(v5a_now, v5a_6m),
+            "2Y Avg Px%":  _pct(c5a_now, c5a_2y),
+            "2Y Avg Vol%": _pct(v5a_now, v5a_2y),
+            "3Y Avg Px%":  _pct(c5a_now, c5a_3y),
+            "3Y Avg Vol%": _pct(v5a_now, v5a_3y),
+            # Weekly rolling avg — NEW periods only (3M/12M come from T2 indicator)
+            "1M Wkly Avg Px%":  _pct(wc4a_now, wc4a_1m),
+            "1M Wkly Avg Vol%": _pct(wv4a_now, wv4a_1m),
+            "6M Wkly Avg Px%":  _pct(wc4a_now, wc4a_6m),
+            "6M Wkly Avg Vol%": _pct(wv4a_now, wv4a_6m),
+            "2Y Wkly Avg Px%":  _pct(wc4a_now, wc4a_2y),
+            "2Y Wkly Avg Vol%": _pct(wv4a_now, wv4a_2y),
+            "3Y Wkly Avg Px%":  _pct(wc4a_now, wc4a_3y),
+            "3Y Wkly Avg Vol%": _pct(wv4a_now, wv4a_3y),
+        }
+
+    return result
+
+
+def get_nth_trading_day_back(tickers: list[str], n: int) -> str | None:
+    """Return the date that is the Nth most-recent trading day in price_history.
+
+    Uses the most-common rn_desc=n date across the provided tickers (all tickers
+    in the same universe share the same calendar, so this is consistent).
+    Returns None if price_history is empty.
+    """
+    if not tickers:
+        return None
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    row = con.execute(
+        f"""
+        SELECT CAST(date AS TEXT)
+        FROM (
+            SELECT date,
+                ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+            FROM price_history WHERE ticker IN ({placeholders})
+        ) t
+        WHERE rn = ?
+        GROUP BY date
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+        """,
+        tickers + [n],
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_custom_period_returns(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, dict]:
+    """Compute custom-period spot and rolling-avg returns from price_history.
+
+    Finds the closest available trading day on or before start_date and on or
+    before end_date (i.e. both snap to the previous trading day), then computes:
+      - "Cust Px%"     : close at end vs close at start
+      - "Cust Avg Px%" : 5d avg at end vs 5d avg at start
+      - "Cust Vol%"    : volume at end vs volume at start
+      - "Cust Avg Vol%": 5d avg vol at end vs 5d avg vol at start
+
+    Returns {ticker: {col: float_or_None}}.
+    """
+    if not tickers:
+        return {}
+
+    placeholders = ", ".join(["?" for _ in tickers])
+
+    # Compute rolling avgs over ALL rows first (no date filter in the window),
+    # then pick the closest available date to start/end in the outer query.
+    # This avoids the window being truncated by a WHERE date >= start_date filter,
+    # which would give a partial (< 5-day) average at the boundary row.
+    combined_sql = f"""
+    WITH all_avgs AS (
+        SELECT ticker, date, close, volume,
+            AVG(close) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            ) AS close_5d_avg,
+            AVG(volume) OVER (
+                PARTITION BY ticker ORDER BY date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            ) AS vol_5d_avg
+        FROM price_history
+        WHERE ticker IN ({placeholders})
+    ),
+    start_ranked AS (
+        SELECT ticker, close, volume, close_5d_avg, vol_5d_avg,
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+        FROM all_avgs WHERE date <= ?
+    ),
+    end_ranked AS (
+        SELECT ticker, close, volume, close_5d_avg, vol_5d_avg,
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn
+        FROM all_avgs WHERE date <= ?
+    )
+    SELECT 'start' AS side, ticker, close, volume, close_5d_avg, vol_5d_avg
+    FROM start_ranked WHERE rn = 1
+    UNION ALL
+    SELECT 'end'   AS side, ticker, close, volume, close_5d_avg, vol_5d_avg
+    FROM end_ranked WHERE rn = 1
+    """
+
+    con = _conn()
+    rows = con.execute(combined_sql, tickers + [start_date, end_date]).fetchall()
+
+    start_rows: dict[str, tuple] = {}
+    end_rows:   dict[str, tuple] = {}
+    for side, ticker, close, volume, c5a, v5a in rows:
+        if side == "start":
+            start_rows[ticker] = (close, volume, c5a, v5a)
+        else:
+            end_rows[ticker]   = (close, volume, c5a, v5a)
+
+    result: dict[str, dict] = {}
+    for ticker in tickers:
+        s = start_rows.get(ticker)
+        e = end_rows.get(ticker)
+        if s is None or e is None:
+            result[ticker] = {
+                "Cust Px%": None, "Cust Avg Px%": None,
+                "Cust Vol%": None, "Cust Avg Vol%": None,
+            }
+        else:
+            result[ticker] = {
+                "Cust Px%":     _pct(e[0], s[0]),
+                "Cust Avg Px%": _pct(e[2], s[2]),
+                "Cust Vol%":    _pct(e[1], s[1]),
+                "Cust Avg Vol%":_pct(e[3], s[3]),
+            }
+    return result
+
+
+def update_earnings_extended(ticker: str, earnings_date: str, fields: dict) -> None:
+    """Update extended earnings columns for an existing earnings_history row.
+
+    fields may contain any subset of:
+        earns_1d_vol_pct, earns_5d_px_pct, earns_5d_vol_pct,
+        earns_5d_roll_px_pct, earns_5d_roll_vol_pct
+    """
+    if not fields:
+        return
+    allowed = {
+        "earns_1d_vol_pct", "earns_5d_px_pct", "earns_5d_vol_pct",
+        "earns_5d_roll_px_pct", "earns_5d_roll_vol_pct",
+    }
+    safe_fields = {k: v for k, v in fields.items() if k in allowed}
+    if not safe_fields:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in safe_fields)
+    vals = list(safe_fields.values()) + [ticker, earnings_date]
+    con = _conn()
+    con.execute(
+        f"UPDATE earnings_history SET {set_clause} "
+        "WHERE ticker = ? AND earnings_date = ?",
+        vals,
+    )
