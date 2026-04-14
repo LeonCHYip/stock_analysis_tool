@@ -24,7 +24,10 @@ import pandas as pd
 import ta
 import yfinance as yf
 
-from market_calendar import get_missing_trading_days, nyse_close_passed_today
+from market_calendar import (
+    get_missing_trading_days, nyse_close_passed_today,
+    get_last_trading_day_before_today, et_today,
+)
 import storage
 
 ET  = ZoneInfo("America/New_York")
@@ -546,9 +549,18 @@ def fetch_and_store_bulk(tickers: list[str],
     weekly_latest_date: if set, limits the weekly comparison window (T2) to
     that date. Close / as_of_date always reflect the latest available data.
     """
-    is_final = nyse_close_passed_today()
+    from datetime import timedelta
+    is_final_session = nyse_close_passed_today()
     results: dict[str, dict] = {}
-    today_str = date.today().isoformat()
+    today_et  = et_today()
+    today_str = today_et.isoformat()
+    # Expected most-recent completed trading day in ET: today if NYSE closed, else prior day
+    expected_date = today_str if is_final_session else (
+        get_last_trading_day_before_today() or today_str
+    )
+    # Explicit date range so yfinance always tries to include today's close
+    _start = (today_et - timedelta(days=3 * 365 + 10)).isoformat()
+    _end   = (today_et + timedelta(days=1)).isoformat()
 
     for i in range(0, len(tickers), _BATCH_SIZE):
         batch = tickers[i: i + _BATCH_SIZE]
@@ -556,7 +568,8 @@ def fetch_and_store_bulk(tickers: list[str],
         try:
             raw = yf.download(
                 tickers=batch,
-                period="3y",
+                start=_start,
+                end=_end,
                 group_by="ticker",
                 auto_adjust=False,
                 threads=True,
@@ -590,7 +603,11 @@ def fetch_and_store_bulk(tickers: list[str],
                     continue
 
                 as_of = fields.pop("_as_of_date", today_str)
-                storage.save_tech_indicators(ticker, as_of, fields, is_final)
+                # Only finalize if yfinance actually returned the expected trading day's data.
+                # If it returned stale data, keep is_finalized=FALSE so refetch_unfinalized
+                # will pick it up on the next session.
+                row_is_final = is_final_session and (as_of >= expected_date)
+                storage.save_tech_indicators(ticker, as_of, fields, row_is_final)
                 storage.save_price_history(ticker, _extract_price_rows(df))
 
                 # Convert flat fields dict → legacy nested dict for indicators.py
@@ -613,9 +630,9 @@ def refetch_unfinalized(log=print) -> int:
     if not pending:
         return 0
 
-    today = date.today().isoformat()
-    # Only re-fetch entries whose as_of_date < today (yesterday's data is always final)
-    # or entries that are today but NYSE has now closed
+    today = et_today().isoformat()
+    # Only re-fetch entries whose as_of_date < today ET (yesterday's data is always final)
+    # or entries that are today ET but NYSE has now closed
     to_refetch = []
     for ticker, as_of_date in pending:
         if as_of_date < today:
@@ -629,6 +646,35 @@ def refetch_unfinalized(log=print) -> int:
     log(f"  [tech] Re-fetching {len(to_refetch)} unfinalized tickers…")
     _refetch_single_batch(to_refetch, log)
     return len(to_refetch)
+
+
+def refetch_stale_tickers(log=print) -> int:
+    """
+    Re-fetch tickers whose stored as_of_date is behind the most recent completed
+    trading day.  Handles the case where yfinance returned stale data during a
+    scan (stored with is_finalized=TRUE but as_of_date is from a prior day).
+    Uses a single SQL query for efficiency.
+
+    Target date logic:
+      - NYSE has closed today  → target = today   (today is now a completed day)
+      - NYSE not yet closed    → target = last trading day before today
+    Tickers with as_of_date < target are re-fetched.
+
+    Returns number of tickers re-fetched.
+    """
+    if nyse_close_passed_today():
+        target_date = et_today().isoformat()
+    else:
+        target_date = get_last_trading_day_before_today()
+    if not target_date:
+        return 0
+    stale = storage.get_tickers_with_stale_tech(target_date)
+    if not stale:
+        return 0
+    log(f"  [tech] Re-fetching {len(stale)} tickers with stale as_of_date "
+        f"(behind {target_date})…")
+    _refetch_single_batch(stale, log)
+    return len(stale)
 
 
 def backfill_missing_days(tickers: list[str], log=print) -> int:
@@ -654,15 +700,23 @@ def backfill_missing_days(tickers: list[str], log=print) -> int:
 
 def _refetch_single_batch(tickers: list[str], log=print) -> None:
     """Re-download and re-compute for a list of tickers (used internally)."""
-    is_final = nyse_close_passed_today()
-    today_str = date.today().isoformat()
+    from datetime import timedelta
+    is_final_session = nyse_close_passed_today()
+    today_et  = et_today()
+    today_str = today_et.isoformat()
+    expected_date = today_str if is_final_session else (
+        get_last_trading_day_before_today() or today_str
+    )
+    _start = (today_et - timedelta(days=3 * 365 + 10)).isoformat()
+    _end   = (today_et + timedelta(days=1)).isoformat()
 
     for i in range(0, len(tickers), _BATCH_SIZE):
         batch = tickers[i: i + _BATCH_SIZE]
         try:
             raw = yf.download(
                 tickers=batch,
-                period="3y",
+                start=_start,
+                end=_end,
                 group_by="ticker",
                 auto_adjust=False,
                 threads=True,
@@ -689,9 +743,9 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
                 if "error" in fields:
                     continue
                 as_of = fields.pop("_as_of_date", today_str)
-                storage.save_tech_indicators(ticker, as_of, fields, is_final)
+                row_is_final = is_final_session and (as_of >= expected_date)
+                storage.save_tech_indicators(ticker, as_of, fields, row_is_final)
                 storage.save_price_history(ticker, _extract_price_rows(df))
-                # Mark old unfinalized rows as finalized (they've been replaced)
                 storage.mark_tech_finalized(ticker, as_of)
             except Exception as e:
                 log(f"  [tech] Re-fetch compute error for {ticker}: {e}")

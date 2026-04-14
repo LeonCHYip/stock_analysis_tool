@@ -36,7 +36,11 @@ import pandas as pd
 import streamlit as st
 
 from data_fetcher  import fetch_technical, fetch_technical_bulk
-from technical_fetcher import fetch_and_store_bulk as fetch_technical_bulk_v2
+from technical_fetcher import (
+    fetch_and_store_bulk as fetch_technical_bulk_v2,
+    refetch_unfinalized as _tf_refetch_unfinalized,
+    refetch_stale_tickers as _tf_refetch_stale,
+)
 import fundamental_fetcher
 from fundamental_fetcher import fetch_fundamental
 from peers_fetcher import get_peer_valuations, clear_peer_cache
@@ -135,6 +139,7 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     "Earnings Extended": [
         "Earns 1D Px%", "Earns 1D Vol%", "Earns 5D Px%", "Earns 5D Vol%",
         "Earns 5D Roll Px%", "Earns 5D Roll Vol%",
+        "Post-Earns Px%", "Post-Earns Vol%", "Post-Earns Avg Px%", "Post-Earns Avg Vol%",
     ],
     "Score": ["Score"],
     "Short Interest": [
@@ -368,19 +373,44 @@ if "_startup_finalized" not in st.session_state:
     except Exception as _e:
         print(f"[startup] mark_old_tech_finalized failed: {_e}")
 
+# Detect stale tech data on startup (single SQL query — no downloads).
+# We store the count in session_state so the warning banner can show it.
+if "_stale_check_done" not in st.session_state:
+    st.session_state["_stale_check_done"] = True
+    try:
+        from market_calendar import get_last_trading_day_before_today, nyse_close_passed_today as _nyse_closed, et_today as _et_today
+        _target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
+        if _target:
+            st.session_state["_stale_target_date"] = _target
+            st.session_state["_stale_count"] = len(storage.get_tickers_with_stale_tech(_target))
+    except Exception as _e:
+        print(f"[startup] stale check failed: {_e}")
+
 if "_earnings_fetched" not in st.session_state:
     st.session_state["_earnings_fetched"] = True
-    try:
-        from earnings_fetcher import run_daily_fetch as _earnings_daily
-        from storage import get_latest_earnings_date as _get_latest_earnings_date
-        _since = _get_latest_earnings_date()
-        if _since:
-            print(f"[earnings] Latest earnings date in DB: {_since} — fetching from there")
-            _earnings_daily(since_date=_since)
-        else:
-            _earnings_daily(lookback_days=7)
-    except Exception as _e:
-        print(f"[earnings] Daily fetch failed: {_e}")
+    def _earnings_bg():
+        try:
+            from earnings_fetcher import run_daily_fetch as _earnings_daily
+            from storage import get_latest_earnings_date as _get_latest_earnings_date
+            _since = _get_latest_earnings_date()
+            if _since:
+                print(f"[earnings] Latest earnings date in DB: {_since} — fetching from there")
+                _earnings_daily(since_date=_since)
+            else:
+                _earnings_daily(lookback_days=7)
+        except Exception as _e:
+            print(f"[earnings] Daily fetch failed: {_e}")
+    threading.Thread(target=_earnings_bg, daemon=True, name="earnings-daily").start()
+
+if "_post_earns_updated" not in st.session_state:
+    st.session_state["_post_earns_updated"] = True
+    def _post_earns_bg():
+        try:
+            from earnings_fetcher import update_post_earns_columns as _update_post_earns
+            _update_post_earns()
+        except Exception as _e:
+            print(f"[post-earns] Update failed: {_e}")
+    threading.Thread(target=_post_earns_bg, daemon=True, name="post-earns-update").start()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state init
@@ -607,7 +637,8 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         return _earnings_ts_to_date_time(v)
 
     rec = {
-        "Ticker":          ticker,
+        "Ticker":              ticker,
+        "Datetime":            row.get("analysis_datetime") or "",
         "Company Summary":     row.get("company_summary") or "",
         "Revenue Composition": row.get("revenue_composition") or "",
         "Status":              row.get("status") or "",
@@ -760,11 +791,15 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     rec["Rev Act ($M)"]  = _f(e.get("rev_act_m"))
     rec["Rev Sur"]       = _f(e.get("rev_sur"))
     # ── Earnings extended columns ─────────────────────────────────────────────
-    rec["Earns 1D Vol%"]       = _f(e.get("earns_1d_vol_pct"))
-    rec["Earns 5D Px%"]        = _f(e.get("earns_5d_px_pct"))
-    rec["Earns 5D Vol%"]       = _f(e.get("earns_5d_vol_pct"))
-    rec["Earns 5D Roll Px%"]   = _f(e.get("earns_5d_roll_px_pct"))
-    rec["Earns 5D Roll Vol%"]  = _f(e.get("earns_5d_roll_vol_pct"))
+    rec["Earns 1D Vol%"]          = _f(e.get("earns_1d_vol_pct"))
+    rec["Earns 5D Px%"]           = _f(e.get("earns_5d_px_pct"))
+    rec["Earns 5D Vol%"]          = _f(e.get("earns_5d_vol_pct"))
+    rec["Earns 5D Roll Px%"]      = _f(e.get("earns_5d_roll_px_pct"))
+    rec["Earns 5D Roll Vol%"]     = _f(e.get("earns_5d_roll_vol_pct"))
+    rec["Post-Earns Px%"]         = _f(e.get("post_earns_px_pct"))
+    rec["Post-Earns Vol%"]        = _f(e.get("post_earns_vol_pct"))
+    rec["Post-Earns Avg Px%"]     = _f(e.get("post_earns_avg_px_pct"))
+    rec["Post-Earns Avg Vol%"]    = _f(e.get("post_earns_avg_vol_pct"))
 
     # ── Short interest (from fundamentals DB) ─────────────────────────────────
     def _pct(v):
@@ -2176,7 +2211,7 @@ def _value_col_config(cols: list[str]) -> dict:
     for col in cols:
         if col == "#":
             cfg[col] = st.column_config.NumberColumn("#", format="%d", disabled=True)
-        elif col == "Ticker":
+        elif col in ("Ticker", "Datetime"):
             cfg[col] = st.column_config.TextColumn(col, disabled=True)
         elif col in ("Sector", "Industry", "Q End Date", "A End Date",
                      "Next Earnings Date", "Last Close Date",
@@ -2407,23 +2442,32 @@ def render_value_table(tickers: list[str], detail_map: dict,
 
     _fixed_right = {"Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
                     "Next Earnings Date", "Next Earnings Time",
-                    "Last Earnings Date", "Last Earnings Time", "Earns 1D Px%"}
+                    "Last Earnings Date", "Last Earnings Time", "Earns 1D Px%",
+                    "Close", "Change %", "Last Close Date"}
     data_cols = [c for c in (sel_cols if sel_cols else group_cols)
                  if c not in _fixed_right and c != "Score" and c != "Status" and c != "Comments"
                  and c not in _USER_NOTE_COLS]
-    # Auto-inject sort col if not already visible and it's a value-table column
+    # Sort col auto-inject: placed after Score (not prepended to data_cols)
+    _sort_inject = []
     if (sort_col and sort_col not in data_cols
             and sort_col not in _fixed_right
-            and sort_col not in ("Score", "Comments", "#", "Ticker")
+            and sort_col not in ("Score", "Comments", "#", "Ticker", "Datetime")
             and sort_col not in _USER_NOTE_COLS):
-        data_cols = [sort_col] + data_cols
-    # Order: Ticker | # | Score | data columns | Company Summary | Status | Comments | note cols | fixed-right columns
+        _sort_inject = [sort_col]
+    # Order: Ticker | # | Datetime | T1-F6 data cols | Score | sort col |
+    #        Mkt Cap | Sector | Industry | Status | Comments | note cols |
+    #        Company Summary | Revenue Composition | Company Name | Company Description |
+    #        Next Earnings Date | Next Earnings Time | Close | Change % | Last Close Date |
+    #        Last Earnings Date | Last Earnings Time | Earns 1D Px%
     show_cols = (
-        ["Ticker", "#", "Score"] + data_cols
-        + ["Company Summary", "Revenue Composition", "Status", "Comments",
+        ["Ticker", "#", "Datetime"] + data_cols + ["Score"] + _sort_inject
+        + ["Mkt Cap ($B)", "Sector", "Industry",
+           "Status", "Comments",
            "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
-           "Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
+           "Company Summary", "Revenue Composition",
+           "Company Name", "Company Description",
            "Next Earnings Date", "Next Earnings Time",
+           "Close", "Change %", "Last Close Date",
            "Last Earnings Date", "Last Earnings Time", "Earns 1D Px%"]
     )
 
@@ -2461,13 +2505,13 @@ def render_value_table(tickers: list[str], detail_map: dict,
             val_edited = st.data_editor(
                 df, column_config=col_cfg, column_order=ordered_cols,
                 width="stretch", hide_index=False,
-                key=f"val_editor_{tab_key}", row_height=80,
+                height=1200, key=f"val_editor_{tab_key}", row_height=80,
             )
         except TypeError:
             val_edited = st.data_editor(
                 df, column_config=col_cfg, column_order=ordered_cols,
                 width="stretch", hide_index=False,
-                key=f"val_editor_{tab_key}",
+                height=1200, key=f"val_editor_{tab_key}",
             )
         if st.button("💾 Save", key=f"save_val_comments_{tab_key}"):
             _user_note_map = {
@@ -2536,6 +2580,13 @@ with st.sidebar:
         "▶ Run Unseen Today",
         width="stretch",
         help="Scans only tickers whose last run was before today 3 pm CST (not yet run today after market close).",
+    )
+    _stale_n_sidebar = st.session_state.get("_stale_count", 0)
+    run_stale_btn = st.button(
+        f"▶ Refresh Stale Data ({_stale_n_sidebar})" if _stale_n_sidebar else "▶ Refresh Stale Data",
+        width="stretch",
+        disabled=(_stale_n_sidebar == 0),
+        help="Re-scans tickers whose Close/Change% is from a prior trading day.",
     )
     st.divider()
 
@@ -2673,6 +2724,18 @@ if run_unseen_btn:
         )
         _launch_scan(ticker_list, label)
 
+if run_stale_btn:
+    from market_calendar import nyse_close_passed_today as _nyse_closed, get_last_trading_day_before_today, et_today as _et_today
+    _stale_target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
+    if _stale_target:
+        _stale_tickers = storage.get_tickers_with_stale_tech(_stale_target)
+        if not _stale_tickers:
+            st.sidebar.info("No stale tickers found.")
+        else:
+            _launch_scan(_stale_tickers, f"Stale data refresh — {len(_stale_tickers)} tickers")
+    else:
+        st.sidebar.warning("Could not determine target trading day.")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Scan progress (fragment — auto-refreshes every 2 s without full-page rerun)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2710,6 +2773,16 @@ with tab_history:
     if not all_dts:
         st.info("No historical data yet.")
         st.stop()
+
+    # ── Stale data warning ────────────────────────────────────────────────────
+    _stale_n = st.session_state.get("_stale_count", 0)
+    _stale_target = st.session_state.get("_stale_target_date", "")
+    if _stale_n and _stale_target:
+        st.warning(
+            f"{_stale_n} tickers have Close/Change% data older than {_stale_target}. "
+            f"Run a new scan to refresh.",
+            icon="⚠️",
+        )
 
     # ── Market Scan Summary ───────────────────────────────────────────────────
     st.markdown("### 📊 Market Scan")
@@ -2979,9 +3052,42 @@ with tab_history:
     all_df_disp = all_df.set_index("Ticker") if "Ticker" in all_df.columns else all_df
     all_col_cfg = make_column_config(all_df_disp)
 
+    # Build column_order: #, Datetime, T1[-subs]-F6[-subs], Score, sort col, fixed right, rest
+    _emoji_ind_cols: list[str] = []
+    for _ind in MAIN_IND_COLS:
+        if _ind in all_df_disp.columns:
+            _emoji_ind_cols.append(_ind)
+        if all_show_sub:
+            for _sd in SUB_DISPLAY.values():
+                if _sd.startswith(_ind + ".") and _sd in all_df_disp.columns:
+                    _emoji_ind_cols.append(_sd)
+
+    _emoji_base = ["#", "Datetime"] + _emoji_ind_cols + ["Score"]
+    _emoji_placed = set(_emoji_base)
+    if _sort_col not in _emoji_placed and _sort_col in all_df_disp.columns:
+        _emoji_base.append(_sort_col)
+        _emoji_placed.add(_sort_col)
+
+    _emoji_fixed_right = [
+        "Mkt Cap ($B)", "Sector", "Industry",
+        "Status", "Comments",
+        "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
+        "Company Summary", "Revenue Composition",
+        "Company Name", "Company Description",
+        "Next Earnings Date", "Next Earnings Time",
+        "Close", "Change %", "Last Close Date",
+    ]
+    _emoji_col_order = [c for c in _emoji_base if c in all_df_disp.columns]
+    _emoji_placed = set(_emoji_col_order)
+    _emoji_col_order += [c for c in _emoji_fixed_right if c in all_df_disp.columns and c not in _emoji_placed]
+    _emoji_placed = set(_emoji_col_order)
+    _emoji_col_order += [c for c in all_df_disp.columns if c not in _emoji_placed]
+
     all_edited = st.data_editor(
         all_df_disp, column_config=all_col_cfg,
+        column_order=_emoji_col_order,
         width="stretch", hide_index=False,
+        height=600,
         key="all_sum_editor",
     )
     if st.button("💾 Save", key="save_all"):

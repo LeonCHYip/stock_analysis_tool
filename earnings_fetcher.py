@@ -283,7 +283,7 @@ def _compute_1d_changes(date_str: str, earnings_dict: dict) -> None:
                     ext["earns_1d_vol_pct"] = _pct_chg(v_map[date_str], v_map[prev_day])
                 if earnings_idx + 4 < len(trading_days):
                     d4 = trading_days[earnings_idx + 4]
-                    ext["earns_5d_px_pct"]  = _pct_chg(c_map.get(d4), c_map.get(date_str))
+                    ext["earns_5d_px_pct"]  = _pct_chg(c_map.get(d4), c_map.get(prev_day))
                     ext["earns_5d_vol_pct"] = _pct_chg(v_map.get(d4), v_map.get(prev_day)) if v_map and prev_day else None
                 pre_days  = [trading_days[i] for i in range(earnings_idx - 5, earnings_idx)      if 0 <= i < len(trading_days)]
                 post_days = [trading_days[i] for i in range(earnings_idx,     earnings_idx + 5)  if 0 <= i < len(trading_days)]
@@ -306,12 +306,12 @@ def _compute_1d_changes(date_str: str, earnings_dict: dict) -> None:
 
                 # ── Extended metrics ─────────────────────────────────────────
                 ext = {}
-                if v_map and prev_day and next_day and next_day in v_map and prev_day in v_map:
-                    ext["earns_1d_vol_pct"] = _pct_chg(v_map[next_day], v_map[prev_day])
+                if v_map and next_day and next_day in v_map and date_str in v_map:
+                    ext["earns_1d_vol_pct"] = _pct_chg(v_map[next_day], v_map[date_str])
                 if earnings_idx + 5 < len(trading_days):
                     d5 = trading_days[earnings_idx + 5]
                     ext["earns_5d_px_pct"]  = _pct_chg(c_map.get(d5), c_map.get(date_str))
-                    ext["earns_5d_vol_pct"] = _pct_chg(v_map.get(d5), v_map.get(prev_day)) if v_map and prev_day else None
+                    ext["earns_5d_vol_pct"] = _pct_chg(v_map.get(d5), v_map.get(date_str)) if v_map else None
                 pre_days  = [trading_days[i] for i in range(earnings_idx - 4, earnings_idx + 1) if 0 <= i < len(trading_days)]
                 post_days = [trading_days[i] for i in range(earnings_idx + 1, earnings_idx + 6) if 0 <= i < len(trading_days)]
                 ext["earns_5d_roll_px_pct"]  = _pct_chg(_avg([c_map.get(d) for d in post_days]), _avg([c_map.get(d) for d in pre_days]))
@@ -408,6 +408,51 @@ def compute_missing_1d_changes(extended_lookback_days: int = 10) -> int:
     return total
 
 
+def recompute_extended_columns() -> int:
+    """Recompute extended earnings columns for ALL historical records (even non-NULL).
+
+    Use this after fixing BMO/AMC reference-day logic.  Steps:
+      1. NULL out the three columns that were computed with wrong reference days:
+         - earns_5d_px_pct  for BMO rows
+         - earns_1d_vol_pct for AMC rows
+         - earns_5d_vol_pct for AMC rows
+      2. NULL out all five extended columns for every other row (so backfill
+         picks them up if price_history has been updated).
+      3. Delegate to backfill_extended_columns() which processes all NULL rows.
+
+    No external API calls — reads only from price_history.
+    Returns number of tickers processed.
+    """
+    con = storage._conn()
+
+    # Step 1: NULL the columns that had wrong reference-day logic
+    con.execute("""
+        UPDATE earnings_history
+        SET earns_5d_px_pct = NULL
+        WHERE earnings_time = 'BMO'
+    """)
+    con.execute("""
+        UPDATE earnings_history
+        SET earns_1d_vol_pct = NULL,
+            earns_5d_vol_pct = NULL
+        WHERE earnings_time = 'AMC'
+    """)
+
+    # Step 2: NULL the remaining extended columns for all rows so they are
+    # recomputed fresh (picks up any price_history improvements too).
+    con.execute("""
+        UPDATE earnings_history
+        SET earns_5d_px_pct      = NULL,
+            earns_1d_vol_pct     = NULL,
+            earns_5d_vol_pct     = NULL,
+            earns_5d_roll_px_pct = NULL,
+            earns_5d_roll_vol_pct = NULL
+    """)
+
+    print("[earnings recompute] Cleared all extended columns — recomputing from price_history…")
+    return backfill_extended_columns()
+
+
 def backfill_extended_columns() -> int:
     """One-time backfill: compute extended earnings columns for ALL historical records.
 
@@ -433,6 +478,112 @@ def backfill_extended_columns() -> int:
         except Exception as e:
             print(f"  [backfill] Failed for {date_str}: {e}")
     print(f"[earnings backfill] Done: {total} tickers processed.")
+    return total
+
+
+def update_post_earns_columns() -> int:
+    """Recompute post_earns_* columns for all tickers that have both earnings and tech data.
+
+    Reference day:
+      BMO → D-1 (last trading day before earnings day); pre 5-day avg = D-5..D-1
+      AMC → D0  (earnings day itself);                  pre 5-day avg = D-4..D0
+    Latest day = as_of_date from tech_indicators.
+    Latest 5-day avg = 5 trading days ending at as_of_date.
+
+    No external API calls — reads only from price_history and tech_indicators.
+    Returns number of tickers updated.
+    """
+    ticker_info = storage.get_latest_earnings_with_as_of_dates()
+    if not ticker_info:
+        print("[post-earns] No earnings data found.")
+        return 0
+
+    # Skip tickers with no tech data or where latest date ≤ earnings date
+    valid = {
+        t: info for t, info in ticker_info.items()
+        if info.get("as_of_date") and info["as_of_date"] > info["earnings_date"]
+    }
+    if not valid:
+        print("[post-earns] No tickers with both earnings and tech data.")
+        return 0
+
+    # Group by earnings_date to batch price_history queries
+    by_earnings_date: dict[str, dict] = {}
+    for ticker, info in valid.items():
+        ed = info["earnings_date"]
+        by_earnings_date.setdefault(ed, {})[ticker] = info
+
+    total = 0
+    for earnings_date, group in sorted(by_earnings_date.items()):
+        tickers = list(group.keys())
+        max_as_of = max(info["as_of_date"] for info in group.values())
+        window_start = (date.fromisoformat(earnings_date) - timedelta(days=14)).isoformat()
+
+        price_data = storage.get_price_history_range(tickers, window_start, max_as_of)
+
+        for ticker, info in group.items():
+            et       = info["earnings_time"]
+            ed       = info["earnings_date"]
+            as_of    = info["as_of_date"]
+
+            ticker_data = price_data.get(ticker, {})
+            if not ticker_data:
+                continue
+
+            trading_days = sorted(ticker_data.keys())
+
+            # Snap as_of to closest available trading day on or before as_of
+            available_up_to = [d for d in trading_days if d <= as_of]
+            if not available_up_to or ed not in trading_days:
+                continue
+            latest = available_up_to[-1]
+            latest_idx    = trading_days.index(latest)
+            earnings_idx  = trading_days.index(ed)
+
+            c_map = {d: ticker_data[d]["close"]  for d in trading_days if ticker_data[d]["close"]  is not None}
+            v_map = {d: ticker_data[d]["volume"] for d in trading_days if ticker_data[d]["volume"] is not None}
+
+            # Pre-earnings anchor and 5-day pre window
+            if et == "BMO":
+                anchor   = trading_days[earnings_idx - 1] if earnings_idx > 0 else None
+                pre_days = [trading_days[i] for i in range(earnings_idx - 5, earnings_idx)
+                            if 0 <= i < len(trading_days)]
+            else:  # AMC
+                anchor   = ed
+                pre_days = [trading_days[i] for i in range(earnings_idx - 4, earnings_idx + 1)
+                            if 0 <= i < len(trading_days)]
+
+            if not anchor or anchor not in c_map:
+                continue
+
+            # Latest 5-day window ending at latest
+            latest_days = [trading_days[i] for i in range(latest_idx - 4, latest_idx + 1)
+                           if 0 <= i < len(trading_days)]
+
+            ext: dict = {}
+
+            # Spot price & volume
+            if latest in c_map:
+                ext["post_earns_px_pct"] = _pct_chg(c_map[latest], c_map[anchor])
+            if anchor in v_map and latest in v_map:
+                ext["post_earns_vol_pct"] = _pct_chg(v_map[latest], v_map[anchor])
+
+            # Rolling avg price & volume
+            pre_avg_px  = _avg([c_map.get(d) for d in pre_days])
+            late_avg_px = _avg([c_map.get(d) for d in latest_days])
+            if pre_avg_px and late_avg_px:
+                ext["post_earns_avg_px_pct"] = _pct_chg(late_avg_px, pre_avg_px)
+
+            pre_avg_vol  = _avg([v_map.get(d) for d in pre_days])
+            late_avg_vol = _avg([v_map.get(d) for d in latest_days])
+            if pre_avg_vol and late_avg_vol:
+                ext["post_earns_avg_vol_pct"] = _pct_chg(late_avg_vol, pre_avg_vol)
+
+            if ext:
+                storage.update_post_earns_extended(ticker, ed, ext)
+                total += 1
+
+    print(f"[post-earns] Updated {total} tickers.")
     return total
 
 
@@ -479,6 +630,10 @@ if __name__ == "__main__":
                         help="Days to look back for gaps (default: 30)")
     parser.add_argument("--backfill-extended", action="store_true",
                         help="One-time backfill of extended earnings columns for all historical records")
+    parser.add_argument("--recompute-extended", action="store_true",
+                        help="Recompute all extended earnings columns (NULLs stale values first, then recomputes from price_history)")
+    parser.add_argument("--update-post-earns", action="store_true",
+                        help="Recompute post_earns_* columns (price/vol from earnings to latest close date)")
     args = parser.parse_args()
 
     init_db()
@@ -490,6 +645,12 @@ if __name__ == "__main__":
 
     if args.backfill_extended:
         backfill_extended_columns()
+
+    if args.recompute_extended:
+        recompute_extended_columns()
+
+    if args.update_post_earns:
+        update_post_earns_columns()
 
     if args.daily:
         run_daily_fetch(args.lookback)

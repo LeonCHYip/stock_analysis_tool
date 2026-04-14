@@ -455,13 +455,17 @@ def _migrate_add_columns(con) -> None:
         if col not in existing_fund:
             con.execute(f"ALTER TABLE fundamentals ADD COLUMN {col} {dtype}")
 
-    # Add 5 new earnings extended columns
+    # Add earnings extended columns
     new_earn_cols = [
-        ("earns_1d_vol_pct",      "DOUBLE"),
-        ("earns_5d_px_pct",       "DOUBLE"),
-        ("earns_5d_vol_pct",      "DOUBLE"),
-        ("earns_5d_roll_px_pct",  "DOUBLE"),
-        ("earns_5d_roll_vol_pct", "DOUBLE"),
+        ("earns_1d_vol_pct",       "DOUBLE"),
+        ("earns_5d_px_pct",        "DOUBLE"),
+        ("earns_5d_vol_pct",       "DOUBLE"),
+        ("earns_5d_roll_px_pct",   "DOUBLE"),
+        ("earns_5d_roll_vol_pct",  "DOUBLE"),
+        ("post_earns_px_pct",      "DOUBLE"),
+        ("post_earns_vol_pct",     "DOUBLE"),
+        ("post_earns_avg_px_pct",  "DOUBLE"),
+        ("post_earns_avg_vol_pct", "DOUBLE"),
     ]
     existing_earn = {row[0] for row in con.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'earnings_history'"
@@ -568,13 +572,30 @@ def mark_tech_finalized(ticker: str, as_of_date: str) -> None:
     )
 
 
+def get_tickers_with_stale_tech(min_date: str) -> list[str]:
+    """
+    Return tickers whose latest as_of_date in tech_indicators is strictly
+    before min_date.  Used to detect cases where yfinance returned stale
+    data during a scan (is_finalized=TRUE but as_of_date behind the most
+    recent completed trading day).
+    """
+    con = _conn()
+    rows = con.execute(
+        "SELECT ticker FROM tech_indicators "
+        "GROUP BY ticker HAVING MAX(CAST(as_of_date AS TEXT)) < ? "
+        "ORDER BY ticker",
+        [min_date],
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def mark_old_tech_finalized() -> None:
     """Mark all tech_indicators rows with as_of_date < today as finalized.
 
     Fast single SQL UPDATE — no API calls. Safe to call on startup.
     """
-    from datetime import date
-    today = date.today().isoformat()
+    from market_calendar import et_today
+    today = et_today().isoformat()
     con = _conn()
     con.execute(
         "UPDATE tech_indicators SET is_finalized = TRUE "
@@ -1192,6 +1213,67 @@ def update_earnings_1d_change(ticker: str, earnings_date: str, change: float) ->
         "UPDATE earnings_history SET one_day_change = ? "
         "WHERE ticker = ? AND earnings_date = ?",
         [change, ticker, earnings_date],
+    )
+
+
+def get_latest_earnings_with_as_of_dates() -> dict[str, dict]:
+    """Return {ticker: {earnings_date, earnings_time, as_of_date}} for the most
+    recent earnings per ticker, joined with the latest tech_indicators as_of_date.
+
+    Tickers with no tech_indicators row get as_of_date = None.
+    """
+    sql = """
+    WITH latest_earnings AS (
+        SELECT ticker, MAX(earnings_date) AS earnings_date
+        FROM earnings_history
+        WHERE earnings_date IS NOT NULL
+        GROUP BY ticker
+    ),
+    earnings_info AS (
+        SELECT eh.ticker,
+               eh.earnings_date::TEXT AS earnings_date,
+               eh.earnings_time
+        FROM earnings_history eh
+        JOIN latest_earnings le
+          ON eh.ticker = le.ticker AND eh.earnings_date = le.earnings_date
+    ),
+    latest_tech AS (
+        SELECT ticker, MAX(as_of_date)::TEXT AS as_of_date
+        FROM tech_indicators
+        GROUP BY ticker
+    )
+    SELECT ei.ticker, ei.earnings_date, ei.earnings_time, lt.as_of_date
+    FROM earnings_info ei
+    LEFT JOIN latest_tech lt ON ei.ticker = lt.ticker
+    """
+    con = _conn()
+    rows = con.execute(sql).fetchall()
+    result: dict = {}
+    for ticker, earnings_date, earnings_time, as_of_date in rows:
+        result[ticker] = {
+            "earnings_date": earnings_date,
+            "earnings_time": earnings_time or "BMO",
+            "as_of_date":    as_of_date,
+        }
+    return result
+
+
+def update_post_earns_extended(ticker: str, earnings_date: str, fields: dict) -> None:
+    """Update post_earns_* columns for a single (ticker, earnings_date) row."""
+    allowed = {
+        "post_earns_px_pct", "post_earns_vol_pct",
+        "post_earns_avg_px_pct", "post_earns_avg_vol_pct",
+    }
+    safe = {k: v for k, v in fields.items() if k in allowed}
+    if not safe:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in safe)
+    vals = list(safe.values()) + [ticker, earnings_date]
+    con = _conn()
+    con.execute(
+        f"UPDATE earnings_history SET {set_clause} "
+        "WHERE ticker = ? AND earnings_date = ?",
+        vals,
     )
 
 
