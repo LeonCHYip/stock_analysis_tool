@@ -5,6 +5,7 @@ Run: streamlit run app.py
 """
 
 from __future__ import annotations
+import copy
 import json
 import threading
 import concurrent.futures
@@ -1840,6 +1841,113 @@ _TAB_FILTER_DEFAULTS: dict[str, dict[str, object]] = {
 }
 
 
+def _tab_filter_keys(tab_id: str) -> dict:
+    """Return the logical→session-state key mapping for any scan tab."""
+    if tab_id in _TAB_FILTER_KEYS:
+        return _TAB_FILTER_KEYS[tab_id]
+    # Auto-generate for dynamic scan tabs
+    return {
+        "f_ticker_multi": f"{tab_id}_f_tick",
+        "f_dt":           f"{tab_id}_f_dt",
+        "f_sector":       f"{tab_id}_f_sector",
+        "f_industry":     f"{tab_id}_f_industry",
+        "mc_lo":          f"{tab_id}_mc_lo",
+        "mc_hi":          f"{tab_id}_mc_hi",
+        "show_sub":       f"{tab_id}_show_sub",
+        "only_latest":    f"{tab_id}_only_latest",
+    }
+
+
+def _tab_extra_ss(tab_id: str, key: str) -> str:
+    """Return the session-state key for extra per-tab state (sort, cust dates, etc.)."""
+    if tab_id == "history":
+        _hist_map = {
+            "sort_col":   "sort_col_history",
+            "sort_dir":   "sort_dir_history",
+            "find_rank":  "find_rank_history",
+            "cust_start": "hist_cust_start",
+            "cust_end":   "hist_cust_end",
+            "det_ticker": "det_ticker",
+            "det_dt":     "det_dt",
+            "emoji_editor": "all_sum_editor",
+            "save_all":   "save_all",
+            "ai_run":     "ai_run_history_btn",
+        }
+        return _hist_map.get(key, f"history_{key}")
+    return f"{tab_id}_{key}"
+
+
+def _register_scan_tab(tab_id: str) -> None:
+    """Ensure tab_id is registered in _TAB_FILTER_KEYS/_TAB_FILTER_DEFAULTS."""
+    if tab_id not in _TAB_FILTER_KEYS:
+        _TAB_FILTER_KEYS[tab_id] = _tab_filter_keys(tab_id)
+    if tab_id not in _TAB_FILTER_DEFAULTS:
+        _TAB_FILTER_DEFAULTS[tab_id] = {
+            "f_ticker_multi": [],
+            "f_dt":           [],
+            "f_sector":       [],
+            "f_industry":     [],
+            "mc_lo":          None,
+            "mc_hi":          None,
+            "show_sub":       False,
+            "only_latest":    True,
+        }
+
+
+def _migrate_filter_groups_global(prefs: dict) -> bool:
+    """If filter_groups is in old per-tab format {tab_key: {name: group}}, flatten to {name: group}."""
+    fg = prefs.get("filter_groups", {})
+    if not fg:
+        return False
+    known_tab_ids = {"history", "latest"}
+    if any(k in known_tab_ids for k in fg):
+        merged: dict = {}
+        for key, val in list(fg.items()):
+            if key in known_tab_ids and isinstance(val, dict):
+                merged.update(val)
+            elif key not in known_tab_ids:
+                merged[key] = val
+        prefs["filter_groups"] = merged
+        return True
+    return False
+
+
+def _copy_tab_settings(src_id: str, dst_id: str) -> None:
+    """Copy all filter/column/sort session state from src_id tab to dst_id tab."""
+    src_tk = _tab_filter_keys(src_id)
+    dst_tk = _tab_filter_keys(dst_id)
+    # Filter keys
+    for lk in src_tk:
+        src_k = src_tk[lk]
+        dst_k = dst_tk[lk]
+        if src_k in st.session_state:
+            st.session_state[dst_k] = copy.deepcopy(st.session_state[src_k])
+    # Indicator filter values per ind
+    for ind in MAIN_IND_COLS:
+        sk = f"filt_vals_{src_id}_{ind}"
+        if sk in st.session_state:
+            st.session_state[f"filt_vals_{dst_id}_{ind}"] = copy.deepcopy(st.session_state[sk])
+    # filt_inds
+    sk = f"filt_inds_{src_id}"
+    if sk in st.session_state:
+        st.session_state[f"filt_inds_{dst_id}"] = copy.deepcopy(st.session_state[sk])
+    # Column filter sub-keys
+    for col in st.session_state.get(f"col_filt_cols_{src_id}", []):
+        for prefix in ["col_filt_catvals", "col_filt_op", "col_filt_numval"]:
+            sk = f"{prefix}_{src_id}_{col}"
+            if sk in st.session_state:
+                st.session_state[f"{prefix}_{dst_id}_{col}"] = copy.deepcopy(st.session_state[sk])
+    # Column group selection
+    for sfx in [f"val_cols_{src_id}", f"_val_cols_shadow_{src_id}"]:
+        if sfx in st.session_state:
+            st.session_state[sfx.replace(src_id, dst_id)] = copy.deepcopy(st.session_state[sfx])
+    # Sort + cust dates
+    for key in ["sort_col", "sort_dir", "cust_start", "cust_end"]:
+        sk = _tab_extra_ss(src_id, key)
+        if sk in st.session_state:
+            st.session_state[_tab_extra_ss(dst_id, key)] = copy.deepcopy(st.session_state[sk])
+
+
 def _actually_clear_filter_keys(tab_key: str) -> None:
     """Reset all filter session state keys for tab_key. Call before widgets render."""
     defaults = _TAB_FILTER_DEFAULTS.get(tab_key, {})
@@ -1892,7 +2000,8 @@ def _queue_filter_group(tab_key: str, group: dict) -> None:
 
 def _process_pending_ops() -> None:
     """Apply any pending filter/column ops. Must be called before any widgets render."""
-    for tab_key in list(_TAB_FILTER_KEYS.keys()):
+    _active_ids = [t["id"] for t in _load_prefs().get("scan_tabs", [{"id": "history"}])]
+    for tab_key in list(set(list(_TAB_FILTER_KEYS.keys()) + _active_ids)):
         # Filter pending ops
         clear_key = f"_pending_filt_clear_{tab_key}"
         group_key = f"_pending_filt_group_{tab_key}"
@@ -1944,8 +2053,9 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
     _loaded_key = f"filt_group_loaded_{tab_key}"
     if _loaded_key not in st.session_state:
         prefs = _load_prefs()
+        _migrate_filter_groups_global(prefs)
         fd = prefs.get("filter_default", {}).get(tab_key)
-        fg = prefs.get("filter_groups", {}).get(tab_key, {})
+        fg = prefs.get("filter_groups", {})
         st.session_state[_loaded_key] = True
         if fd and fd in fg:
             _queue_filter_group(tab_key, fg[fd])
@@ -2058,7 +2168,8 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
     # ── Custom filter groups manager ──────────────────────────────────────────
     with st.expander("Manage filter groups"):
         prefs = _load_prefs()
-        fg = prefs.setdefault("filter_groups", {}).setdefault(tab_key, {})
+        _migrate_filter_groups_global(prefs)
+        fg = prefs.setdefault("filter_groups", {})
         fd = prefs.get("filter_default", {}).get(tab_key)
         group_names = list(fg.keys())
 
@@ -2760,19 +2871,46 @@ _process_pending_ops()
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_history, tab_ai = st.tabs(["📊 Market Scan", "🤖 AI Analysis"])
+def render_scan_tab(tab_id: str) -> None:
+    """Render a full Market Scan tab for the given tab_id."""
+    _register_scan_tab(tab_id)
+    tk = _tab_filter_keys(tab_id)
 
+    # ── Tab rename / delete controls ─────────────────────────────────────────
+    _prefs_tabs = _load_prefs()
+    _scan_tabs_cfg = _prefs_tabs.get("scan_tabs", [{"id": "history", "name": "Market Scan"}])
+    _this_tab_cfg = next((t for t in _scan_tabs_cfg if t["id"] == tab_id), None)
+    _tab_display_name = _this_tab_cfg["name"] if _this_tab_cfg else tab_id
+    _can_delete = len(_scan_tabs_cfg) > 1
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1: Market Scan
-# ══════════════════════════════════════════════════════════════════════════════
+    with st.expander("⚙️ Tab settings", expanded=False):
+        _tc1, _tc2, _tc3 = st.columns([3, 1, 1])
+        with _tc1:
+            _new_tab_name = st.text_input(
+                "Tab name", value=_tab_display_name,
+                key=f"_tab_rename_input_{tab_id}",
+                label_visibility="collapsed",
+            )
+        with _tc2:
+            if st.button("Rename", key=f"_tab_rename_btn_{tab_id}"):
+                _nn = _new_tab_name.strip()
+                if _nn and _nn != _tab_display_name and _this_tab_cfg:
+                    _this_tab_cfg["name"] = _nn
+                    _save_prefs(_prefs_tabs)
+                    st.rerun()
+        with _tc3:
+            if st.button("🗑️ Delete tab", key=f"_tab_del_btn_{tab_id}",
+                         disabled=not _can_delete,
+                         help="Cannot delete the last remaining scan tab" if not _can_delete else ""):
+                _prefs_tabs["scan_tabs"] = [t for t in _scan_tabs_cfg if t["id"] != tab_id]
+                _save_prefs(_prefs_tabs)
+                st.rerun()
 
-with tab_history:
     all_dts = get_all_run_datetimes()
 
     if not all_dts:
         st.info("No historical data yet.")
-        st.stop()
+        return
 
     # ── Stale data warning ────────────────────────────────────────────────────
     _stale_n = st.session_state.get("_stale_count", 0)
@@ -2784,20 +2922,18 @@ with tab_history:
             icon="⚠️",
         )
 
-    # ── Market Scan Summary ───────────────────────────────────────────────────
-    st.markdown("### 📊 Market Scan")
     st.caption("Rows sorted: newest datetime first, then alphabetical ticker")
 
     # Pre-read widget states for data fetching before widget rendering
-    _f_tickers_pre   = st.session_state.get("hist_f_tick", [])
-    _f_dts_pre       = st.session_state.get("hist_f_dt", [])
-    _only_latest_pre = st.session_state.get("hist_only_latest", True)   # default True
-    _show_sub_pre    = st.session_state.get("all_queries_show_sub", False)
-    _f_sectors_pre   = st.session_state.get("hist_f_sector", [])
-    _mc_lo_pre       = st.session_state.get("hist_mc_lo", None)
-    _mc_hi_pre       = st.session_state.get("hist_mc_hi", None)
-    _cust_start_pre  = st.session_state.get("hist_cust_start", "").strip()
-    _cust_end_pre    = st.session_state.get("hist_cust_end", "").strip()
+    _f_tickers_pre   = st.session_state.get(tk["f_ticker_multi"], [])
+    _f_dts_pre       = st.session_state.get(tk["f_dt"], [])
+    _only_latest_pre = st.session_state.get(tk["only_latest"], True)
+    _show_sub_pre    = st.session_state.get(tk["show_sub"], False)
+    _f_sectors_pre   = st.session_state.get(tk["f_sector"], [])
+    _mc_lo_pre       = st.session_state.get(tk["mc_lo"], None)
+    _mc_hi_pre       = st.session_state.get(tk["mc_hi"], None)
+    _cust_start_pre  = st.session_state.get(_tab_extra_ss(tab_id, "cust_start"), "").strip()
+    _cust_end_pre    = st.session_state.get(_tab_extra_ss(tab_id, "cust_end"), "").strip()
 
     # ── Fetch rows ────────────────────────────────────────────────────────────
     filt_rows = get_all_summaries(
@@ -2806,7 +2942,6 @@ with tab_history:
     )
     total_before = len(filt_rows)
 
-    # Apply "latest only" using pre-read value
     if _only_latest_pre:
         _seen: dict[str, str] = {}
         for r in filt_rows:
@@ -2816,7 +2951,6 @@ with tab_history:
         filt_rows = [r for r in filt_rows
                      if r.get("analysis_datetime") == _seen.get(r["ticker"])]
 
-    # Apply mkt cap pre-filter (so sector options reflect mkt-cap-filtered set)
     if _mc_lo_pre is not None:
         filt_rows = [r for r in filt_rows
                      if _mkt_cap_b(r.get("market_cap")) is not None
@@ -2826,113 +2960,108 @@ with tab_history:
                      if _mkt_cap_b(r.get("market_cap")) is not None
                      and _mkt_cap_b(r.get("market_cap")) <= _mc_hi_pre]
 
-    # ── Fetch fund/tech data for filtered tickers ─────────────────────────────
-    _hist_tickers_pre = list({r["ticker"] for r in filt_rows})
-    hist_fund_map     = get_all_fundamentals_for_run(_hist_tickers_pre)
-    hist_tech_map     = get_tech_for_tickers(_hist_tickers_pre)
-    si_map_hist       = _extract_si(hist_fund_map)
-    ne_map_hist       = _extract_ne(hist_fund_map)
-    net_map_hist      = _extract_net(hist_fund_map)
-    company_map_hist  = _extract_company(hist_fund_map)
+    # ── Fetch fund/tech data ──────────────────────────────────────────────────
+    _tickers_pre   = list({r["ticker"] for r in filt_rows})
+    fund_map       = get_all_fundamentals_for_run(_tickers_pre)
+    tech_map       = get_tech_for_tickers(_tickers_pre)
+    si_map         = _extract_si(fund_map)
+    ne_map         = _extract_ne(fund_map)
+    net_map        = _extract_net(fund_map)
+    company_map    = _extract_company(fund_map)
 
-    # Build sector→industries cascade mapping
-    _s2i_h: dict[str, set[str]] = {}
-    for s, i in si_map_hist.values():
+    _s2i: dict[str, set[str]] = {}
+    for s, i in si_map.values():
         if s != "N/A" and i != "N/A":
-            _s2i_h.setdefault(s, set()).add(i)
-    all_sectors_h = sorted({s for s, _ in si_map_hist.values() if s != "N/A"})
+            _s2i.setdefault(s, set()).add(i)
+    all_sectors = sorted({s for s, _ in si_map.values() if s != "N/A"})
     if _f_sectors_pre:
-        avail_industries_h = sorted({i for s in _f_sectors_pre for i in _s2i_h.get(s, set())})
+        avail_industries = sorted({i for s in _f_sectors_pre for i in _s2i.get(s, set())})
     else:
-        avail_industries_h = sorted({i for _, i in si_map_hist.values() if i != "N/A"})
+        avail_industries = sorted({i for _, i in si_map.values() if i != "N/A"})
 
     # ── Row 1: ticker | datetime | sector | industry ──────────────────────────
     all_stored_tickers = get_all_tickers()
     fc1, fc2, fc3, fc4 = st.columns(4)
     with fc1:
         f_tickers = st.multiselect("Filter by Ticker", options=all_stored_tickers,
-                                   key="hist_f_tick")
+                                   key=tk["f_ticker_multi"])
     with fc2:
-        f_dts = st.multiselect("Filter by Datetime", options=all_dts, key="hist_f_dt")
+        f_dts = st.multiselect("Filter by Datetime", options=all_dts, key=tk["f_dt"])
     with fc3:
-        f_sectors_h = st.multiselect("Filter by Sector", options=all_sectors_h,
-                                     key="hist_f_sector")
+        f_sectors = st.multiselect("Filter by Sector", options=all_sectors,
+                                   key=tk["f_sector"])
     with fc4:
-        f_industries_h = st.multiselect("Filter by Industry", options=avail_industries_h,
-                                        key="hist_f_industry")
+        f_industries = st.multiselect("Filter by Industry", options=avail_industries,
+                                      key=tk["f_industry"])
 
     # ── Row 2: Mkt cap + custom period dates ──────────────────────────────────
     mc1, mc2, cp1, cp2 = st.columns(4)
     with mc1:
-        mc_lo_h = st.number_input("Mkt Cap min ($B)", value=None, min_value=0.0,
-                                  placeholder="no min", key="hist_mc_lo",
-                                  format="%.2f", step=1.0)
+        mc_lo = st.number_input("Mkt Cap min ($B)", value=None, min_value=0.0,
+                                placeholder="no min", key=tk["mc_lo"],
+                                format="%.2f", step=1.0)
     with mc2:
-        mc_hi_h = st.number_input("Mkt Cap max ($B)", value=None, min_value=0.0,
-                                  placeholder="no max", key="hist_mc_hi",
-                                  format="%.2f", step=1.0)
+        mc_hi = st.number_input("Mkt Cap max ($B)", value=None, min_value=0.0,
+                                placeholder="no max", key=tk["mc_hi"],
+                                format="%.2f", step=1.0)
     with cp1:
         _cust_start_val = st.text_input(
             "Custom Period Start (YYYY-MM-DD)", value="",
-            placeholder="e.g. 2024-01-01", key="hist_cust_start",
+            placeholder="e.g. 2024-01-01",
+            key=_tab_extra_ss(tab_id, "cust_start"),
         ).strip()
     with cp2:
         _cust_end_val = st.text_input(
             "Custom Period End (YYYY-MM-DD)", value="",
-            placeholder="e.g. 2024-12-31", key="hist_cust_end",
+            placeholder="e.g. 2024-12-31",
+            key=_tab_extra_ss(tab_id, "cust_end"),
         ).strip()
 
-    # ── Indicator filter — always visible ─────────────────────────────────────
-    hist_ind_filter, hist_col_filter = render_indicator_filter("history")
+    # ── Indicator filter ──────────────────────────────────────────────────────
+    ind_filter, col_filter = render_indicator_filter(tab_id)
 
-    # Apply remaining filters using current-run widget values
-    if f_sectors_h:
+    if f_sectors:
         filt_rows = [r for r in filt_rows
-                     if si_map_hist.get(r["ticker"], ("N/A",))[0] in f_sectors_h]
-    if f_industries_h:
+                     if si_map.get(r["ticker"], ("N/A",))[0] in f_sectors]
+    if f_industries:
         filt_rows = [r for r in filt_rows
-                     if si_map_hist.get(r["ticker"], ("N/A", "N/A"))[1] in f_industries_h]
+                     if si_map.get(r["ticker"], ("N/A", "N/A"))[1] in f_industries]
 
-    filt_rows = apply_indicator_filter(filt_rows, hist_ind_filter)
+    filt_rows = apply_indicator_filter(filt_rows, ind_filter)
 
-    # Build detail map (needed for col filter): use most-recent datetime per ticker
     _ticker_latest: dict[str, str] = {}
     for r in filt_rows:
         t  = r["ticker"]
         dt = r.get("analysis_datetime", "")
         if t not in _ticker_latest or dt > _ticker_latest[t]:
             _ticker_latest[t] = dt
-    hist_detail_map: dict = {}
+    detail_map: dict = {}
     for t, dt in _ticker_latest.items():
         t_det = get_detail_filtered(ticker=t, analysis_dt=dt)
         if t in t_det:
-            hist_detail_map[t] = t_det[t]
+            detail_map[t] = t_det[t]
 
-    # Apply column value filter
-    if hist_col_filter:
-        hist_rows_by_ticker_all = {r["ticker"]: r for r in filt_rows}
-        _hist_earnings_map = get_latest_earnings_for_tickers(
+    if col_filter:
+        _rows_by_ticker_all = {r["ticker"]: r for r in filt_rows}
+        _earnings_map_cf = get_latest_earnings_for_tickers(
             [r["ticker"] for r in filt_rows]
         ) if filt_rows else {}
-        _hist_pass = set(apply_col_filter(
-            [r["ticker"] for r in filt_rows], hist_col_filter, hist_detail_map,
-            hist_rows_by_ticker_all, hist_fund_map, hist_tech_map,
-            earnings_map=_hist_earnings_map,
+        _pass = set(apply_col_filter(
+            [r["ticker"] for r in filt_rows], col_filter, detail_map,
+            _rows_by_ticker_all, fund_map, tech_map,
+            earnings_map=_earnings_map_cf,
         ))
-        filt_rows = [r for r in filt_rows if r["ticker"] in _hist_pass]
+        filt_rows = [r for r in filt_rows if r["ticker"] in _pass]
 
-    # ── Pre-build value records for all-column sort support ───────────────────
-    _pre_rows_by_ticker = {r["ticker"]: r for r in filt_rows}
-    _pre_earnings_map   = get_latest_earnings_for_tickers(list(_pre_rows_by_ticker)) if filt_rows else {}
+    # ── Pre-build value records ───────────────────────────────────────────────
+    _rows_by_ticker = {r["ticker"]: r for r in filt_rows}
+    _earnings_map   = get_latest_earnings_for_tickers(list(_rows_by_ticker)) if filt_rows else {}
 
-    # ── Price-history returns (spot + rolling avg) ────────────────────────────
-    _ph_tickers = list(_pre_rows_by_ticker.keys())
+    _ph_tickers = list(_rows_by_ticker.keys())
     _ph_returns: dict[str, dict] = storage.compute_returns_for_tickers(_ph_tickers) if _ph_tickers else {}
 
-    # ── Custom period returns ─────────────────────────────────────────────────
     from datetime import date as _date, timedelta as _td
     _today_str = _date.today().isoformat()
-    # Default when blank: 22 trading days back (same reference as "1M Avg Px%")
     _cust_s = _cust_start_pre or storage.get_nth_trading_day_back(_ph_tickers, 22) or (
         _date.today() - _td(days=31)
     ).isoformat()
@@ -2944,47 +3073,46 @@ with tab_history:
     _pre_val_records: dict[str, dict] = {
         t: _build_value_record(
             t,
-            hist_detail_map.get(t, {}),
-            _pre_rows_by_ticker[t],
-            hist_fund_map.get(t, {}),
-            hist_tech_map.get(t, {}),
-            _pre_earnings_map.get(t),
+            detail_map.get(t, {}),
+            _rows_by_ticker[t],
+            fund_map.get(t, {}),
+            tech_map.get(t, {}),
+            _earnings_map.get(t),
             _ph_returns.get(t),
         )
-        for t in _pre_rows_by_ticker
+        for t in _rows_by_ticker
     }
 
     all_df = build_summary_df(filt_rows, show_sub=_show_sub_pre,
-                              include_datetime=True, si_map=si_map_hist,
-                              ne_map=ne_map_hist, net_map=net_map_hist,
-                              company_map=company_map_hist,
-                              tech_map=hist_tech_map)
+                              include_datetime=True, si_map=si_map,
+                              ne_map=ne_map, net_map=net_map,
+                              company_map=company_map,
+                              tech_map=tech_map)
 
-    # ── Sort controls + Find Ranking (shared: applies to both tables) ─────────
-    _sort_rank = pd.Series(dtype=int)  # default; populated below when df non-empty
+    # ── Sort controls ─────────────────────────────────────────────────────────
+    _sort_rank = pd.Series(dtype=int)
     if not all_df.empty:
         sc1, sc2, sc3 = st.columns([2, 1, 2])
         with sc1:
             _sort_col = st.selectbox(
                 "Sort by", _FILTERABLE_COLS,
                 index=_FILTERABLE_COLS.index("Score") if "Score" in _FILTERABLE_COLS else 0,
-                key="sort_col_history",
+                key=_tab_extra_ss(tab_id, "sort_col"),
             )
         with sc2:
             _sort_asc = st.radio(
-                "Order", ["Desc", "Asc"], key="sort_dir_history", horizontal=True,
+                "Order", ["Desc", "Asc"],
+                key=_tab_extra_ss(tab_id, "sort_dir"), horizontal=True,
             ) == "Asc"
         with sc3:
             _find_ticker = st.text_input(
-                "Find ranking", placeholder="e.g. AAPL", key="find_rank_history",
+                "Find ranking", placeholder="e.g. AAPL",
+                key=_tab_extra_ss(tab_id, "find_rank"),
             ).upper().strip()
 
-        # Sort using pre-built records (covers all value-table columns)
         _sort_vals = pd.Series({t: _pre_val_records.get(t, {}).get(_sort_col)
                                  for t in all_df["Ticker"]})
-        # Treat "N/A" and empty strings as missing so they always sort last regardless of direction
         _sort_vals = _sort_vals.replace({"N/A": None, "": None})
-        # Compute SQL RANK() (tied rows share same rank) before sorting
         _sort_rank = _sort_vals.rank(method="min", ascending=_sort_asc, na_option="bottom").astype(int)
         _sort_vals = _sort_vals.sort_values(ascending=_sort_asc, na_position="last")
         _sorted_tickers = list(_sort_vals.index)
@@ -2995,7 +3123,6 @@ with tab_history:
                   .drop(columns=["_si"])
                   .reset_index(drop=True))
 
-        # Auto-inject sort col into emoji table if not already present
         if _sort_col not in all_df.columns:
             all_df[_sort_col] = all_df["Ticker"].map(
                 lambda t: _pre_val_records.get(t, {}).get(_sort_col)
@@ -3012,21 +3139,20 @@ with tab_history:
             else:
                 st.warning(f"**{_find_ticker}** not found in current filtered results")
     else:
-        _sort_col = st.session_state.get("sort_col_history", "Score")
+        _sort_col = st.session_state.get(_tab_extra_ss(tab_id, "sort_col"), "Score")
         _sorted_tickers = []
 
-    # ── Row 8: Show sub-indicators | Latest per ticker | Showing X rows ───────
+    # ── Show sub-indicators | Latest per ticker | Row count ───────────────────
     row8c1, row8c2, row8c3 = st.columns(3)
     with row8c1:
         all_show_sub = st.checkbox("Show sub-indicators", value=False,
-                                   key="all_queries_show_sub")
+                                   key=tk["show_sub"])
     with row8c2:
         only_latest = st.checkbox("Latest entry per ticker only", value=True,
-                                  key="hist_only_latest")
+                                  key=tk["only_latest"])
     with row8c3:
         st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
 
-    # CSS: make user-note cells honour newline characters (\n → visual line break)
     st.markdown(
         """<style>
         .stDataEditor [col-id="Comments"] .ag-cell-value,
@@ -3052,7 +3178,6 @@ with tab_history:
     all_df_disp = all_df.set_index("Ticker") if "Ticker" in all_df.columns else all_df
     all_col_cfg = make_column_config(all_df_disp)
 
-    # Build column_order: #, Datetime, T1[-subs]-F6[-subs], Score, sort col, fixed right, rest
     _emoji_ind_cols: list[str] = []
     for _ind in MAIN_IND_COLS:
         if _ind in all_df_disp.columns:
@@ -3088,41 +3213,34 @@ with tab_history:
         column_order=_emoji_col_order,
         width="stretch", hide_index=False,
         height=600,
-        key="all_sum_editor",
+        key=_tab_extra_ss(tab_id, "emoji_editor"),
     )
-    if st.button("💾 Save", key="save_all"):
+    if st.button("💾 Save", key=_tab_extra_ss(tab_id, "save_all")):
         save_edits(filt_rows, all_edited, include_datetime=True)
         st.success("Saved.")
         st.rerun()
 
-    # AI Analysis button for filtered tickers
-    _hist_ai_tickers = list(dict.fromkeys(r["ticker"] for r in filt_rows))
-    _n_hist_ai = len(_hist_ai_tickers)
-    if _n_hist_ai > 0:
-        if st.button(
-            f"🤖 Run AI Analysis on {_n_hist_ai} filtered ticker(s)",
-            key="ai_run_history_btn",
-        ):
-            if _n_hist_ai > AI_MAX_TICKERS:
-                st.error(f"Too many tickers ({_n_hist_ai}). Max is {AI_MAX_TICKERS}.")
+    _ai_tickers = list(dict.fromkeys(r["ticker"] for r in filt_rows))
+    _n_ai = len(_ai_tickers)
+    if _n_ai > 0:
+        if st.button(f"🤖 Run AI Analysis on {_n_ai} filtered ticker(s)",
+                     key=_tab_extra_ss(tab_id, "ai_run")):
+            if _n_ai > AI_MAX_TICKERS:
+                st.error(f"Too many tickers ({_n_ai}). Max is {AI_MAX_TICKERS}.")
             else:
-                st.session_state["ai_confirm_pending"] = {"tickers": _hist_ai_tickers}
+                st.session_state["ai_confirm_pending"] = {"tickers": _ai_tickers}
                 st.rerun()
 
     st.markdown("---")
 
     # ── Value Table ───────────────────────────────────────────────────────────
-    # Use sorted order from emoji table so both tables share the same ranking
-    hist_tickers = (
-        _sorted_tickers if _sorted_tickers
-        else [r["ticker"] for r in filt_rows]
-    )
-    render_value_table(hist_tickers, hist_detail_map,
-                       _pre_rows_by_ticker, hist_fund_map, "history",
-                       tech_map=hist_tech_map,
+    hist_tickers = _sorted_tickers if _sorted_tickers else [r["ticker"] for r in filt_rows]
+    render_value_table(hist_tickers, detail_map,
+                       _rows_by_ticker, fund_map, tab_id,
+                       tech_map=tech_map,
                        sort_col=_sort_col,
                        pre_built_records=_pre_val_records,
-                       pre_built_earnings=_pre_earnings_map,
+                       pre_built_earnings=_earnings_map,
                        rank_map=dict(_sort_rank) if not _sort_rank.empty else None,
                        returns_map=_ph_returns)
 
@@ -3132,37 +3250,33 @@ with tab_history:
     st.markdown("### 🔍 Detail by Analysis Run")
     st.caption("Ticker dropdown filters to datetimes for that ticker, and vice versa")
 
-    # Read current selections to compute dependent options
-    cur_ticker = st.session_state.get("det_ticker", "")
-    cur_dt     = st.session_state.get("det_dt", "")
+    cur_ticker = st.session_state.get(_tab_extra_ss(tab_id, "det_ticker"), "")
+    cur_dt     = st.session_state.get(_tab_extra_ss(tab_id, "det_dt"), "")
 
-    # Compute filtered options based on the other field's current value
     avail_dts     = get_datetimes_for_ticker(cur_ticker) if cur_ticker else all_dts
     avail_tickers = get_tickers_for_datetime(cur_dt)     if cur_dt     else all_stored_tickers
 
-    # Reset the other field if its stored value is no longer valid
     if cur_dt and cur_dt not in avail_dts:
-        st.session_state["det_dt"] = ""
+        st.session_state[_tab_extra_ss(tab_id, "det_dt")] = ""
         cur_dt = ""
         avail_dts = get_datetimes_for_ticker(cur_ticker) if cur_ticker else all_dts
     if cur_ticker and cur_ticker not in avail_tickers:
-        st.session_state["det_ticker"] = ""
+        st.session_state[_tab_extra_ss(tab_id, "det_ticker")] = ""
         cur_ticker = ""
         avail_tickers = get_tickers_for_datetime(cur_dt) if cur_dt else all_stored_tickers
 
     dcol1, dcol2 = st.columns(2)
     with dcol1:
         det_ticker = st.selectbox("Ticker (optional)", options=[""] + avail_tickers,
-                                  key="det_ticker")
+                                  key=_tab_extra_ss(tab_id, "det_ticker"))
     with dcol2:
         det_dt = st.selectbox("Datetime (optional)", options=[""] + avail_dts,
-                              key="det_dt")
+                              key=_tab_extra_ss(tab_id, "det_dt"))
 
     det_ticker_val = det_ticker if det_ticker else None
     det_dt_val     = det_dt     if det_dt     else None
 
     if det_ticker_val and not det_dt_val:
-        # Show all records for this ticker, one section per datetime
         dts = get_datetimes_for_ticker(det_ticker_val)
         if not dts:
             st.info(f"No data found for {det_ticker_val}.")
@@ -3171,24 +3285,93 @@ with tab_history:
             render_detail_for_tickers(
                 [det_ticker_val], det_map,
                 dt_label=dt,
-                state_key=f"history_{det_ticker_val}_{dt}",
+                state_key=f"{tab_id}_{det_ticker_val}_{dt}",
             )
     elif det_ticker_val and det_dt_val:
         det_map = get_detail_filtered(ticker=det_ticker_val, analysis_dt=det_dt_val)
         render_detail_for_tickers(
             [det_ticker_val], det_map,
             dt_label=det_dt_val,
-            state_key=f"history_{det_ticker_val}_{det_dt_val}",
+            state_key=f"{tab_id}_{det_ticker_val}_{det_dt_val}",
         )
     elif det_dt_val:
         det_map = get_detail_filtered(analysis_dt=det_dt_val)
         render_detail_for_tickers(
             sorted(det_map.keys()), det_map,
-            state_key=f"history_dt_{det_dt_val}",
+            state_key=f"{tab_id}_dt_{det_dt_val}",
         )
     else:
         st.info("Select a ticker and/or datetime above to view detail.")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab management helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_scan_tabs() -> list[dict]:
+    prefs = _load_prefs()
+    tabs = prefs.get("scan_tabs", [])
+    if not tabs:
+        tabs = [{"id": "history", "name": "Market Scan"}]
+        prefs["scan_tabs"] = tabs
+        _save_prefs(prefs)
+    return tabs
+
+
+def _add_scan_tab() -> None:
+    prefs = _load_prefs()
+    tabs  = prefs.get("scan_tabs", [{"id": "history", "name": "Market Scan"}])
+    if len(tabs) >= 5:
+        return
+    existing_nums = set()
+    for t in tabs:
+        if t["id"].startswith("scan_"):
+            try:
+                existing_nums.add(int(t["id"].split("_")[1]))
+            except ValueError:
+                pass
+    n = 2
+    while n in existing_nums:
+        n += 1
+    new_id   = f"scan_{n}"
+    new_name = f"Market Scan {n}"
+    tabs.append({"id": new_id, "name": new_name})
+    prefs["scan_tabs"] = tabs
+    _save_prefs(prefs)
+    _register_scan_tab(new_id)
+    _copy_tab_settings("history", new_id)
+
+
+# ── Register all saved tabs at startup ────────────────────────────────────────
+for _saved_tab in _get_scan_tabs():
+    _register_scan_tab(_saved_tab["id"])
+
+# ── Dynamic tabs ──────────────────────────────────────────────────────────────
+_scan_tabs_list = _get_scan_tabs()
+
+# + button row above the tabs
+_plus_col_l, _plus_col_r = st.columns([9, 1])
+with _plus_col_r:
+    if st.button("＋", key="_add_tab_btn",
+                 disabled=len(_scan_tabs_list) >= 5,
+                 help="Add a new Market Scan tab (max 5)" if len(_scan_tabs_list) < 5 else "Maximum 5 tabs"):
+        _add_scan_tab()
+        st.rerun()
+
+_all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + ["🤖 AI Analysis"]
+_all_tab_widgets = st.tabs(_all_tab_labels)
+_scan_tab_widgets = _all_tab_widgets[:-1]
+tab_ai = _all_tab_widgets[-1]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Market Scan tabs (dynamic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+for _scan_tab_widget, _scan_tab_cfg in zip(_scan_tab_widgets, _scan_tabs_list):
+    with _scan_tab_widget:
+        st.markdown(f"### 📊 {_scan_tab_cfg['name']}")
+        render_scan_tab(_scan_tab_cfg["id"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: AI Analysis
