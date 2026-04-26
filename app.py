@@ -48,6 +48,9 @@ from peers_fetcher import get_peer_valuations, clear_peer_cache
 import vpn_switcher
 from indicators    import evaluate_all, score_indicators
 import storage
+import trigger_engine
+from trigger_engine import TRIG_FIELD_OPTIONS, TRIG_FIELD_DISPLAY, TRIG_OP_OPTIONS
+from column_catalog import render_column_reference_tab
 from storage import (
     init_db, save_results, update_field, save_comment_for_ticker, save_status_for_ticker,
     save_user_field_for_ticker,
@@ -75,6 +78,8 @@ STATUS_OPTIONS = ["", "必買", "買", "等", "研究", "X"]
 TICKERS_FILE = Path(__file__).parent / "tickers.txt"
 
 # ── Value table column groups ──────────────────────────────────────────────────
+# IMPORTANT: Keep column_catalog.py in sync — update it whenever you add,
+# rename, or remove columns here or in _build_value_record().
 VALUE_COL_GROUPS: dict[str, list[str]] = {
     "User": ["Status"],
     # ── Indicator-derived groups (from analysis detail JSON) ──────────────────
@@ -109,6 +114,10 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     "Custom Period Returns": [
         "Cust Px%", "Cust Vol%", "Cust Avg Px%", "Cust Avg Vol%",
     ],
+    "Trigger Returns": [
+        "Trig Px%", "Trig Vol%", "Trig Avg Px%", "Trig Avg Vol%",
+        "Trig Start Date", "Trig End Date",
+    ],
     "MA Checks (T3)": [
         "MA10>20", "MA20>50", "MA50>150", "MA150>200",
     ],
@@ -142,7 +151,37 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "Earns 5D Roll Px%", "Earns 5D Roll Vol%",
         "Post-Earns Px%", "Post-Earns Vol%", "Post-Earns Avg Px%", "Post-Earns Avg Vol%",
     ],
-    "Score": ["Score"],
+    "Score": ["T Score", "F Score", "Score"],
+    "Extended Valuation": [
+        "Beta", "Trailing PE", "Trailing EPS", "Forward EPS", "PEG Ratio", "Trailing PEG",
+        "Div Yield%", "Div Rate", "Payout Ratio%",
+        "Enterprise Value ($B)", "EV/EBITDA", "EV/Revenue",
+        "Revenue/Share", "Cash/Share", "Book Value/Share",
+        "Insiders%", "Institutions%",
+        "Total Cash ($B)", "Total Debt ($B)", "FCF Spot ($B)",
+    ],
+    "Avg $Vol / Mkt Cap": [
+        "Avg $Vol 20D / Mkt Cap%", "Avg $Vol 50D / Mkt Cap%",
+    ],
+    "Income Statement": [
+        "Q Gross Profit ($B)", "A Gross Profit ($B)", "Q Gross Profit YoY%", "A Gross Profit YoY%",
+        "Q Op Income ($B)", "A Op Income ($B)", "Q Op Income YoY%", "A Op Income YoY%",
+        "Q Net Income ($B)", "A Net Income ($B)", "Q Net Income YoY%", "A Net Income YoY%",
+        "Q EBITDA ($B)", "A EBITDA ($B)", "Q EBITDA YoY%", "A EBITDA YoY%",
+        "Q R&D ($B)", "A R&D ($B)", "Q R&D YoY%", "A R&D YoY%",
+    ],
+    "Cash Flow": [
+        "Q OCF ($B)", "A OCF ($B)", "Q OCF YoY%", "A OCF YoY%",
+        "Q FCF ($B)", "A FCF ($B)", "Q FCF YoY%", "A FCF YoY%",
+        "Q CapEx ($B)", "A CapEx ($B)", "Q CapEx YoY%", "A CapEx YoY%",
+    ],
+    "Balance Sheet": [
+        "Q Total Debt ($B)", "A Total Debt ($B)", "Q Total Debt YoY%", "A Total Debt YoY%",
+        "Q Net Debt ($B)", "A Net Debt ($B)", "Q Net Debt YoY%", "A Net Debt YoY%",
+        "Q Cash ($B)", "A Cash ($B)", "Q Cash YoY%", "A Cash YoY%",
+        "Q Working Cap ($B)", "A Working Cap ($B)", "Q Working Cap YoY%", "A Working Cap YoY%",
+        "Q Total Assets ($B)", "A Total Assets ($B)", "Q Total Assets YoY%", "A Total Assets YoY%",
+    ],
     "Short Interest": [
         "Short % Float (Y)", "Short % Float (Calc)",
         "Short % Out (Y)", "Short % Out (Calc)", "Short % Impl Out",
@@ -164,10 +203,27 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     ],
     # ── tech_indicators groups ─────────────────────────────────────────────────
     "Price & 52W": [
-        "Last Close Date", "Close", "Change %", "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
+        "Last Close Date", "Close", "Change %", "1D Vol%",
+        "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
+    ],
+    "52W & Historical High/Low": [
+        "52W High Close", "From 52W High Close%", "Days Since 52W High",
+        "52W Low Close",  "From 52W Low Close%",  "Days Since 52W Low",
+        "3Y High Close",  "From 3Y High Close%",
+        "3Y Low Close",   "From 3Y Low Close%",
+        "5D High Now", "22D High Now", "52W High Now",
+        "5D Low Now",  "22D Low Now",  "52W Low Now",
+    ],
+    "Price vs MA (%)": [
+        "From SMA10%", "From SMA20%", "From SMA50%", "From SMA150%", "From SMA200%",
+        "From EMA9%", "From EMA21%", "From EMA50%", "From EMA200%",
+    ],
+    "MA Slopes": [
+        "SMA10 Slope 10D", "SMA20 Slope 10D", "SMA50 Slope 20D",
+        "SMA150 Slope 20D", "SMA200 Slope 20D",
     ],
     "EMA & Slope": [
-        "EMA9", "EMA21", "EMA50", "EMA200", "SMA50 Slope 20D", "From SMA200%",
+        "EMA9", "EMA21", "EMA50", "EMA200",
     ],
     "Momentum": [
         "RSI14", "MACD Line", "MACD Signal", "MACD Hist", "Stoch K", "Stoch D",
@@ -176,19 +232,25 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "BB Upper", "BB Middle", "BB Lower", "BB %B",
     ],
     "Volatility": [
-        "ATR14", "ATR%", "ADX14", "+DI", "-DI", "RVol 20D%", "RVol 60D%",
+        "ATR14", "ATR%", "ADX14", "+DI", "-DI", "Real Vol 20D%", "Real Vol 60D%",
     ],
     "Drawdown": [
         "Max DD 63D%", "Max DD 252D%",
     ],
     "Volume": [
-        "OBV", "CMF20", "AD Line", "Avg $Vol 20D", "Avg $Vol 50D", "Med Vol 50D",
+        "OBV", "CMF20", "AD Line",
+        "Avg $Vol 20D", "Avg $Vol 50D", "Med Vol 50D",
+        "Rel Vol 20D", "Rel Vol 50D", "Up/Dn Vol Ratio 20D",
     ],
     "Donchian": [
         "Don High 20", "Don Low 20", "Don High 55", "Don Low 55",
         "Don High 252", "Don Low 252",
         "From 20D High%", "From 55D High%", "From 252D High%",
         "Breakout 55D", "Breakout 3M",
+    ],
+    "Swing Points": [
+        "Swing High", "Swing High Date", "From Swing High%",
+        "Swing Low", "Swing Low Date", "From Swing Low%",
     ],
     "Rolling Stats 3M": [
         "Up Days 3M", "Down Days 3M", "UD Ratio 3M", "Max Win Str 3M", "Win Str 5% 3M",
@@ -245,8 +307,8 @@ TECH_COL_MAP: dict[str, str] = {
     "adx14":               "ADX14",
     "plus_di":             "+DI",
     "minus_di":            "-DI",
-    "realized_vol_20d":    "RVol 20D%",
-    "realized_vol_60d":    "RVol 60D%",
+    "realized_vol_20d":    "Real Vol 20D%",
+    "realized_vol_60d":    "Real Vol 60D%",
     "max_drawdown_63d":    "Max DD 63D%",
     "max_drawdown_252d":   "Max DD 252D%",
     "obv":                 "OBV",
@@ -291,6 +353,45 @@ TECH_COL_MAP: dict[str, str] = {
     "as_of_date":          "Last Close Date",
     "is_finalized":        "Finalized",
     "daily_pct_change":    "Change %",
+    "daily_vol_pct":       "1D Vol%",
+    "pct_from_sma10":      "From SMA10%",
+    "pct_from_sma20":      "From SMA20%",
+    "pct_from_sma50":      "From SMA50%",
+    "pct_from_sma150":     "From SMA150%",
+    "pct_from_ema9":       "From EMA9%",
+    "pct_from_ema21":      "From EMA21%",
+    "pct_from_ema50":      "From EMA50%",
+    "pct_from_ema200":     "From EMA200%",
+    "sma10_slope_10d":     "SMA10 Slope 10D",
+    "sma20_slope_10d":     "SMA20 Slope 10D",
+    "sma150_slope_20d":    "SMA150 Slope 20D",
+    "sma200_slope_20d":    "SMA200 Slope 20D",
+    "rel_vol_20d":         "Rel Vol 20D",
+    "rel_vol_50d":         "Rel Vol 50D",
+    "up_down_vol_ratio_20d": "Up/Dn Vol Ratio 20D",
+    "swing_high":          "Swing High",
+    "swing_high_date":     "Swing High Date",
+    "swing_low":           "Swing Low",
+    "swing_low_date":      "Swing Low Date",
+    "pct_from_swing_high": "From Swing High%",
+    "pct_from_swing_low":  "From Swing Low%",
+    # Close-based 52W & historical
+    "high_close_52w":          "52W High Close",
+    "low_close_52w":           "52W Low Close",
+    "pct_from_high_close_52w": "From 52W High Close%",
+    "pct_from_low_close_52w":  "From 52W Low Close%",
+    "high_close_3y":           "3Y High Close",
+    "low_close_3y":            "3Y Low Close",
+    "pct_from_high_close_3y":  "From 3Y High Close%",
+    "pct_from_low_close_3y":   "From 3Y Low Close%",
+    "days_since_52w_high":     "Days Since 52W High",
+    "days_since_52w_low":      "Days Since 52W Low",
+    "made_high_5d":            "5D High Now",
+    "made_high_22d":           "22D High Now",
+    "made_high_252d":          "52W High Now",
+    "made_low_5d":             "5D Low Now",
+    "made_low_22d":            "22D Low Now",
+    "made_low_252d":           "52W Low Now",
 }
 # Reverse map: display name → tech_indicators field
 TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
@@ -299,6 +400,8 @@ TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
 TECH_BOOL_COLS = {
     "Breakout 55D", "Breakout 3M",
     "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
+    "5D High Now", "22D High Now", "52W High Now",
+    "5D Low Now",  "22D Low Now",  "52W Low Now",
     "Finalized",
 }
 
@@ -331,7 +434,7 @@ _COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
     "Next Earnings Time":  ["BMO", "AMC"],
     "Status":              ["", "必買", "買", "等", "研究", "X"],
 }
-_COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date"}
+_COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date", "Swing High Date", "Swing Low Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
 # All user-filterable value columns (ordered, deduplicated)
 _FILTERABLE_COLS  = [c for c in ALL_VALUE_COLS if c not in _COL_FILTER_SKIP]
@@ -421,13 +524,13 @@ def _ss(key, default):
     if key not in st.session_state:
         st.session_state[key] = default
 
-_ss("last_analysis_dt",  None)
-_ss("last_tickers",      [])
-_ss("last_detail_map",   {})
-_ss("scan_thread",       None)
-_ss("scan_pause_event",  None)
-_ss("scan_stop_event",   None)
-_ss("scan_progress",     {})
+_ss("last_analysis_dt",       None)
+_ss("last_tickers",           [])
+_ss("last_detail_map",        {})
+_ss("scan_thread",            None)
+_ss("scan_pause_event",       None)
+_ss("scan_stop_event",        None)
+_ss("scan_progress",          {})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -516,6 +619,33 @@ def compute_score(row: dict) -> float:
               "F3_sub_q_rev_yoy", "F3_sub_q_eps_yoy", "F4_sub_a_rev_yoy", "F4_sub_a_eps_yoy"):
         if p(c): s += 5
     # F5, F6 main indicators (each 5)
+    for c in ("F5", "F6"):
+        if p(c): s += 5
+    return s
+
+
+def compute_tech_score(row: dict) -> float:
+    """Compute 0–50 technical score (T1–T4 only)."""
+    def p(col): return str(row.get(col, "NA")).upper() == "PASS"
+    s = 0.0
+    if p("T1_sub_3m_price"):  s += 2.5 + (2.5 if p("T1_sub_3m_vol") else 0)
+    if p("T1_sub_12m_price"): s += 2.5 + (2.5 if p("T1_sub_12m_vol") else 0)
+    if p("T2_sub_3m_price"):  s += 2.5 + (2.5 if p("T2_sub_3m_vol") else 0)
+    if p("T2_sub_12m_price"): s += 2.5 + (2.5 if p("T2_sub_12m_vol") else 0)
+    for c in ("T3_sub_ma10_20", "T3_sub_ma20_50", "T3_sub_ma50_150", "T3_sub_ma150_200"):
+        if p(c): s += 5
+    for c in ("T4_sub_has_big_up", "T4_sub_no_big_down"):
+        if p(c): s += 5
+    return s
+
+
+def compute_fund_score(row: dict) -> float:
+    """Compute 0–50 fundamental score (F1–F6 only)."""
+    def p(col): return str(row.get(col, "NA")).upper() == "PASS"
+    s = 0.0
+    for c in ("F1_sub_q_rev", "F1_sub_q_eps", "F2_sub_a_rev", "F2_sub_a_eps",
+              "F3_sub_q_rev_yoy", "F3_sub_q_eps_yoy", "F4_sub_a_rev_yoy", "F4_sub_a_eps_yoy"):
+        if p(c): s += 5
     for c in ("F5", "F6"):
         if p(c): s += 5
     return s
@@ -649,6 +779,8 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "technical -ve":   row.get("tech_neg") or "",
         "fundamental -ve": row.get("fund_neg") or "",
         "Score":           compute_score(row),
+        "T Score":         compute_tech_score(row),
+        "F Score":         compute_fund_score(row),
         # T1 — daily comparisons (float %) — renamed from "3M Daily Px%" etc.
         "3M Avg Px%":    _f(t1.get("3M Price Change %")),
         "3M Avg Vol%":   _f(t1.get("3M Volume Change %")),
@@ -776,6 +908,49 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "Last Close Date":  str(tc.get("as_of_date") or "N/A"),
         "Finalized":        _bi(tc.get("is_finalized")),
         "Change %":         _f(tc.get("daily_pct_change")),
+        "1D Vol%":          _f(tc.get("daily_vol_pct")),
+        # Price vs MA distances
+        "From SMA10%":      _f(tc.get("pct_from_sma10")),
+        "From SMA20%":      _f(tc.get("pct_from_sma20")),
+        "From SMA50%":      _f(tc.get("pct_from_sma50")),
+        "From SMA150%":     _f(tc.get("pct_from_sma150")),
+        "From EMA9%":       _f(tc.get("pct_from_ema9")),
+        "From EMA21%":      _f(tc.get("pct_from_ema21")),
+        "From EMA50%":      _f(tc.get("pct_from_ema50")),
+        "From EMA200%":     _f(tc.get("pct_from_ema200")),
+        # MA slopes
+        "SMA10 Slope 10D":  _f(tc.get("sma10_slope_10d")),
+        "SMA20 Slope 10D":  _f(tc.get("sma20_slope_10d")),
+        "SMA150 Slope 20D": _f(tc.get("sma150_slope_20d")),
+        "SMA200 Slope 20D": _f(tc.get("sma200_slope_20d")),
+        # Relative volume & up/down vol ratio
+        "Rel Vol 20D":           _f(tc.get("rel_vol_20d")),
+        "Rel Vol 50D":           _f(tc.get("rel_vol_50d")),
+        "Up/Dn Vol Ratio 20D":   _f(tc.get("up_down_vol_ratio_20d")),
+        # Swing high/low
+        "Swing High":       _f(tc.get("swing_high")),
+        "Swing High Date":  str(tc.get("swing_high_date") or "N/A"),
+        "Swing Low":        _f(tc.get("swing_low")),
+        "Swing Low Date":   str(tc.get("swing_low_date") or "N/A"),
+        "From Swing High%": _f(tc.get("pct_from_swing_high")),
+        "From Swing Low%":  _f(tc.get("pct_from_swing_low")),
+        # Close-based 52W & historical high/low
+        "52W High Close":       _f(tc.get("high_close_52w")),
+        "52W Low Close":        _f(tc.get("low_close_52w")),
+        "From 52W High Close%": _f(tc.get("pct_from_high_close_52w")),
+        "From 52W Low Close%":  _f(tc.get("pct_from_low_close_52w")),
+        "3Y High Close":        _f(tc.get("high_close_3y")),
+        "3Y Low Close":         _f(tc.get("low_close_3y")),
+        "From 3Y High Close%":  _f(tc.get("pct_from_high_close_3y")),
+        "From 3Y Low Close%":   _f(tc.get("pct_from_low_close_3y")),
+        "Days Since 52W High":  tc.get("days_since_52w_high"),
+        "Days Since 52W Low":   tc.get("days_since_52w_low"),
+        "5D High Now":   _bi(tc.get("made_high_5d")),
+        "22D High Now":  _bi(tc.get("made_high_22d")),
+        "52W High Now":  _bi(tc.get("made_high_252d")),
+        "5D Low Now":    _bi(tc.get("made_low_5d")),
+        "22D Low Now":   _bi(tc.get("made_low_22d")),
+        "52W Low Now":   _bi(tc.get("made_low_252d")),
     }
     # ── Earnings columns (from earnings_history) ──────────────────────────────
     e = earnings or {}
@@ -885,6 +1060,108 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     # Custom period
     for col in ("Cust Px%", "Cust Vol%", "Cust Avg Px%", "Cust Avg Vol%"):
         rec[col] = _f(ph.get(col))
+    # Trigger-based columns (injected via ph dict from trigger_returns)
+    for col in ("Trig Px%", "Trig Vol%", "Trig Avg Px%", "Trig Avg Vol%"):
+        rec[col] = _f(ph.get(col))
+    for col in ("Trig Start Date", "Trig End Date"):
+        rec[col] = ph.get(col) or "N/A"
+
+    # ── Extended valuation (from fundamentals DB) ─────────────────────────────
+    def _b(v):  # raw value → $B (2dp)
+        f = _f(v)
+        return round(f / 1e9, 2) if f is not None else None
+
+    rec["Beta"]                   = _f(f_db.get("beta"))
+    rec["Trailing PE"]            = _f(f_db.get("trailing_pe"))
+    rec["Trailing EPS"]           = _f(f_db.get("trailing_eps"))
+    rec["Forward EPS"]            = _f(f_db.get("forward_eps"))
+    rec["PEG Ratio"]              = _f(f_db.get("peg_ratio"))
+    rec["Trailing PEG"]           = _f(f_db.get("trailing_peg"))
+    rec["Div Yield%"]             = round(_f(f_db.get("dividend_yield")) * 100, 4) \
+                                    if f_db.get("dividend_yield") else None
+    rec["Div Rate"]               = _f(f_db.get("dividend_rate"))
+    rec["Payout Ratio%"]          = round(_f(f_db.get("payout_ratio")) * 100, 4) \
+                                    if f_db.get("payout_ratio") else None
+    rec["Enterprise Value ($B)"]  = _b(f_db.get("enterprise_value"))
+    rec["EV/EBITDA"]              = _f(f_db.get("ev_to_ebitda"))
+    rec["EV/Revenue"]             = _f(f_db.get("ev_to_revenue"))
+    rec["Revenue/Share"]          = _f(f_db.get("revenue_per_share"))
+    rec["Cash/Share"]             = _f(f_db.get("total_cash_per_share"))
+    rec["Book Value/Share"]       = _f(f_db.get("book_value_per_share"))
+    rec["Insiders%"]              = round(_f(f_db.get("held_pct_insiders")) * 100, 4) \
+                                    if f_db.get("held_pct_insiders") else None
+    rec["Institutions%"]          = round(_f(f_db.get("held_pct_institutions")) * 100, 4) \
+                                    if f_db.get("held_pct_institutions") else None
+    rec["Total Cash ($B)"]        = _b(f_db.get("total_cash"))
+    rec["Total Debt ($B)"]        = _b(f_db.get("total_debt_spot"))
+    rec["FCF Spot ($B)"]          = _b(f_db.get("fcf_spot"))
+
+    # ── Avg $Vol / Mkt Cap% ────────────────────────────────────────────────────
+    mkt_cap_raw = _f(row.get("market_cap") or f_db.get("market_cap"))
+    avg_dvol_20 = _f(tc.get("avg_dollar_vol_20d"))
+    avg_dvol_50 = _f(tc.get("avg_dollar_vol_50d"))
+    rec["Avg $Vol 20D / Mkt Cap%"] = round(avg_dvol_20 / mkt_cap_raw * 100, 4) \
+                                      if avg_dvol_20 and mkt_cap_raw else None
+    rec["Avg $Vol 50D / Mkt Cap%"] = round(avg_dvol_50 / mkt_cap_raw * 100, 4) \
+                                      if avg_dvol_50 and mkt_cap_raw else None
+
+    # ── Income statement Q+A ──────────────────────────────────────────────────
+    rec["Q Gross Profit ($B)"]    = _b(f_db.get("q_gross_profit"))
+    rec["A Gross Profit ($B)"]    = _b(f_db.get("a_gross_profit"))
+    rec["Q Gross Profit YoY%"]    = _f(f_db.get("q_gross_profit_yoy"))
+    rec["A Gross Profit YoY%"]    = _f(f_db.get("a_gross_profit_yoy"))
+    rec["Q Op Income ($B)"]       = _b(f_db.get("q_op_income"))
+    rec["A Op Income ($B)"]       = _b(f_db.get("a_op_income"))
+    rec["Q Op Income YoY%"]       = _f(f_db.get("q_op_income_yoy"))
+    rec["A Op Income YoY%"]       = _f(f_db.get("a_op_income_yoy"))
+    rec["Q Net Income ($B)"]      = _b(f_db.get("q_net_income"))
+    rec["A Net Income ($B)"]      = _b(f_db.get("a_net_income"))
+    rec["Q Net Income YoY%"]      = _f(f_db.get("q_net_income_yoy"))
+    rec["A Net Income YoY%"]      = _f(f_db.get("a_net_income_yoy"))
+    rec["Q EBITDA ($B)"]          = _b(f_db.get("q_ebitda"))
+    rec["A EBITDA ($B)"]          = _b(f_db.get("a_ebitda"))
+    rec["Q EBITDA YoY%"]          = _f(f_db.get("q_ebitda_yoy"))
+    rec["A EBITDA YoY%"]          = _f(f_db.get("a_ebitda_yoy"))
+    rec["Q R&D ($B)"]             = _b(f_db.get("q_rd"))
+    rec["A R&D ($B)"]             = _b(f_db.get("a_rd"))
+    rec["Q R&D YoY%"]             = _f(f_db.get("q_rd_yoy"))
+    rec["A R&D YoY%"]             = _f(f_db.get("a_rd_yoy"))
+
+    # ── Cash flow Q+A ─────────────────────────────────────────────────────────
+    rec["Q OCF ($B)"]             = _b(f_db.get("q_ocf"))
+    rec["A OCF ($B)"]             = _b(f_db.get("a_ocf"))
+    rec["Q OCF YoY%"]             = _f(f_db.get("q_ocf_yoy"))
+    rec["A OCF YoY%"]             = _f(f_db.get("a_ocf_yoy"))
+    rec["Q FCF ($B)"]             = _b(f_db.get("q_fcf"))
+    rec["A FCF ($B)"]             = _b(f_db.get("a_fcf"))
+    rec["Q FCF YoY%"]             = _f(f_db.get("q_fcf_yoy"))
+    rec["A FCF YoY%"]             = _f(f_db.get("a_fcf_yoy"))
+    rec["Q CapEx ($B)"]           = _b(f_db.get("q_capex"))
+    rec["A CapEx ($B)"]           = _b(f_db.get("a_capex"))
+    rec["Q CapEx YoY%"]           = _f(f_db.get("q_capex_yoy"))
+    rec["A CapEx YoY%"]           = _f(f_db.get("a_capex_yoy"))
+
+    # ── Balance sheet Q+A ─────────────────────────────────────────────────────
+    rec["Q Total Debt ($B)"]      = _b(f_db.get("q_total_debt"))
+    rec["A Total Debt ($B)"]      = _b(f_db.get("a_total_debt"))
+    rec["Q Total Debt YoY%"]      = _f(f_db.get("q_total_debt_yoy"))
+    rec["A Total Debt YoY%"]      = _f(f_db.get("a_total_debt_yoy"))
+    rec["Q Net Debt ($B)"]        = _b(f_db.get("q_net_debt"))
+    rec["A Net Debt ($B)"]        = _b(f_db.get("a_net_debt"))
+    rec["Q Net Debt YoY%"]        = _f(f_db.get("q_net_debt_yoy"))
+    rec["A Net Debt YoY%"]        = _f(f_db.get("a_net_debt_yoy"))
+    rec["Q Cash ($B)"]            = _b(f_db.get("q_cash"))
+    rec["A Cash ($B)"]            = _b(f_db.get("a_cash"))
+    rec["Q Cash YoY%"]            = _f(f_db.get("q_cash_yoy"))
+    rec["A Cash YoY%"]            = _f(f_db.get("a_cash_yoy"))
+    rec["Q Working Cap ($B)"]     = _b(f_db.get("q_working_cap"))
+    rec["A Working Cap ($B)"]     = _b(f_db.get("a_working_cap"))
+    rec["Q Working Cap YoY%"]     = _f(f_db.get("q_working_cap_yoy"))
+    rec["A Working Cap YoY%"]     = _f(f_db.get("a_working_cap_yoy"))
+    rec["Q Total Assets ($B)"]    = _b(f_db.get("q_total_assets"))
+    rec["A Total Assets ($B)"]    = _b(f_db.get("a_total_assets"))
+    rec["Q Total Assets YoY%"]    = _f(f_db.get("q_total_assets_yoy"))
+    rec["A Total Assets YoY%"]    = _f(f_db.get("a_total_assets_yoy"))
 
     return rec
 
@@ -1105,6 +1382,54 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
             if vpn_rotate and not stop_event.is_set() and not vpn_switched_this_batch:
                 _do_vpn_switch("Batch complete")
 
+    # ── Auto re-scan: recover tickers with missing F1-F6 data ────────────────
+    if not stop_event.is_set():
+        missing_f6 = storage.get_tickers_missing_f1f6(analysis_dt)
+        if missing_f6:
+            progress["rescan_total"]     = len(missing_f6)
+            progress["rescan_done"]      = 0
+            progress["rescan_recovered"] = 0
+            tech_map_rescan = get_tech_for_tickers(missing_f6)
+            rescan_done = 0
+            RESCAN_BATCH = 50
+            for rs_start in range(0, len(missing_f6), RESCAN_BATCH):
+                if stop_event.is_set():
+                    break
+                rs_batch = missing_f6[rs_start: rs_start + RESCAN_BATCH]
+                progress["current"] = (
+                    f"Re-scan missing F1-F6 ({rescan_done}/{len(missing_f6)}): "
+                    f"{rs_batch[0]}…{rs_batch[-1]}"
+                )
+                rs_pool = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_FUND_WORKERS)
+                rs_map  = {rs_pool.submit(_run_fund_and_peers, t, fetch_peers): t
+                           for t in rs_batch}
+                try:
+                    for future in concurrent.futures.as_completed(rs_map):
+                        if stop_event.is_set():
+                            break
+                        t = rs_map[future]
+                        try:
+                            fund, peer_data = future.result()
+                            if not fund.get("rate_limited") and not fund.get("error"):
+                                tech = tech_map_rescan.get(t, {})
+                                indicators = evaluate_all(t, tech, fund, peer_data)
+                                save_results(t, indicators, analysis_dt, fund.get("market_cap"))
+                                progress["rescan_recovered"] = progress["rescan_recovered"] + 1
+                                # Remove from failures if it was listed there
+                                progress["failures"].pop(t, None)
+                        except Exception:
+                            pass
+                        rescan_done += 1
+                        progress["rescan_done"] = rescan_done
+                finally:
+                    rs_pool.shutdown(wait=False, cancel_futures=True)
+                # Brief cooldown between re-scan batches
+                if rs_start + RESCAN_BATCH < len(missing_f6) and not stop_event.is_set():
+                    for _ in range(30):
+                        if stop_event.is_set():
+                            break
+                        time.sleep(0.1)
+
     fundamental_fetcher.set_stop_event(None)
     progress["finished"] = True
     progress["current"]  = ""
@@ -1163,6 +1488,8 @@ def build_summary_df(rows: list[dict],
                     rec[SUB_DISPLAY.get(sc, sc)] = _e(r.get(sc, "NA"))
 
         rec["Score"]           = compute_score(r)
+        rec["T Score"]         = compute_tech_score(r)
+        rec["F Score"]         = compute_fund_score(r)
         rec["Company Summary"]     = r.get("company_summary") or ""
         rec["Revenue Composition"] = r.get("revenue_composition") or ""
         rec["Status"]              = r.get("status") or ""
@@ -1615,9 +1942,17 @@ def render_scan_progress():
     paused    = prog.get("paused", False)
 
     if finished:
-        failures = prog.get("failures", {})
-        st.success(f"✅ Scan complete — {done} tickers processed"
-                   + (f" | ⚠️ {len(failures)} with missing/failed data" if failures else ""))
+        failures        = prog.get("failures", {})
+        rescan_total    = prog.get("rescan_total", 0)
+        rescan_recovered= prog.get("rescan_recovered", 0)
+
+        summary = f"✅ Scan complete — {done} tickers processed"
+        if rescan_total:
+            summary += f" | 🔄 Re-scan: {rescan_recovered}/{rescan_total} recovered"
+        if failures:
+            summary += f" | ⚠️ {len(failures)} still missing data"
+        st.success(summary)
+
         if failures:
             with st.expander(f"⚠️ Data issues ({len(failures)} tickers)", expanded=False):
                 for tkr, info in sorted(failures.items()):
@@ -1946,6 +2281,196 @@ def _copy_tab_settings(src_id: str, dst_id: str) -> None:
         sk = _tab_extra_ss(src_id, key)
         if sk in st.session_state:
             st.session_state[_tab_extra_ss(dst_id, key)] = copy.deepcopy(st.session_state[sk])
+    # Trigger config
+    for _trig_key in [
+        f"{src_id}_trig_start_conds", f"{src_id}_trig_start_logic",
+        f"{src_id}_trig_end_conds",   f"{src_id}_trig_end_logic",
+    ]:
+        if _trig_key in st.session_state:
+            st.session_state[_trig_key.replace(src_id, dst_id, 1)] = copy.deepcopy(
+                st.session_state[_trig_key]
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger conditions UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _trig_load_defaults(tab_id: str) -> None:
+    """Initialise trigger ss from user_prefs (called once per tab per session)."""
+    init_key = f"_trig_init_{tab_id}"
+    if st.session_state.get(init_key):
+        return
+    prefs = _load_prefs()
+    trig: dict = {}
+    # Look in scan_tabs list first
+    for tc in prefs.get("scan_tabs", []):
+        if tc.get("id") == tab_id:
+            trig = tc.get("trigger_config", {})
+            break
+    # Fallback: global trigger_configs dict (used for tabs not in scan_tabs list)
+    if not trig:
+        trig = prefs.get("trigger_configs", {}).get(tab_id, {})
+    st.session_state[f"{tab_id}_trig_start_conds"] = trig.get("start_conditions", [])
+    st.session_state[f"{tab_id}_trig_start_logic"] = trig.get("start_logic", "AND")
+    st.session_state[f"{tab_id}_trig_end_conds"]   = trig.get("end_conditions", [])
+    st.session_state[f"{tab_id}_trig_end_logic"]   = trig.get("end_logic", "AND")
+    st.session_state[init_key] = True
+
+
+def _render_cond_list(tab_id: str, prefix: str, label: str) -> None:
+    """Render an editable condition list (start or end) for tab_id.
+
+    prefix is 'tsc' for start-conditions, 'tec' for end-conditions.
+    ids_key  = f"{tab_id}_{prefix}_ids"   — list of UUID hex strings
+    For each uuid: ss keys are f"{tab_id}_{prefix}_{uuid}_field" etc.
+    """
+    ids_key = f"{tab_id}_{prefix}_ids"
+    field_display_list = list(TRIG_FIELD_OPTIONS.keys())
+
+    # Bootstrap id list from stored conds if not yet in ss
+    if ids_key not in st.session_state:
+        conds_key = f"{tab_id}_trig_start_conds" if prefix == "tsc" else f"{tab_id}_trig_end_conds"
+        stored = st.session_state.get(conds_key, [])
+        ids = []
+        for c in stored:
+            uid = c.get("_key") or __import__("uuid").uuid4().hex
+            # Always store display name in ss (convert from internal if needed)
+            internal = c.get("field", "daily_px_pct")
+            disp = TRIG_FIELD_DISPLAY.get(internal, field_display_list[0])
+            st.session_state[f"{tab_id}_{prefix}_{uid}_field"] = disp
+            st.session_state[f"{tab_id}_{prefix}_{uid}_op"]    = c.get("op", ">")
+            st.session_state[f"{tab_id}_{prefix}_{uid}_val"]   = float(c.get("value", 0))
+            ids.append(uid)
+        st.session_state[ids_key] = ids
+
+    ids: list[str] = list(st.session_state[ids_key])
+    to_delete = None
+
+    st.markdown(f"**{label}**")
+    for uid in ids:
+        c1, c2, c3, c4 = st.columns([3, 1.5, 2, 0.5])
+        with c1:
+            # ss stores display name; fall back to first option if stale
+            cur_disp = st.session_state.get(f"{tab_id}_{prefix}_{uid}_field", field_display_list[0])
+            if cur_disp not in field_display_list:
+                cur_disp = TRIG_FIELD_DISPLAY.get(cur_disp, field_display_list[0])
+            fidx = field_display_list.index(cur_disp) if cur_disp in field_display_list else 0
+            st.selectbox("Field", field_display_list, index=fidx,
+                         key=f"{tab_id}_{prefix}_{uid}_field",
+                         label_visibility="collapsed")
+        with c2:
+            cur_op = st.session_state.get(f"{tab_id}_{prefix}_{uid}_op", ">")
+            oidx = TRIG_OP_OPTIONS.index(cur_op) if cur_op in TRIG_OP_OPTIONS else 0
+            st.selectbox("Op", TRIG_OP_OPTIONS, index=oidx,
+                         key=f"{tab_id}_{prefix}_{uid}_op",
+                         label_visibility="collapsed")
+        with c3:
+            cur_val = float(st.session_state.get(f"{tab_id}_{prefix}_{uid}_val", 0))
+            st.number_input("Val", value=cur_val, format="%.1f", step=1.0,
+                            key=f"{tab_id}_{prefix}_{uid}_val",
+                            label_visibility="collapsed")
+        with c4:
+            if st.button("✕", key=f"{tab_id}_{prefix}_{uid}_del"):
+                to_delete = uid
+
+    if to_delete:
+        ids.remove(to_delete)
+        st.session_state[ids_key] = ids
+        st.rerun()
+
+    if st.button(f"＋ Add condition", key=f"{tab_id}_{prefix}_add"):
+        uid = __import__("uuid").uuid4().hex
+        st.session_state[f"{tab_id}_{prefix}_{uid}_field"] = field_display_list[0]
+        st.session_state[f"{tab_id}_{prefix}_{uid}_op"]    = ">"
+        st.session_state[f"{tab_id}_{prefix}_{uid}_val"]   = 0.0
+        ids.append(uid)
+        st.session_state[ids_key] = ids
+        st.rerun()
+
+
+def _read_cond_list(tab_id: str, prefix: str) -> list[dict]:
+    """Read current condition list from widget session state."""
+    ids_key = f"{tab_id}_{prefix}_ids"
+    ids: list[str] = st.session_state.get(ids_key, [])
+    conds = []
+    for uid in ids:
+        field_disp = st.session_state.get(f"{tab_id}_{prefix}_{uid}_field", "daily_px_pct")
+        field      = TRIG_FIELD_OPTIONS.get(field_disp, field_disp)
+        op         = st.session_state.get(f"{tab_id}_{prefix}_{uid}_op", ">")
+        val        = float(st.session_state.get(f"{tab_id}_{prefix}_{uid}_val", 0))
+        conds.append({"_key": uid, "field": field, "op": op, "value": val})
+    return conds
+
+
+def _render_trigger_ui(tab_id: str) -> bool:
+    """Render ⚡ Trigger Conditions expander.
+
+    Returns True if start conditions are currently configured (non-empty).
+    Saves config to user_prefs when Apply is clicked.
+    """
+    _trig_load_defaults(tab_id)
+
+    with st.expander("⚡ Trigger Conditions"):
+        # ── Start conditions ──────────────────────────────────────────────────
+        logic_options = ["AND", "OR"]
+        start_logic = st.radio(
+            "Start logic", logic_options, horizontal=True,
+            index=logic_options.index(
+                st.session_state.get(f"{tab_id}_trig_start_logic", "AND")
+            ),
+            key=f"{tab_id}_trig_start_logic",
+        )
+        _render_cond_list(tab_id, "tsc", "Start Trigger (latest date where conditions are met)")
+
+        st.divider()
+
+        # ── End conditions ────────────────────────────────────────────────────
+        st.caption("End Trigger — leave blank to use each ticker's latest available date")
+        end_logic = st.radio(
+            "End logic", logic_options, horizontal=True,
+            index=logic_options.index(
+                st.session_state.get(f"{tab_id}_trig_end_logic", "AND")
+            ),
+            key=f"{tab_id}_trig_end_logic",
+        )
+        _render_cond_list(tab_id, "tec", "End Trigger (latest date where conditions are met)")
+
+        st.divider()
+
+        # ── Apply button ──────────────────────────────────────────────────────
+        if st.button("⚡ Apply Trigger", key=f"{tab_id}_trig_apply_btn", type="primary"):
+            start_conds = _read_cond_list(tab_id, "tsc")
+            end_conds   = _read_cond_list(tab_id, "tec")
+            # Persist to user_prefs
+            prefs = _load_prefs()
+            saved = False
+            for tc in prefs.get("scan_tabs", []):
+                if tc.get("id") == tab_id:
+                    tc["trigger_config"] = {
+                        "start_conditions": start_conds,
+                        "start_logic": start_logic,
+                        "end_conditions": end_conds,
+                        "end_logic": end_logic,
+                    }
+                    saved = True
+                    break
+            if not saved:
+                # tab not yet in prefs (e.g. "history" tab) — store globally
+                prefs.setdefault("trigger_configs", {})[tab_id] = {
+                    "start_conditions": start_conds,
+                    "start_logic": start_logic,
+                    "end_conditions": end_conds,
+                    "end_logic": end_logic,
+                }
+            _save_prefs(prefs)
+            # Update ss so computation uses the latest values immediately
+            st.session_state[f"{tab_id}_trig_start_conds"] = start_conds
+            st.session_state[f"{tab_id}_trig_end_conds"]   = end_conds
+
+    # Return True if start conditions are active
+    start_conds_live = _read_cond_list(tab_id, "tsc")
+    return bool(start_conds_live)
 
 
 def _actually_clear_filter_keys(tab_key: str) -> None:
@@ -2934,6 +3459,12 @@ def render_scan_tab(tab_id: str) -> None:
     _mc_hi_pre       = st.session_state.get(tk["mc_hi"], None)
     _cust_start_pre  = st.session_state.get(_tab_extra_ss(tab_id, "cust_start"), "").strip()
     _cust_end_pre    = st.session_state.get(_tab_extra_ss(tab_id, "cust_end"), "").strip()
+    # Trigger config (pre-read before widget rendering)
+    _trig_load_defaults(tab_id)
+    _trig_start_conds_pre = st.session_state.get(f"{tab_id}_trig_start_conds", [])
+    _trig_start_logic_pre = st.session_state.get(f"{tab_id}_trig_start_logic", "AND")
+    _trig_end_conds_pre   = st.session_state.get(f"{tab_id}_trig_end_conds", [])
+    _trig_end_logic_pre   = st.session_state.get(f"{tab_id}_trig_end_logic", "AND")
 
     # ── Fetch rows ────────────────────────────────────────────────────────────
     filt_rows = get_all_summaries(
@@ -3017,6 +3548,9 @@ def render_scan_tab(tab_id: str) -> None:
             key=_tab_extra_ss(tab_id, "cust_end"),
         ).strip()
 
+    # ── Trigger conditions UI ─────────────────────────────────────────────────
+    _render_trigger_ui(tab_id)
+
     # ── Indicator filter ──────────────────────────────────────────────────────
     ind_filter, col_filter = render_indicator_filter(tab_id)
 
@@ -3069,6 +3603,18 @@ def render_scan_tab(tab_id: str) -> None:
     _cust_returns = storage.get_custom_period_returns(_ph_tickers, _cust_s, _cust_e) if _ph_tickers else {}
     for _t, _cr in _cust_returns.items():
         _ph_returns.setdefault(_t, {}).update(_cr)
+
+    # ── Trigger-based returns ─────────────────────────────────────────────────
+    if _ph_tickers and _trig_start_conds_pre:
+        _trig_results = trigger_engine.compute_trigger_returns(
+            _ph_tickers,
+            _trig_start_conds_pre,
+            _trig_start_logic_pre,
+            _trig_end_conds_pre,
+            _trig_end_logic_pre,
+        )
+        for _t, _tr in _trig_results.items():
+            _ph_returns.setdefault(_t, {}).update(_tr)
 
     _pre_val_records: dict[str, dict] = {
         t: _build_value_record(
@@ -3358,10 +3904,11 @@ with _plus_col_r:
         _add_scan_tab()
         st.rerun()
 
-_all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + ["🤖 AI Analysis"]
+_all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + ["🤖 AI Analysis", "📖 Column Reference"]
 _all_tab_widgets = st.tabs(_all_tab_labels)
-_scan_tab_widgets = _all_tab_widgets[:-1]
-tab_ai = _all_tab_widgets[-1]
+_scan_tab_widgets = _all_tab_widgets[:-2]
+tab_ai  = _all_tab_widgets[-2]
+tab_ref = _all_tab_widgets[-1]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3442,3 +3989,10 @@ with tab_ai:
                         st.error(content)
                     else:
                         st.markdown(content)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB: Column Reference
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_ref:
+    render_column_reference_tab()

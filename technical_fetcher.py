@@ -255,17 +255,37 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         ma50_gt_ma150  = (v_sma50 > v_sma150)  if _all_ma else None
         ma150_gt_ma200 = (v_sma150 > v_sma200) if _all_ma else None
 
-        # SMA50 slope: (sma50[now] - sma50[20 days ago]) / sma50[20 days ago] * 100
-        sma50_slope_20d = None
-        if v_sma50 is not None and n > 20:
-            prev_sma50 = _last(sma50.iloc[:-20]) if n > 20 else None
-            if prev_sma50 and prev_sma50 != 0:
-                sma50_slope_20d = _safe((v_sma50 - prev_sma50) / abs(prev_sma50) * 100)
+        # MA slopes
+        def _slope(series: pd.Series, lookback: int) -> float | None:
+            if series is None or len(series) <= lookback:
+                return None
+            cur  = _last(series)
+            prev = _last(series.iloc[:-lookback])
+            if cur is None or prev is None or prev == 0:
+                return None
+            return _safe((cur - prev) / abs(prev) * 100)
 
-        # % distance from SMA200
-        pct_from_sma200 = None
-        if latest_close and v_sma200 and v_sma200 != 0:
-            pct_from_sma200 = _safe((latest_close - v_sma200) / abs(v_sma200) * 100)
+        sma10_slope_10d  = _slope(sma10,  10)
+        sma20_slope_10d  = _slope(sma20,  10)
+        sma50_slope_20d  = _slope(sma50,  20)
+        sma150_slope_20d = _slope(sma150, 20)
+        sma200_slope_20d = _slope(sma200, 20)
+
+        # % distance from each MA
+        def _pct_from_ma(close_val, ma_val) -> float | None:
+            if close_val and ma_val and ma_val != 0:
+                return _safe((close_val - ma_val) / abs(ma_val) * 100)
+            return None
+
+        pct_from_sma10  = _pct_from_ma(latest_close, v_sma10)
+        pct_from_sma20  = _pct_from_ma(latest_close, v_sma20)
+        pct_from_sma50  = _pct_from_ma(latest_close, v_sma50)
+        pct_from_sma150 = _pct_from_ma(latest_close, v_sma150)
+        pct_from_sma200 = _pct_from_ma(latest_close, v_sma200)
+        pct_from_ema9   = _pct_from_ma(latest_close, v_ema9)
+        pct_from_ema21  = _pct_from_ma(latest_close, v_ema21)
+        pct_from_ema50  = _pct_from_ma(latest_close, v_ema50e)
+        pct_from_ema200 = _pct_from_ma(latest_close, v_ema200)
 
         # ATR%
         v_atr14 = _safe(_last(atr14_ser))
@@ -276,6 +296,37 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         avg_dv20 = _safe(dollar_vol.tail(20).mean(), 0)
         avg_dv50 = _safe(dollar_vol.tail(50).mean(), 0)
         med_vol50 = _safe(volume.tail(50).median(), 0)
+
+        # 1D volume %
+        raw_vol = volume.replace(0, np.nan)
+        daily_vol_pct = None
+        if len(raw_vol) >= 2:
+            v_today = raw_vol.iloc[-1]
+            v_prev  = raw_vol.iloc[-2]
+            if v_today and v_prev and v_prev != 0:
+                daily_vol_pct = _safe((v_today - v_prev) / abs(v_prev) * 100)
+
+        # Relative volume (today vs N-day avg raw volume; excludes today)
+        avg_vol_20d = _safe(raw_vol.iloc[:-1].tail(20).mean(), 0)
+        avg_vol_50d = _safe(raw_vol.iloc[:-1].tail(50).mean(), 0)
+        rel_vol_20d = None
+        rel_vol_50d = None
+        if latest_volume and avg_vol_20d and avg_vol_20d > 0:
+            rel_vol_20d = _safe(latest_volume / avg_vol_20d, 2)
+        if latest_volume and avg_vol_50d and avg_vol_50d > 0:
+            rel_vol_50d = _safe(latest_volume / avg_vol_50d, 2)
+
+        # Up/down volume ratio (20D): sum vol on up days / sum vol on down days
+        up_down_vol_ratio_20d = None
+        if n >= 21:
+            vol_window  = volume.iloc[-20:]
+            prev_close  = close.shift(1).iloc[-20:]
+            cur_close   = close.iloc[-20:]
+            is_up       = (cur_close.values > prev_close.values)
+            up_vol      = float(vol_window.values[is_up].sum())
+            dn_vol      = float(vol_window.values[~is_up].sum())
+            if dn_vol > 0:
+                up_down_vol_ratio_20d = _safe(up_vol / dn_vol, 3)
 
         # ── 52-week high/low ──────────────────────────────────────────────────
         high_52w = _safe(high.tail(252).max())
@@ -289,6 +340,36 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             pct_from_52w_low = _safe((latest_close - low_52w) / abs(low_52w) * 100)
         if high_52w and low_52w and (high_52w - low_52w) != 0 and latest_close:
             pos_52w_pct = _safe((latest_close - low_52w) / (high_52w - low_52w) * 100)
+
+        # ── Close-based 52W & historical high/low ─────────────────────────────
+        close_52w = close.tail(252)
+        high_close_52w = _safe(close_52w.max())
+        low_close_52w  = _safe(close_52w.min())
+        high_close_3y  = _safe(close.max())
+        low_close_3y   = _safe(close.min())
+
+        pct_from_high_close_52w = _pct_from_ma(latest_close, high_close_52w)
+        pct_from_low_close_52w  = _pct_from_ma(latest_close, low_close_52w)
+        pct_from_high_close_3y  = _pct_from_ma(latest_close, high_close_3y)
+        pct_from_low_close_3y   = _pct_from_ma(latest_close, low_close_3y)
+
+        # Days since the 52W high/low close (0 = today is the high/low)
+        days_since_52w_high = None
+        days_since_52w_low  = None
+        if len(close_52w) > 0:
+            idx_high = close_52w.index.get_loc(close_52w.idxmax())
+            idx_low  = close_52w.index.get_loc(close_52w.idxmin())
+            days_since_52w_high = int(len(close_52w) - 1 - idx_high)
+            days_since_52w_low  = int(len(close_52w) - 1 - idx_low)
+
+        # Whether today's close is the high/low of the window
+        c_today = latest_close or 0.0
+        made_high_5d   = bool(c_today >= float(close.tail(5).max()))   if n >= 5   else None
+        made_high_22d  = bool(c_today >= float(close.tail(22).max()))  if n >= 22  else None
+        made_high_252d = bool(c_today >= float(close.tail(252).max())) if n >= 252 else None
+        made_low_5d    = bool(c_today <= float(close.tail(5).min()))   if n >= 5   else None
+        made_low_22d   = bool(c_today <= float(close.tail(22).min()))  if n >= 22  else None
+        made_low_252d  = bool(c_today <= float(close.tail(252).min())) if n >= 252 else None
 
         # ── Donchian channels ─────────────────────────────────────────────────
         def _donchian(window):
@@ -343,6 +424,37 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         gap_rate_60d = _safe(len(gaps_60d[gaps_60d.abs() > 3]) / len(gaps_60d) * 100) \
                        if len(gaps_60d) > 0 else None
         max_gap_60d  = _safe(gaps_60d.abs().max()) if len(gaps_60d) > 0 else None
+
+        # ── Swing high/low (5-bar pivot) ──────────────────────────────────────
+        swing_high_val = swing_high_date = swing_low_val = swing_low_date = None
+        pct_from_swing_high = pct_from_swing_low = None
+        _N = 5   # bars required on each side of a pivot
+        if n >= 2 * _N + 1:
+            # Scan from most recent valid pivot position backward
+            # A pivot high at i: high[i] > max of N bars before AND N bars after
+            # Skip the last _N bars (can't confirm right side yet)
+            found_h = found_l = False
+            for _i in range(n - _N - 1, _N - 1, -1):
+                if not found_h:
+                    _h = float(high.iloc[_i])
+                    if (_h > float(high.iloc[_i - _N: _i].max()) and
+                            _h > float(high.iloc[_i + 1: _i + _N + 1].max())):
+                        swing_high_val  = _safe(_h)
+                        swing_high_date = str(high.index[_i].date())
+                        found_h = True
+                if not found_l:
+                    _l = float(low.iloc[_i])
+                    if (_l < float(low.iloc[_i - _N: _i].min()) and
+                            _l < float(low.iloc[_i + 1: _i + _N + 1].min())):
+                        swing_low_val  = _safe(_l)
+                        swing_low_date = str(low.index[_i].date())
+                        found_l = True
+                if found_h and found_l:
+                    break
+        if latest_close and swing_high_val and swing_high_val != 0:
+            pct_from_swing_high = _safe((latest_close - swing_high_val) / abs(swing_high_val) * 100)
+        if latest_close and swing_low_val and swing_low_val != 0:
+            pct_from_swing_low = _safe((latest_close - swing_low_val) / abs(swing_low_val) * 100)
 
         # ── Rolling up/down stats ─────────────────────────────────────────────
         daily_up = (close.diff() > 0)
@@ -439,6 +551,22 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "pct_from_52w_high":   pct_from_52w_high,
             "pct_from_52w_low":    pct_from_52w_low,
             "pos_52w_pct":         pos_52w_pct,
+            "high_close_52w":          high_close_52w,
+            "low_close_52w":           low_close_52w,
+            "pct_from_high_close_52w": pct_from_high_close_52w,
+            "pct_from_low_close_52w":  pct_from_low_close_52w,
+            "high_close_3y":           high_close_3y,
+            "low_close_3y":            low_close_3y,
+            "pct_from_high_close_3y":  pct_from_high_close_3y,
+            "pct_from_low_close_3y":   pct_from_low_close_3y,
+            "days_since_52w_high":     days_since_52w_high,
+            "days_since_52w_low":      days_since_52w_low,
+            "made_high_5d":            made_high_5d,
+            "made_high_22d":           made_high_22d,
+            "made_high_252d":          made_high_252d,
+            "made_low_5d":             made_low_5d,
+            "made_low_22d":            made_low_22d,
+            "made_low_252d":           made_low_252d,
             "donchian_high_20":    d_high_20,
             "donchian_low_20":     d_low_20,
             "donchian_high_55":    d_high_55,
@@ -467,6 +595,32 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "max_win_streak_1y":   ms1y,
             "win_streaks_5p_1y":   sp1y,
             "daily_pct_change":    _safe(float(pct_change.iloc[-1]), 2) if len(pct_change) >= 2 else None,
+            "daily_vol_pct":       daily_vol_pct,
+            # Price vs MA distances (%)
+            "pct_from_sma10":      pct_from_sma10,
+            "pct_from_sma20":      pct_from_sma20,
+            "pct_from_sma50":      pct_from_sma50,
+            "pct_from_sma150":     pct_from_sma150,
+            "pct_from_ema9":       pct_from_ema9,
+            "pct_from_ema21":      pct_from_ema21,
+            "pct_from_ema50":      pct_from_ema50,
+            "pct_from_ema200":     pct_from_ema200,
+            # Additional MA slopes
+            "sma10_slope_10d":     sma10_slope_10d,
+            "sma20_slope_10d":     sma20_slope_10d,
+            "sma150_slope_20d":    sma150_slope_20d,
+            "sma200_slope_20d":    sma200_slope_20d,
+            # Relative volume & up/down vol ratio
+            "rel_vol_20d":         rel_vol_20d,
+            "rel_vol_50d":         rel_vol_50d,
+            "up_down_vol_ratio_20d": up_down_vol_ratio_20d,
+            # Swing high/low
+            "swing_high":          swing_high_val,
+            "swing_high_date":     swing_high_date,
+            "swing_low":           swing_low_val,
+            "swing_low_date":      swing_low_date,
+            "pct_from_swing_high": pct_from_swing_high,
+            "pct_from_swing_low":  pct_from_swing_low,
             "big_up_events_90d":   json.dumps(big_up_events, default=str),
             "big_down_events_90d": json.dumps(big_down_events, default=str),
             "daily_vs_3m":         json.dumps(daily_3m,   default=str),

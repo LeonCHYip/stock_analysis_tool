@@ -73,10 +73,26 @@ _QS_URLS = [
 
 # ── Call 2: v8 timeseries fields ───────────────────────────────────────────────
 _TS_TYPES = [
-    "quarterlyBasicEPS",     # GAAP Q EPS per share
-    "quarterlyTotalRevenue", # Q revenue
-    "annualBasicEPS",        # GAAP annual EPS per share
-    "annualTotalRevenue",    # Annual revenue
+    # Existing — revenue + EPS
+    "quarterlyBasicEPS",              # GAAP Q EPS per share
+    "quarterlyTotalRevenue",          # Q revenue
+    "annualBasicEPS",                 # GAAP annual EPS per share
+    "annualTotalRevenue",             # Annual revenue
+    # Income statement
+    "quarterlyGrossProfit",           "annualGrossProfit",
+    "quarterlyOperatingIncome",       "annualOperatingIncome",
+    "quarterlyNetIncome",             "annualNetIncome",
+    "quarterlyEBITDA",                "annualEBITDA",
+    "quarterlyResearchAndDevelopment","annualResearchAndDevelopment",
+    # Cash flow (OCF = FCF − CapEx; CapEx is stored negative)
+    "quarterlyFreeCashFlow",          "annualFreeCashFlow",
+    "quarterlyCapitalExpenditure",    "annualCapitalExpenditure",
+    # Balance sheet
+    "quarterlyTotalDebt",             "annualTotalDebt",
+    "quarterlyNetDebt",               "annualNetDebt",
+    "quarterlyCashAndCashEquivalents","annualCashAndCashEquivalents",
+    "quarterlyWorkingCapital",        "annualWorkingCapital",
+    "quarterlyTotalAssets",           "annualTotalAssets",
 ]
 _TS_URLS = [
     "https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{sym}",
@@ -378,6 +394,35 @@ def fetch_fundamental(ticker: str,
         a_eps_ts  = ts.get("annualBasicEPS",        [])
         a_rev_ts  = ts.get("annualTotalRevenue",    [])
 
+        # ── New timeseries fields ──────────────────────────────────────────────
+        # Income statement
+        q_gp_ts   = ts.get("quarterlyGrossProfit",            [])
+        a_gp_ts   = ts.get("annualGrossProfit",               [])
+        q_oi_ts   = ts.get("quarterlyOperatingIncome",        [])
+        a_oi_ts   = ts.get("annualOperatingIncome",           [])
+        q_ni_ts   = ts.get("quarterlyNetIncome",              [])
+        a_ni_ts   = ts.get("annualNetIncome",                 [])
+        q_ebt_ts  = ts.get("quarterlyEBITDA",                 [])
+        a_ebt_ts  = ts.get("annualEBITDA",                    [])
+        q_rd_ts   = ts.get("quarterlyResearchAndDevelopment", [])
+        a_rd_ts   = ts.get("annualResearchAndDevelopment",    [])
+        # Cash flow
+        q_fcf_ts  = ts.get("quarterlyFreeCashFlow",           [])
+        a_fcf_ts  = ts.get("annualFreeCashFlow",              [])
+        q_cap_ts  = ts.get("quarterlyCapitalExpenditure",     [])
+        a_cap_ts  = ts.get("annualCapitalExpenditure",        [])
+        # Balance sheet
+        q_td_ts   = ts.get("quarterlyTotalDebt",              [])
+        a_td_ts   = ts.get("annualTotalDebt",                 [])
+        q_nd_ts   = ts.get("quarterlyNetDebt",                [])
+        a_nd_ts   = ts.get("annualNetDebt",                   [])
+        q_ca_ts   = ts.get("quarterlyCashAndCashEquivalents", [])
+        a_ca_ts   = ts.get("annualCashAndCashEquivalents",    [])
+        q_wc_ts   = ts.get("quarterlyWorkingCapital",         [])
+        a_wc_ts   = ts.get("annualWorkingCapital",            [])
+        q_ta_ts   = ts.get("quarterlyTotalAssets",            [])
+        a_ta_ts   = ts.get("annualTotalAssets",               [])
+
         # Quarterly fields (GAAP Basic EPS from timeseries)
         q_revenue  = _ts_value(q_rev_ts, 0)
         q_eps      = _ts_value(q_eps_ts, 0)
@@ -412,6 +457,113 @@ def fetch_fundamental(ticker: str,
         a_end_date = _ts_date(a_eps_ts, 0)
         a_rev_yoy  = _ts_yoy(a_rev_ts, 0, 1)   # previous fiscal year
         a_eps_yoy  = _ts_yoy(a_eps_ts, 0, 1)   # previous fiscal year
+
+        # ── Income statement Q+A ──────────────────────────────────────────────
+        q_gross_profit     = _ts_value(q_gp_ts, 0)
+        a_gross_profit     = _ts_value(a_gp_ts, 0)
+        q_gross_profit_yoy = _ts_yoy(q_gp_ts, 0, 4)
+        a_gross_profit_yoy = _ts_yoy(a_gp_ts, 0, 1)
+
+        q_op_income        = _ts_value(q_oi_ts, 0)
+        a_op_income        = _ts_value(a_oi_ts, 0)
+        q_op_income_yoy    = _ts_yoy(q_oi_ts, 0, 4)
+        a_op_income_yoy    = _ts_yoy(a_oi_ts, 0, 1)
+
+        q_net_income       = _ts_value(q_ni_ts, 0)
+        a_net_income       = _ts_value(a_ni_ts, 0)
+        q_net_income_yoy   = _ts_yoy(q_ni_ts, 0, 4)
+        a_net_income_yoy   = _ts_yoy(a_ni_ts, 0, 1)
+
+        q_ebitda           = _ts_value(q_ebt_ts, 0)
+        a_ebitda           = _ts_value(a_ebt_ts, 0)
+        q_ebitda_yoy       = _ts_yoy(q_ebt_ts, 0, 4)
+        a_ebitda_yoy       = _ts_yoy(a_ebt_ts, 0, 1)
+
+        q_rd               = _ts_value(q_rd_ts, 0)
+        a_rd               = _ts_value(a_rd_ts, 0)
+        q_rd_yoy           = _ts_yoy(q_rd_ts, 0, 4)
+        a_rd_yoy           = _ts_yoy(a_rd_ts, 0, 1)
+
+        # ── Cash flow Q+A (OCF derived: FCF − CapEx; CapEx is negative) ───────
+        def _derive_ocf(fcf_ts, cap_ts, idx):
+            fcf = _ts_value(fcf_ts, idx)
+            cap = _ts_value(cap_ts, idx)
+            if fcf is None or cap is None:
+                return None
+            return round(fcf - cap, 0)   # OCF = FCF + |CapEx|
+
+        q_fcf              = _ts_value(q_fcf_ts, 0)
+        a_fcf              = _ts_value(a_fcf_ts, 0)
+        q_fcf_yoy          = _ts_yoy(q_fcf_ts, 0, 4)
+        a_fcf_yoy          = _ts_yoy(a_fcf_ts, 0, 1)
+
+        q_capex            = _ts_value(q_cap_ts, 0)
+        a_capex            = _ts_value(a_cap_ts, 0)
+        q_capex_yoy        = _ts_yoy(q_cap_ts, 0, 4)
+        a_capex_yoy        = _ts_yoy(a_cap_ts, 0, 1)
+
+        q_ocf              = _derive_ocf(q_fcf_ts, q_cap_ts, 0)
+        a_ocf              = _derive_ocf(a_fcf_ts, a_cap_ts, 0)
+        # OCF YoY via derived values
+        def _ts_yoy_derived(fcf_ts, cap_ts, curr_idx, prev_idx):
+            curr = _derive_ocf(fcf_ts, cap_ts, curr_idx)
+            prev = _derive_ocf(fcf_ts, cap_ts, prev_idx)
+            if curr is None or prev is None or float(prev) == 0:
+                return None
+            return round((float(curr) - float(prev)) / abs(float(prev)) * 100, 2)
+        q_ocf_yoy          = _ts_yoy_derived(q_fcf_ts, q_cap_ts, 0, 4)
+        a_ocf_yoy          = _ts_yoy_derived(a_fcf_ts, a_cap_ts, 0, 1)
+
+        # ── Balance sheet Q+A ─────────────────────────────────────────────────
+        q_total_debt       = _ts_value(q_td_ts, 0)
+        a_total_debt       = _ts_value(a_td_ts, 0)
+        q_total_debt_yoy   = _ts_yoy(q_td_ts, 0, 4)
+        a_total_debt_yoy   = _ts_yoy(a_td_ts, 0, 1)
+
+        q_net_debt         = _ts_value(q_nd_ts, 0)
+        a_net_debt         = _ts_value(a_nd_ts, 0)
+        q_net_debt_yoy     = _ts_yoy(q_nd_ts, 0, 4)
+        a_net_debt_yoy     = _ts_yoy(a_nd_ts, 0, 1)
+
+        q_cash             = _ts_value(q_ca_ts, 0)
+        a_cash             = _ts_value(a_ca_ts, 0)
+        q_cash_yoy         = _ts_yoy(q_ca_ts, 0, 4)
+        a_cash_yoy         = _ts_yoy(a_ca_ts, 0, 1)
+
+        q_working_cap      = _ts_value(q_wc_ts, 0)
+        a_working_cap      = _ts_value(a_wc_ts, 0)
+        q_working_cap_yoy  = _ts_yoy(q_wc_ts, 0, 4)
+        a_working_cap_yoy  = _ts_yoy(a_wc_ts, 0, 1)
+
+        q_total_assets     = _ts_value(q_ta_ts, 0)
+        a_total_assets     = _ts_value(a_ta_ts, 0)
+        q_total_assets_yoy = _ts_yoy(q_ta_ts, 0, 4)
+        a_total_assets_yoy = _ts_yoy(a_ta_ts, 0, 1)
+
+        # ── Extended valuation (all from existing Call 1 modules) ─────────────
+        beta                 = _safe(_raw(stats_m, "beta"), 3)
+        trailing_pe          = _safe(_raw(stats_m, "trailingPE"), 2)
+        trailing_eps         = _safe(_raw(stats_m, "trailingEps"), 4)
+        forward_eps_v        = _safe(_raw(stats_m, "forwardEps"), 4)
+        peg_ratio            = _safe(_raw(stats_m, "pegRatio"), 3)
+        trailing_peg         = _safe(_raw(stats_m, "trailingPegRatio"), 3)
+        enterprise_value     = _safe(_raw(stats_m, "enterpriseValue"), 0)
+        ev_to_ebitda         = _safe(_raw(stats_m, "enterpriseToEbitda"), 3)
+        ev_to_revenue        = _safe(_raw(stats_m, "enterpriseToRevenue"), 3)
+        book_value_per_share = _safe(_raw(stats_m, "bookValue"), 3)
+        held_pct_insiders    = _safe(_raw(stats_m, "heldPercentInsiders"), 6)
+        held_pct_institutions= _safe(_raw(stats_m, "heldPercentInstitutions"), 6)
+
+        summary_det_m        = qs.get("summaryDetail", {})
+        dividend_yield       = _safe(_raw(summary_det_m, "dividendYield"), 6)
+        dividend_rate        = _safe(_raw(summary_det_m, "dividendRate"), 4)
+        payout_ratio         = _safe(_raw(summary_det_m, "payoutRatio"), 6)
+
+        revenue_per_share    = _safe(_raw(fin_m, "revenuePerShare"), 4)
+        total_cash_per_share = _safe(_raw(fin_m, "totalCashPerShare"), 4)
+        total_cash           = _safe(_raw(fin_m, "totalCash"), 0)
+        total_debt_spot      = _safe(_raw(fin_m, "totalDebt"), 0)
+        fcf_spot             = _safe(_raw(fin_m, "freeCashflow"), 0)
 
         # ── Finviz override: use newer earnings data if available ──────────────
         fviz = storage.get_latest_earnings(ticker)
@@ -548,6 +700,82 @@ def fetch_fundamental(ticker: str,
             "rec_mean":         rec_mean,
             "rec_key":          rec_key,
             "analyst_count":    analyst_count,
+            # Extended valuation (Call 1)
+            "beta":                  beta,
+            "trailing_pe":           trailing_pe,
+            "trailing_eps":          trailing_eps,
+            "forward_eps":           forward_eps_v,
+            "peg_ratio":             peg_ratio,
+            "trailing_peg":          trailing_peg,
+            "dividend_yield":        dividend_yield,
+            "dividend_rate":         dividend_rate,
+            "payout_ratio":          payout_ratio,
+            "enterprise_value":      enterprise_value,
+            "ev_to_ebitda":          ev_to_ebitda,
+            "ev_to_revenue":         ev_to_revenue,
+            "revenue_per_share":     revenue_per_share,
+            "total_cash_per_share":  total_cash_per_share,
+            "book_value_per_share":  book_value_per_share,
+            "held_pct_insiders":     held_pct_insiders,
+            "held_pct_institutions": held_pct_institutions,
+            "total_cash":            total_cash,
+            "total_debt_spot":       total_debt_spot,
+            "fcf_spot":              fcf_spot,
+            # Income statement Q+A
+            "q_gross_profit":        q_gross_profit,
+            "a_gross_profit":        a_gross_profit,
+            "q_gross_profit_yoy":    q_gross_profit_yoy,
+            "a_gross_profit_yoy":    a_gross_profit_yoy,
+            "q_op_income":           q_op_income,
+            "a_op_income":           a_op_income,
+            "q_op_income_yoy":       q_op_income_yoy,
+            "a_op_income_yoy":       a_op_income_yoy,
+            "q_net_income":          q_net_income,
+            "a_net_income":          a_net_income,
+            "q_net_income_yoy":      q_net_income_yoy,
+            "a_net_income_yoy":      a_net_income_yoy,
+            "q_ebitda":              q_ebitda,
+            "a_ebitda":              a_ebitda,
+            "q_ebitda_yoy":          q_ebitda_yoy,
+            "a_ebitda_yoy":          a_ebitda_yoy,
+            "q_rd":                  q_rd,
+            "a_rd":                  a_rd,
+            "q_rd_yoy":              q_rd_yoy,
+            "a_rd_yoy":              a_rd_yoy,
+            # Cash flow Q+A
+            "q_ocf":                 q_ocf,
+            "a_ocf":                 a_ocf,
+            "q_ocf_yoy":             q_ocf_yoy,
+            "a_ocf_yoy":             a_ocf_yoy,
+            "q_fcf":                 q_fcf,
+            "a_fcf":                 a_fcf,
+            "q_fcf_yoy":             q_fcf_yoy,
+            "a_fcf_yoy":             a_fcf_yoy,
+            "q_capex":               q_capex,
+            "a_capex":               a_capex,
+            "q_capex_yoy":           q_capex_yoy,
+            "a_capex_yoy":           a_capex_yoy,
+            # Balance sheet Q+A
+            "q_total_debt":          q_total_debt,
+            "a_total_debt":          a_total_debt,
+            "q_total_debt_yoy":      q_total_debt_yoy,
+            "a_total_debt_yoy":      a_total_debt_yoy,
+            "q_net_debt":            q_net_debt,
+            "a_net_debt":            a_net_debt,
+            "q_net_debt_yoy":        q_net_debt_yoy,
+            "a_net_debt_yoy":        a_net_debt_yoy,
+            "q_cash":                q_cash,
+            "a_cash":                a_cash,
+            "q_cash_yoy":            q_cash_yoy,
+            "a_cash_yoy":            a_cash_yoy,
+            "q_working_cap":         q_working_cap,
+            "a_working_cap":         a_working_cap,
+            "q_working_cap_yoy":     q_working_cap_yoy,
+            "a_working_cap_yoy":     a_working_cap_yoy,
+            "q_total_assets":        q_total_assets,
+            "a_total_assets":        a_total_assets,
+            "q_total_assets_yoy":    q_total_assets_yoy,
+            "a_total_assets_yoy":    a_total_assets_yoy,
         })
 
         return {
@@ -570,6 +798,82 @@ def fetch_fundamental(ticker: str,
             "pb_ratio":      pb_ratio,
             "market_cap":    market_cap,
             "raw_info":      flat_info,
+            # Extended valuation
+            "beta":                  beta,
+            "trailing_pe":           trailing_pe,
+            "trailing_eps":          trailing_eps,
+            "forward_eps":           forward_eps_v,
+            "peg_ratio":             peg_ratio,
+            "trailing_peg":          trailing_peg,
+            "dividend_yield":        dividend_yield,
+            "dividend_rate":         dividend_rate,
+            "payout_ratio":          payout_ratio,
+            "enterprise_value":      enterprise_value,
+            "ev_to_ebitda":          ev_to_ebitda,
+            "ev_to_revenue":         ev_to_revenue,
+            "revenue_per_share":     revenue_per_share,
+            "total_cash_per_share":  total_cash_per_share,
+            "book_value_per_share":  book_value_per_share,
+            "held_pct_insiders":     held_pct_insiders,
+            "held_pct_institutions": held_pct_institutions,
+            "total_cash":            total_cash,
+            "total_debt_spot":       total_debt_spot,
+            "fcf_spot":              fcf_spot,
+            # Income statement
+            "q_gross_profit":        q_gross_profit,
+            "a_gross_profit":        a_gross_profit,
+            "q_gross_profit_yoy":    q_gross_profit_yoy,
+            "a_gross_profit_yoy":    a_gross_profit_yoy,
+            "q_op_income":           q_op_income,
+            "a_op_income":           a_op_income,
+            "q_op_income_yoy":       q_op_income_yoy,
+            "a_op_income_yoy":       a_op_income_yoy,
+            "q_net_income":          q_net_income,
+            "a_net_income":          a_net_income,
+            "q_net_income_yoy":      q_net_income_yoy,
+            "a_net_income_yoy":      a_net_income_yoy,
+            "q_ebitda":              q_ebitda,
+            "a_ebitda":              a_ebitda,
+            "q_ebitda_yoy":          q_ebitda_yoy,
+            "a_ebitda_yoy":          a_ebitda_yoy,
+            "q_rd":                  q_rd,
+            "a_rd":                  a_rd,
+            "q_rd_yoy":              q_rd_yoy,
+            "a_rd_yoy":              a_rd_yoy,
+            # Cash flow
+            "q_ocf":                 q_ocf,
+            "a_ocf":                 a_ocf,
+            "q_ocf_yoy":             q_ocf_yoy,
+            "a_ocf_yoy":             a_ocf_yoy,
+            "q_fcf":                 q_fcf,
+            "a_fcf":                 a_fcf,
+            "q_fcf_yoy":             q_fcf_yoy,
+            "a_fcf_yoy":             a_fcf_yoy,
+            "q_capex":               q_capex,
+            "a_capex":               a_capex,
+            "q_capex_yoy":           q_capex_yoy,
+            "a_capex_yoy":           a_capex_yoy,
+            # Balance sheet
+            "q_total_debt":          q_total_debt,
+            "a_total_debt":          a_total_debt,
+            "q_total_debt_yoy":      q_total_debt_yoy,
+            "a_total_debt_yoy":      a_total_debt_yoy,
+            "q_net_debt":            q_net_debt,
+            "a_net_debt":            a_net_debt,
+            "q_net_debt_yoy":        q_net_debt_yoy,
+            "a_net_debt_yoy":        a_net_debt_yoy,
+            "q_cash":                q_cash,
+            "a_cash":                a_cash,
+            "q_cash_yoy":            q_cash_yoy,
+            "a_cash_yoy":            a_cash_yoy,
+            "q_working_cap":         q_working_cap,
+            "a_working_cap":         a_working_cap,
+            "q_working_cap_yoy":     q_working_cap_yoy,
+            "a_working_cap_yoy":     a_working_cap_yoy,
+            "q_total_assets":        q_total_assets,
+            "a_total_assets":        a_total_assets,
+            "q_total_assets_yoy":    q_total_assets_yoy,
+            "a_total_assets_yoy":    a_total_assets_yoy,
         }
 
     except Exception as e:

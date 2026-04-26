@@ -118,12 +118,29 @@ CREATE TABLE IF NOT EXISTS tech_indicators (
     avg_dollar_vol_20d  DOUBLE,
     avg_dollar_vol_50d  DOUBLE,
     median_volume_50d   DOUBLE,
-    -- Price positions
+    -- Price positions (intraday 52W high/low)
     high_52w            DOUBLE,
     low_52w             DOUBLE,
     pct_from_52w_high   DOUBLE,
     pct_from_52w_low    DOUBLE,
     pos_52w_pct         DOUBLE,
+    -- Close-based 52W & historical high/low
+    high_close_52w          DOUBLE,
+    low_close_52w           DOUBLE,
+    pct_from_high_close_52w DOUBLE,
+    pct_from_low_close_52w  DOUBLE,
+    high_close_3y           DOUBLE,
+    low_close_3y            DOUBLE,
+    pct_from_high_close_3y  DOUBLE,
+    pct_from_low_close_3y   DOUBLE,
+    days_since_52w_high     INTEGER,
+    days_since_52w_low      INTEGER,
+    made_high_5d            BOOLEAN,
+    made_high_22d           BOOLEAN,
+    made_high_252d          BOOLEAN,
+    made_low_5d             BOOLEAN,
+    made_low_22d            BOOLEAN,
+    made_low_252d           BOOLEAN,
     -- Donchian
     donchian_high_20    DOUBLE,
     donchian_low_20     DOUBLE,
@@ -164,8 +181,35 @@ CREATE TABLE IF NOT EXISTS tech_indicators (
     daily_vs_12m        TEXT,
     weekly_vs_3m        TEXT,
     weekly_vs_12m       TEXT,
-    -- Daily price change
+    -- Daily price/volume change
     daily_pct_change    DOUBLE,
+    daily_vol_pct       DOUBLE,
+    -- Price vs MA distances (%)
+    pct_from_sma10      DOUBLE,
+    pct_from_sma20      DOUBLE,
+    pct_from_sma50      DOUBLE,
+    pct_from_sma150     DOUBLE,
+    pct_from_ema9       DOUBLE,
+    pct_from_ema21      DOUBLE,
+    pct_from_ema50      DOUBLE,
+    pct_from_ema200     DOUBLE,
+    -- Additional MA slopes
+    sma10_slope_10d     DOUBLE,
+    sma20_slope_10d     DOUBLE,
+    sma150_slope_20d    DOUBLE,
+    sma200_slope_20d    DOUBLE,
+    -- Relative volume (today / N-day avg raw volume)
+    rel_vol_20d         DOUBLE,
+    rel_vol_50d         DOUBLE,
+    -- Up/down volume ratio (20D)
+    up_down_vol_ratio_20d DOUBLE,
+    -- Swing high/low
+    swing_high          DOUBLE,
+    swing_high_date     TEXT,
+    swing_low           DOUBLE,
+    swing_low_date      TEXT,
+    pct_from_swing_high DOUBLE,
+    pct_from_swing_low  DOUBLE,
     -- Status
     is_finalized        BOOLEAN DEFAULT FALSE,
     computed_at         TIMESTAMP,
@@ -340,6 +384,22 @@ CREATE TABLE IF NOT EXISTS price_history (
 );
 """
 
+_DDL_TRIGGER_CACHE = """
+CREATE TABLE IF NOT EXISTS trigger_cache (
+    cache_key        TEXT    NOT NULL,
+    ticker           TEXT    NOT NULL,
+    start_date       TEXT,
+    end_date         TEXT,
+    trig_px_pct      DOUBLE,
+    trig_vol_pct     DOUBLE,
+    trig_avg_px_pct  DOUBLE,
+    trig_avg_vol_pct DOUBLE,
+    max_ph_date      TEXT,
+    computed_at      TIMESTAMP,
+    PRIMARY KEY (cache_key, ticker)
+);
+"""
+
 _init_lock = threading.Lock()
 _db_lock   = threading.RLock()    # serialises ALL DB operations (reads + writes)
 _global_conn: duckdb.DuckDBPyConnection | None = None
@@ -391,6 +451,7 @@ def init_db() -> None:
     con.execute(_DDL_EARNINGS)
     con.execute(_DDL_EARNINGS_LOG)
     con.execute(_DDL_PRICE_HISTORY)
+    con.execute(_DDL_TRIGGER_CACHE)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
 
@@ -398,7 +459,45 @@ def init_db() -> None:
 def _migrate_add_columns(con) -> None:
     """Add new columns to existing tables if they don't already exist."""
     new_tech_cols = [
-        ("daily_pct_change", "DOUBLE"),
+        ("daily_pct_change",            "DOUBLE"),
+        ("daily_vol_pct",               "DOUBLE"),
+        ("high_close_52w",              "DOUBLE"),
+        ("low_close_52w",               "DOUBLE"),
+        ("pct_from_high_close_52w",     "DOUBLE"),
+        ("pct_from_low_close_52w",      "DOUBLE"),
+        ("high_close_3y",               "DOUBLE"),
+        ("low_close_3y",                "DOUBLE"),
+        ("pct_from_high_close_3y",      "DOUBLE"),
+        ("pct_from_low_close_3y",       "DOUBLE"),
+        ("days_since_52w_high",         "INTEGER"),
+        ("days_since_52w_low",          "INTEGER"),
+        ("made_high_5d",                "BOOLEAN"),
+        ("made_high_22d",               "BOOLEAN"),
+        ("made_high_252d",              "BOOLEAN"),
+        ("made_low_5d",                 "BOOLEAN"),
+        ("made_low_22d",                "BOOLEAN"),
+        ("made_low_252d",               "BOOLEAN"),
+        ("pct_from_sma10",         "DOUBLE"),
+        ("pct_from_sma20",         "DOUBLE"),
+        ("pct_from_sma50",         "DOUBLE"),
+        ("pct_from_sma150",        "DOUBLE"),
+        ("pct_from_ema9",          "DOUBLE"),
+        ("pct_from_ema21",         "DOUBLE"),
+        ("pct_from_ema50",         "DOUBLE"),
+        ("pct_from_ema200",        "DOUBLE"),
+        ("sma10_slope_10d",        "DOUBLE"),
+        ("sma20_slope_10d",        "DOUBLE"),
+        ("sma150_slope_20d",       "DOUBLE"),
+        ("sma200_slope_20d",       "DOUBLE"),
+        ("rel_vol_20d",            "DOUBLE"),
+        ("rel_vol_50d",            "DOUBLE"),
+        ("up_down_vol_ratio_20d",  "DOUBLE"),
+        ("swing_high",             "DOUBLE"),
+        ("swing_high_date",        "TEXT"),
+        ("swing_low",              "DOUBLE"),
+        ("swing_low_date",         "TEXT"),
+        ("pct_from_swing_high",    "DOUBLE"),
+        ("pct_from_swing_low",     "DOUBLE"),
     ]
     existing = {row[0] for row in con.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'tech_indicators'"
@@ -447,6 +546,56 @@ def _migrate_add_columns(con) -> None:
         ("target_low",      "DOUBLE"), ("target_mean",     "DOUBLE"),
         ("current_price_fd","DOUBLE"), ("rec_mean",        "DOUBLE"),
         ("rec_key",         "TEXT"),   ("analyst_count",   "DOUBLE"),
+        # Extended valuation (Call 1 — quoteSummary, no extra HTTP calls)
+        ("beta",                "DOUBLE"),
+        ("trailing_pe",         "DOUBLE"),
+        ("trailing_eps",        "DOUBLE"),
+        ("forward_eps",         "DOUBLE"),
+        ("peg_ratio",           "DOUBLE"),
+        ("trailing_peg",        "DOUBLE"),
+        ("dividend_yield",      "DOUBLE"),   # fraction (0.005 = 0.5%)
+        ("dividend_rate",       "DOUBLE"),
+        ("payout_ratio",        "DOUBLE"),   # fraction
+        ("enterprise_value",    "DOUBLE"),
+        ("ev_to_ebitda",        "DOUBLE"),
+        ("ev_to_revenue",       "DOUBLE"),
+        ("revenue_per_share",   "DOUBLE"),
+        ("total_cash_per_share","DOUBLE"),
+        ("book_value_per_share","DOUBLE"),
+        ("held_pct_insiders",   "DOUBLE"),   # fraction
+        ("held_pct_institutions","DOUBLE"),  # fraction
+        ("total_cash",          "DOUBLE"),
+        ("total_debt_spot",     "DOUBLE"),
+        ("fcf_spot",            "DOUBLE"),
+        # Income statement Q+A values and YoY (Call 2 timeseries, no extra HTTP calls)
+        ("q_gross_profit",      "DOUBLE"), ("a_gross_profit",      "DOUBLE"),
+        ("q_gross_profit_yoy",  "DOUBLE"), ("a_gross_profit_yoy",  "DOUBLE"),
+        ("q_op_income",         "DOUBLE"), ("a_op_income",         "DOUBLE"),
+        ("q_op_income_yoy",     "DOUBLE"), ("a_op_income_yoy",     "DOUBLE"),
+        ("q_net_income",        "DOUBLE"), ("a_net_income",        "DOUBLE"),
+        ("q_net_income_yoy",    "DOUBLE"), ("a_net_income_yoy",    "DOUBLE"),
+        ("q_ebitda",            "DOUBLE"), ("a_ebitda",            "DOUBLE"),
+        ("q_ebitda_yoy",        "DOUBLE"), ("a_ebitda_yoy",        "DOUBLE"),
+        ("q_rd",                "DOUBLE"), ("a_rd",                "DOUBLE"),
+        ("q_rd_yoy",            "DOUBLE"), ("a_rd_yoy",            "DOUBLE"),
+        # Cash flow Q+A values and YoY
+        ("q_ocf",               "DOUBLE"), ("a_ocf",               "DOUBLE"),
+        ("q_ocf_yoy",           "DOUBLE"), ("a_ocf_yoy",           "DOUBLE"),
+        ("q_fcf",               "DOUBLE"), ("a_fcf",               "DOUBLE"),
+        ("q_fcf_yoy",           "DOUBLE"), ("a_fcf_yoy",           "DOUBLE"),
+        ("q_capex",             "DOUBLE"), ("a_capex",             "DOUBLE"),
+        ("q_capex_yoy",         "DOUBLE"), ("a_capex_yoy",         "DOUBLE"),
+        # Balance sheet Q+A values and YoY
+        ("q_total_debt",        "DOUBLE"), ("a_total_debt",        "DOUBLE"),
+        ("q_total_debt_yoy",    "DOUBLE"), ("a_total_debt_yoy",    "DOUBLE"),
+        ("q_net_debt",          "DOUBLE"), ("a_net_debt",          "DOUBLE"),
+        ("q_net_debt_yoy",      "DOUBLE"), ("a_net_debt_yoy",      "DOUBLE"),
+        ("q_cash",              "DOUBLE"), ("a_cash",              "DOUBLE"),
+        ("q_cash_yoy",          "DOUBLE"), ("a_cash_yoy",          "DOUBLE"),
+        ("q_working_cap",       "DOUBLE"), ("a_working_cap",       "DOUBLE"),
+        ("q_working_cap_yoy",   "DOUBLE"), ("a_working_cap_yoy",   "DOUBLE"),
+        ("q_total_assets",      "DOUBLE"), ("a_total_assets",      "DOUBLE"),
+        ("q_total_assets_yoy",  "DOUBLE"), ("a_total_assets_yoy",  "DOUBLE"),
     ]
     existing_fund = {row[0] for row in con.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'fundamentals'"
@@ -975,6 +1124,35 @@ def get_tickers_run_since(cutoff_dt: str) -> set[str]:
         [cutoff_dt],
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def get_tickers_missing_f1f6(run_dt: str) -> list[str]:
+    """Return tickers in run_dt where any F1–F6 sub-indicator (or F5/F6 parent) is NA.
+
+    Used to find candidates for a targeted fundamentals re-scan.
+    """
+    con = _conn()
+    rows = con.execute(
+        """
+        SELECT ticker FROM analysis_runs
+        WHERE run_dt = ?
+          AND (
+            F1_sub_q_rev     IS NULL OR F1_sub_q_rev     = 'NA' OR
+            F1_sub_q_eps     IS NULL OR F1_sub_q_eps     = 'NA' OR
+            F2_sub_a_rev     IS NULL OR F2_sub_a_rev     = 'NA' OR
+            F2_sub_a_eps     IS NULL OR F2_sub_a_eps     = 'NA' OR
+            F3_sub_q_rev_yoy IS NULL OR F3_sub_q_rev_yoy = 'NA' OR
+            F3_sub_q_eps_yoy IS NULL OR F3_sub_q_eps_yoy = 'NA' OR
+            F4_sub_a_rev_yoy IS NULL OR F4_sub_a_rev_yoy = 'NA' OR
+            F4_sub_a_eps_yoy IS NULL OR F4_sub_a_eps_yoy = 'NA' OR
+            F5               IS NULL OR F5               = 'NA' OR
+            F6               IS NULL OR F6               = 'NA'
+          )
+        ORDER BY ticker
+        """,
+        [run_dt],
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def get_datetimes_for_ticker(ticker: str) -> list[str]:
@@ -1685,6 +1863,203 @@ def get_custom_period_returns(
                 "Cust Avg Vol%":_pct(e[3], s[3]),
             }
     return result
+
+
+def get_latest_price_dates(tickers: list[str]) -> dict[str, str]:
+    """Return {ticker: latest_date_str} for each ticker in price_history."""
+    if not tickers:
+        return {}
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    rows = con.execute(
+        f"""
+        SELECT ticker, CAST(MAX(date) AS TEXT)
+        FROM price_history
+        WHERE ticker IN ({placeholders})
+        GROUP BY ticker
+        """,
+        tickers,
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def get_price_history_max_date(tickers: list[str]) -> str | None:
+    """Return the global max date across all specified tickers in price_history."""
+    if not tickers:
+        return None
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    row = con.execute(
+        f"SELECT CAST(MAX(date) AS TEXT) FROM price_history WHERE ticker IN ({placeholders})",
+        tickers,
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_trigger_period_returns(
+    ticker_date_pairs: dict[str, tuple[str, str]],
+) -> dict[str, dict]:
+    """Compute returns for each ticker between its specific (start_date, end_date).
+
+    Uses the same 5-day rolling average window logic as get_custom_period_returns.
+    Returns {ticker: {"px_pct":..., "vol_pct":..., "avg_px_pct":..., "avg_vol_pct":...}}
+    """
+    if not ticker_date_pairs:
+        return {}
+
+    tickers = list(ticker_date_pairs.keys())
+    placeholders = ", ".join(["?" for _ in tickers])
+
+    # Build VALUES clause: (ticker, start_date, end_date)
+    values_rows = []
+    values_params: list = []
+    for ticker, (start_date, end_date) in ticker_date_pairs.items():
+        values_rows.append("(?, ?, ?)")
+        values_params.extend([ticker, start_date, end_date])
+
+    values_sql = ", ".join(values_rows)
+
+    sql = f"""
+    WITH date_pairs(ticker, start_date, end_date) AS (
+        VALUES {values_sql}
+    ),
+    all_avgs AS (
+        SELECT
+            ph.ticker, ph.date, ph.close, ph.volume,
+            AVG(ph.close) OVER (
+                PARTITION BY ph.ticker ORDER BY ph.date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            ) AS close_5d_avg,
+            AVG(CAST(ph.volume AS DOUBLE)) OVER (
+                PARTITION BY ph.ticker ORDER BY ph.date
+                ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+            ) AS vol_5d_avg
+        FROM price_history ph
+        WHERE ph.ticker IN ({placeholders})
+    ),
+    start_prices AS (
+        SELECT
+            dp.ticker,
+            aa.close AS s_close, aa.volume AS s_vol,
+            aa.close_5d_avg AS s_c5a, aa.vol_5d_avg AS s_v5a,
+            ROW_NUMBER() OVER (PARTITION BY dp.ticker ORDER BY aa.date DESC) AS rn
+        FROM date_pairs dp
+        JOIN all_avgs aa
+            ON dp.ticker = aa.ticker
+            AND aa.date <= CAST(dp.start_date AS DATE)
+    ),
+    end_prices AS (
+        SELECT
+            dp.ticker,
+            aa.close AS e_close, aa.volume AS e_vol,
+            aa.close_5d_avg AS e_c5a, aa.vol_5d_avg AS e_v5a,
+            ROW_NUMBER() OVER (PARTITION BY dp.ticker ORDER BY aa.date DESC) AS rn
+        FROM date_pairs dp
+        JOIN all_avgs aa
+            ON dp.ticker = aa.ticker
+            AND aa.date <= CAST(dp.end_date AS DATE)
+    )
+    SELECT
+        s.ticker,
+        CASE WHEN s.s_close > 0  THEN (e.e_close / s.s_close - 1) * 100  ELSE NULL END AS px_pct,
+        CASE WHEN s.s_vol > 0    THEN (CAST(e.e_vol AS DOUBLE) / s.s_vol - 1) * 100 ELSE NULL END AS vol_pct,
+        CASE WHEN s.s_c5a > 0   THEN (e.e_c5a / s.s_c5a - 1) * 100     ELSE NULL END AS avg_px_pct,
+        CASE WHEN s.s_v5a > 0   THEN (e.e_v5a / s.s_v5a - 1) * 100     ELSE NULL END AS avg_vol_pct
+    FROM (SELECT * FROM start_prices WHERE rn = 1) s
+    JOIN (SELECT * FROM end_prices WHERE rn = 1) e ON s.ticker = e.ticker
+    """
+
+    con = _conn()
+    rows = con.execute(sql, values_params + tickers).fetchall()
+
+    def _r(v):
+        return round(v, 4) if v is not None else None
+
+    result: dict[str, dict] = {}
+    for ticker, px, vol, avg_px, avg_vol in rows:
+        result[ticker] = {
+            "px_pct":     _r(px),
+            "vol_pct":    _r(vol),
+            "avg_px_pct": _r(avg_px),
+            "avg_vol_pct":_r(avg_vol),
+        }
+    return result
+
+
+def get_trigger_cache(
+    cache_key: str,
+    tickers: list[str],
+    current_max_date: str | None,
+) -> dict[str, dict] | None:
+    """Return cached trigger results if valid; None on miss or stale.
+
+    Cache is valid when:
+    - All requested tickers have an entry for this cache_key
+    - Every entry has max_ph_date == current_max_date
+    """
+    if not tickers or current_max_date is None:
+        return None
+
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    rows = con.execute(
+        f"""
+        SELECT ticker, start_date, end_date,
+               trig_px_pct, trig_vol_pct, trig_avg_px_pct, trig_avg_vol_pct
+        FROM trigger_cache
+        WHERE cache_key = ?
+          AND ticker IN ({placeholders})
+          AND (max_ph_date = ? OR (max_ph_date IS NULL AND ? IS NULL))
+        """,
+        [cache_key] + tickers + [current_max_date, current_max_date],
+    ).fetchall()
+
+    if len(rows) < len(tickers):
+        return None  # incomplete coverage
+
+    result: dict[str, dict] = {}
+    for row in rows:
+        ticker, start_d, end_d, px, vol, avg_px, avg_vol = row
+        result[ticker] = {
+            "Trig Start Date": start_d,
+            "Trig End Date":   end_d,
+            "Trig Px%":        px,
+            "Trig Vol%":       vol,
+            "Trig Avg Px%":    avg_px,
+            "Trig Avg Vol%":   avg_vol,
+        }
+    return result
+
+
+def save_trigger_cache(
+    cache_key: str,
+    results: dict[str, dict],
+    max_ph_date: str | None,
+) -> None:
+    """Upsert trigger results into trigger_cache for the given cache_key."""
+    if not results:
+        return
+    now = datetime.now(ZoneInfo("America/Chicago"))
+    con = _conn()
+    # Remove stale entries for this cache_key first
+    con.execute("DELETE FROM trigger_cache WHERE cache_key = ?", [cache_key])
+    for ticker, r in results.items():
+        con.execute(
+            """
+            INSERT OR REPLACE INTO trigger_cache
+                (cache_key, ticker, start_date, end_date,
+                 trig_px_pct, trig_vol_pct, trig_avg_px_pct, trig_avg_vol_pct,
+                 max_ph_date, computed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                cache_key, ticker,
+                r.get("Trig Start Date"), r.get("Trig End Date"),
+                r.get("Trig Px%"), r.get("Trig Vol%"),
+                r.get("Trig Avg Px%"), r.get("Trig Avg Vol%"),
+                max_ph_date, now,
+            ],
+        )
 
 
 def update_earnings_extended(ticker: str, earnings_date: str, fields: dict) -> None:
