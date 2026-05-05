@@ -43,3 +43,9 @@ chat_export_*.md
 user_prefs.json
 
 CRWV_*.md
+# Local databases
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.db
+*.sqlite

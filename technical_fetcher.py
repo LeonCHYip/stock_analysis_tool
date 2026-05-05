@@ -39,15 +39,18 @@ _BATCH_SIZE = 100   # yf.download tickers per call
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_price_rows(df: pd.DataFrame) -> list[tuple]:
-    """Extract (date_str, close, volume) tuples from an OHLCV DataFrame."""
-    sub = df[["Close", "Volume"]].dropna(subset=["Close"])
+    """Extract (date_str, open, high, low, close, volume) tuples from an OHLCV DataFrame."""
+    sub = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
     rows = []
     for idx, row in sub.iterrows():
         d = idx.date().isoformat() if hasattr(idx, "date") else str(idx)[:10]
+        o = _safe(row["Open"], 4)
+        h = _safe(row["High"], 4)
+        l = _safe(row["Low"], 4)
         c = _safe(row["Close"], 4)
         v = _safe_int(row["Volume"])
         if c is not None:
-            rows.append((d, c, v))
+            rows.append((d, o, h, l, c, v))
     return rows
 
 def _safe(v, ndigits=2):
@@ -362,14 +365,36 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             days_since_52w_high = int(len(close_52w) - 1 - idx_high)
             days_since_52w_low  = int(len(close_52w) - 1 - idx_low)
 
-        # Whether today's close is the high/low of the window
-        c_today = latest_close or 0.0
-        made_high_5d   = bool(c_today >= float(close.tail(5).max()))   if n >= 5   else None
-        made_high_22d  = bool(c_today >= float(close.tail(22).max()))  if n >= 22  else None
-        made_high_252d = bool(c_today >= float(close.tail(252).max())) if n >= 252 else None
-        made_low_5d    = bool(c_today <= float(close.tail(5).min()))   if n >= 5   else None
-        made_low_22d   = bool(c_today <= float(close.tail(22).min()))  if n >= 22  else None
-        made_low_252d  = bool(c_today <= float(close.tail(252).min())) if n >= 252 else None
+        # Whether today's OHLC intraday high is the high of the window
+        h_today = _safe(high.iloc[-1]) or 0.0
+        made_high_5d   = bool(h_today >= float(high.tail(5).max()))   if n >= 5   else None
+        made_high_22d  = bool(h_today >= float(high.tail(22).max()))  if n >= 22  else None
+        made_high_252d = bool(h_today >= float(high.tail(252).max())) if n >= 252 else None
+        made_high_3m   = bool(h_today >= float(high.tail(63).max()))  if n >= 63  else None
+        made_high_3y   = bool(h_today >= float(high.max()))           if n >= 1   else None
+        made_low_5d    = bool(h_today <= float(low.tail(5).min()))    if n >= 5   else None
+        made_low_22d   = bool(h_today <= float(low.tail(22).min()))   if n >= 22  else None
+        made_low_252d  = bool(h_today <= float(low.tail(252).min()))  if n >= 252 else None
+
+        # Days since intraday high in each window (0 = today is the high)
+        def _days_since_intraday_high(window: pd.Series) -> int | None:
+            if window.empty:
+                return None
+            loc = window.index.get_loc(window.idxmax())
+            return int(len(window) - 1 - loc)
+
+        days_since_5d_high  = _days_since_intraday_high(high.tail(5))   if n >= 5   else None
+        days_since_22d_high = _days_since_intraday_high(high.tail(22))  if n >= 22  else None
+        days_since_3m_high  = _days_since_intraday_high(high.tail(63))  if n >= 63  else None
+        days_since_3y_high  = _days_since_intraday_high(high)           if n >= 1   else None
+
+        # Close-based pct from high for short windows
+        high_close_5d  = _safe(close.tail(5).max())   if n >= 5  else None
+        high_close_22d = _safe(close.tail(22).max())  if n >= 22 else None
+        high_close_3m  = _safe(close.tail(63).max())  if n >= 63 else None
+        pct_from_high_close_5d  = _pct_from_ma(latest_close, high_close_5d)
+        pct_from_high_close_22d = _pct_from_ma(latest_close, high_close_22d)
+        pct_from_high_close_3m  = _pct_from_ma(latest_close, high_close_3m)
 
         # ── Donchian channels ─────────────────────────────────────────────────
         def _donchian(window):
@@ -470,6 +495,41 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         up3m, dn3m, r3m, ms3m, sp3m = _rolling_stats(63)
         up1y, dn1y, r1y, ms1y, sp1y = _rolling_stats(252)
 
+        # ── Consecutive up-close streak ───────────────────────────────────────
+        up_streak_days = 0
+        up_streak_px_pct = up_streak_vol_pct = None
+        up_streak_avg_px_pct = up_streak_avg_vol_pct = None
+        if n >= 2:
+            _daily_px_chg = close.pct_change() * 100
+            _daily_vol_chg = volume.replace(0, np.nan).pct_change() * 100
+            # Count consecutive up-close days ending today
+            streak = 0
+            for _i in range(n - 1, 0, -1):
+                if float(close.iloc[_i]) > float(close.iloc[_i - 1]):
+                    streak += 1
+                else:
+                    break
+            up_streak_days = streak
+            if streak > 0:
+                streak_close = close.iloc[-streak:]
+                streak_vol   = volume.replace(0, np.nan).iloc[-streak:]
+                prior_close  = close.iloc[max(0, n - streak * 2): n - streak]
+                prior_vol    = volume.replace(0, np.nan).iloc[max(0, n - streak * 2): n - streak]
+                if len(prior_close) > 0 and prior_close.mean() != 0:
+                    up_streak_px_pct = _safe(
+                        (streak_close.mean() / prior_close.mean() - 1) * 100
+                    )
+                if len(prior_vol) > 0 and prior_vol.mean() != 0:
+                    up_streak_vol_pct = _safe(
+                        (streak_vol.mean() / prior_vol.mean() - 1) * 100
+                    )
+                _streak_daily_px  = _daily_px_chg.iloc[-streak:].dropna()
+                _streak_daily_vol = _daily_vol_chg.iloc[-streak:].dropna()
+                if not _streak_daily_px.empty:
+                    up_streak_avg_px_pct = _safe(_streak_daily_px.mean())
+                if not _streak_daily_vol.empty:
+                    up_streak_avg_vol_pct = _safe(_streak_daily_vol.mean())
+
         # ── Big moves (90d, ≥10%) ─────────────────────────────────────────────
         pct_change = close.pct_change() * 100
         vol_30d_avg = volume.rolling(window=30, min_periods=10).mean().shift(1)
@@ -564,9 +624,23 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "made_high_5d":            made_high_5d,
             "made_high_22d":           made_high_22d,
             "made_high_252d":          made_high_252d,
+            "made_high_3m":            made_high_3m,
+            "made_high_3y":            made_high_3y,
             "made_low_5d":             made_low_5d,
             "made_low_22d":            made_low_22d,
             "made_low_252d":           made_low_252d,
+            "days_since_5d_high":      days_since_5d_high,
+            "days_since_22d_high":     days_since_22d_high,
+            "days_since_3m_high":      days_since_3m_high,
+            "days_since_3y_high":      days_since_3y_high,
+            "pct_from_high_close_5d":  pct_from_high_close_5d,
+            "pct_from_high_close_22d": pct_from_high_close_22d,
+            "pct_from_high_close_3m":  pct_from_high_close_3m,
+            "up_streak_days":          up_streak_days,
+            "up_streak_px_pct":        up_streak_px_pct,
+            "up_streak_vol_pct":       up_streak_vol_pct,
+            "up_streak_avg_px_pct":    up_streak_avg_px_pct,
+            "up_streak_avg_vol_pct":   up_streak_avg_vol_pct,
             "donchian_high_20":    d_high_20,
             "donchian_low_20":     d_low_20,
             "donchian_high_55":    d_high_55,

@@ -138,9 +138,24 @@ CREATE TABLE IF NOT EXISTS tech_indicators (
     made_high_5d            BOOLEAN,
     made_high_22d           BOOLEAN,
     made_high_252d          BOOLEAN,
+    made_high_3m            BOOLEAN,
+    made_high_3y            BOOLEAN,
     made_low_5d             BOOLEAN,
     made_low_22d            BOOLEAN,
     made_low_252d           BOOLEAN,
+    days_since_5d_high      INTEGER,
+    days_since_22d_high     INTEGER,
+    days_since_3m_high      INTEGER,
+    days_since_3y_high      INTEGER,
+    pct_from_high_close_5d  DOUBLE,
+    pct_from_high_close_22d DOUBLE,
+    pct_from_high_close_3m  DOUBLE,
+    -- Consecutive up-close streak
+    up_streak_days          INTEGER,
+    up_streak_px_pct        DOUBLE,
+    up_streak_vol_pct       DOUBLE,
+    up_streak_avg_px_pct    DOUBLE,
+    up_streak_avg_vol_pct   DOUBLE,
     -- Donchian
     donchian_high_20    DOUBLE,
     donchian_low_20     DOUBLE,
@@ -378,6 +393,9 @@ _DDL_PRICE_HISTORY = """
 CREATE TABLE IF NOT EXISTS price_history (
     ticker  TEXT   NOT NULL,
     date    DATE   NOT NULL,
+    open    DOUBLE,
+    high    DOUBLE,
+    low     DOUBLE,
     close   DOUBLE,
     volume  BIGINT,
     PRIMARY KEY (ticker, date)
@@ -474,9 +492,23 @@ def _migrate_add_columns(con) -> None:
         ("made_high_5d",                "BOOLEAN"),
         ("made_high_22d",               "BOOLEAN"),
         ("made_high_252d",              "BOOLEAN"),
+        ("made_high_3m",                "BOOLEAN"),
+        ("made_high_3y",                "BOOLEAN"),
         ("made_low_5d",                 "BOOLEAN"),
         ("made_low_22d",                "BOOLEAN"),
         ("made_low_252d",               "BOOLEAN"),
+        ("days_since_5d_high",          "INTEGER"),
+        ("days_since_22d_high",         "INTEGER"),
+        ("days_since_3m_high",          "INTEGER"),
+        ("days_since_3y_high",          "INTEGER"),
+        ("pct_from_high_close_5d",      "DOUBLE"),
+        ("pct_from_high_close_22d",     "DOUBLE"),
+        ("pct_from_high_close_3m",      "DOUBLE"),
+        ("up_streak_days",              "INTEGER"),
+        ("up_streak_px_pct",            "DOUBLE"),
+        ("up_streak_vol_pct",           "DOUBLE"),
+        ("up_streak_avg_px_pct",        "DOUBLE"),
+        ("up_streak_avg_vol_pct",       "DOUBLE"),
         ("pct_from_sma10",         "DOUBLE"),
         ("pct_from_sma20",         "DOUBLE"),
         ("pct_from_sma50",         "DOUBLE"),
@@ -622,6 +654,15 @@ def _migrate_add_columns(con) -> None:
     for col, dtype in new_earn_cols:
         if col not in existing_earn:
             con.execute(f"ALTER TABLE earnings_history ADD COLUMN {col} {dtype}")
+
+    # Add OHLC columns to price_history
+    new_ph_cols = [("open", "DOUBLE"), ("high", "DOUBLE"), ("low", "DOUBLE")]
+    existing_ph = {row[0] for row in con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'price_history'"
+    ).fetchall()}
+    for col, dtype in new_ph_cols:
+        if col not in existing_ph:
+            con.execute(f"ALTER TABLE price_history ADD COLUMN {col} {dtype}")
 
 
 def _migrate_earnings_surprise_to_double(con) -> None:
@@ -1534,15 +1575,24 @@ def save_price_history(ticker: str, rows: list[tuple]) -> None:
 
     Args:
         ticker: ticker symbol
-        rows: list of (date_str, close, volume) tuples, date_str as 'YYYY-MM-DD'
+        rows: list of (date_str, open, high, low, close, volume) or (date_str, close, volume) tuples
     """
     if not rows:
         return
     con = _conn()
-    con.executemany(
-        "INSERT OR REPLACE INTO price_history (ticker, date, close, volume) VALUES (?, ?, ?, ?)",
-        [(ticker, r[0], r[1], r[2]) for r in rows],
-    )
+    if len(rows[0]) >= 6:
+        # Full OHLCV: (date, open, high, low, close, volume)
+        con.executemany(
+            "INSERT OR REPLACE INTO price_history (ticker, date, open, high, low, close, volume) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(ticker, r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows],
+        )
+    else:
+        # Legacy (date, close, volume) — leave open/high/low NULL
+        con.executemany(
+            "INSERT OR REPLACE INTO price_history (ticker, date, close, volume) VALUES (?, ?, ?, ?)",
+            [(ticker, r[0], r[1], r[2]) for r in rows],
+        )
 
 
 def _pct(new_val, old_val) -> float | None:
@@ -2060,6 +2110,359 @@ def save_trigger_cache(
                 max_ph_date, now,
             ],
         )
+
+
+def get_event_scan_stats(
+    pairs: list[tuple[str, str]],
+) -> list[dict]:
+    """Given [(ticker, trigger_date), ...], compute post-trigger stats for Event Scanner.
+
+    Supports multiple trigger dates per ticker. Returns a list of dicts (one per
+    input pair), each containing:
+        "ticker", "trigger_date", "trig_close", "trig_vol", "trig_dollar_vol",
+        "latest_date", "latest_close", "latest_vol", "latest_dollar_vol",
+        "px_pct", "vol_pct",
+        "max_high", "max_date", "max_close", "max_vol", "max_dollar_vol",
+        "max_high_pct", "max_vol_pct",
+        "min_low", "min_date", "min_close", "min_vol", "min_dollar_vol",
+        "min_low_pct", "min_vol_pct",
+        "days_since_trig", "days_to_max", "days_to_min",
+        "trig_mkt_cap_b", "earns_1d_px_pct", "sector", "industry", "_run_row",
+    """
+    if not pairs:
+        return []
+
+    tickers = list(dict.fromkeys(t for t, _ in pairs))
+    placeholders = ", ".join(["?" for _ in tickers])
+
+    val_rows = ", ".join("(?, ?)" for _ in pairs)
+    val_params: list = []
+    for t, d in pairs:
+        val_params.extend([t, d])
+
+    # ── OHLC-based post-trigger stats via QUALIFY CTEs ────────────────────────
+    # All window functions partition by (ticker, trigger_date) so multiple
+    # trigger dates per ticker are handled independently.
+    sql_ph = f"""
+    WITH triggers(ticker, trigger_date) AS (
+        VALUES {val_rows}
+    ),
+    post_range AS (
+        SELECT
+            ph.ticker,
+            tr.trigger_date,
+            ph.date,
+            COALESCE(ph.high, ph.close)                  AS day_high,
+            COALESCE(ph.low,  ph.close)                  AS day_low,
+            ph.close,
+            CAST(ph.volume AS DOUBLE)                    AS volume,
+            ph.close * CAST(ph.volume AS DOUBLE)         AS dollar_vol
+        FROM price_history ph
+        JOIN triggers tr ON ph.ticker = tr.ticker
+        WHERE ph.date >= CAST(tr.trigger_date AS DATE)
+    ),
+    trig_row AS (
+        SELECT ticker, trigger_date,
+               CAST(date AS TEXT) AS trig_date,
+               close              AS trig_close,
+               volume             AS trig_vol,
+               dollar_vol         AS trig_dollar_vol
+        FROM post_range
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY ticker, trigger_date ORDER BY date ASC
+        ) = 1
+    ),
+    latest_row AS (
+        SELECT ticker, trigger_date,
+               CAST(date AS TEXT) AS last_date,
+               close              AS last_close,
+               volume             AS last_vol,
+               dollar_vol         AS last_dollar_vol
+        FROM post_range
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY ticker, trigger_date ORDER BY date DESC
+        ) = 1
+    ),
+    max_row AS (
+        SELECT ticker, trigger_date,
+               CAST(date AS TEXT) AS max_date,
+               day_high           AS max_high,
+               close              AS max_close,
+               volume             AS max_vol,
+               dollar_vol         AS max_dollar_vol
+        FROM post_range
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY ticker, trigger_date ORDER BY day_high DESC, date ASC
+        ) = 1
+    ),
+    min_row AS (
+        SELECT ticker, trigger_date,
+               CAST(date AS TEXT) AS min_date,
+               day_low            AS min_low,
+               close              AS min_close,
+               volume             AS min_vol,
+               dollar_vol         AS min_dollar_vol
+        FROM post_range
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY ticker, trigger_date ORDER BY day_low ASC, date ASC
+        ) = 1
+    )
+    SELECT
+        tr.ticker,
+        CAST(tr.trigger_date AS TEXT),
+        tr.trig_date,    tr.trig_close,   tr.trig_vol,   tr.trig_dollar_vol,
+        la.last_date,    la.last_close,   la.last_vol,   la.last_dollar_vol,
+        mx.max_date,     mx.max_high,     mx.max_close,  mx.max_vol,   mx.max_dollar_vol,
+        mn.min_date,     mn.min_low,      mn.min_close,  mn.min_vol,   mn.min_dollar_vol
+    FROM trig_row tr
+    LEFT JOIN latest_row la
+        ON tr.ticker = la.ticker AND tr.trigger_date = la.trigger_date
+    LEFT JOIN max_row mx
+        ON tr.ticker = mx.ticker AND tr.trigger_date = mx.trigger_date
+    LEFT JOIN min_row mn
+        ON tr.ticker = mn.ticker AND tr.trigger_date = mn.trigger_date
+    """
+
+    con = _conn()
+    try:
+        ph_rows = con.execute(sql_ph, val_params).fetchall()
+    except Exception:
+        ph_rows = []
+
+    # Keyed by (ticker, trigger_date)
+    ph_map: dict[tuple[str, str], dict] = {}
+    for row in ph_rows:
+        (ticker, trigger_date,
+         trig_date,  trig_close,  trig_vol,  trig_dollar_vol,
+         last_date,  last_close,  last_vol,  last_dollar_vol,
+         max_date,   max_high,    max_close, max_vol,  max_dollar_vol,
+         min_date,   min_low,     min_close, min_vol,  min_dollar_vol) = row
+        ph_map[(ticker, str(trigger_date))] = {
+            "trig_date":        str(trig_date)  if trig_date  else None,
+            "trig_close":       trig_close,
+            "trig_vol":         trig_vol,
+            "trig_dollar_vol":  trig_dollar_vol,
+            "last_date":        str(last_date)  if last_date  else None,
+            "last_close":       last_close,
+            "last_vol":         last_vol,
+            "last_dollar_vol":  last_dollar_vol,
+            "max_date":         str(max_date)   if max_date   else None,
+            "max_high":         max_high,
+            "max_close":        max_close,
+            "max_vol":          max_vol,
+            "max_dollar_vol":   max_dollar_vol,
+            "min_date":         str(min_date)   if min_date   else None,
+            "min_low":          min_low,
+            "min_close":        min_close,
+            "min_vol":          min_vol,
+            "min_dollar_vol":   min_dollar_vol,
+        }
+
+    # ── Latest score from analysis_runs ──────────────────────────────────────
+    try:
+        score_rows = con.execute(
+            f"""
+            SELECT ticker,
+                   T1, T2, T3, T4, F1, F2, F3, F4, F5, F6,
+                   T1_sub_3m_price, T1_sub_3m_vol, T1_sub_12m_price, T1_sub_12m_vol,
+                   T2_sub_3m_price, T2_sub_3m_vol, T2_sub_12m_price, T2_sub_12m_vol,
+                   T3_sub_ma10_20, T3_sub_ma20_50, T3_sub_ma50_150, T3_sub_ma150_200,
+                   T4_sub_has_big_up, T4_sub_no_big_down,
+                   F1_sub_q_rev, F1_sub_q_eps, F2_sub_a_rev, F2_sub_a_eps,
+                   F3_sub_q_rev_yoy, F3_sub_q_eps_yoy, F4_sub_a_rev_yoy, F4_sub_a_eps_yoy,
+                   market_cap,
+                   run_dt
+            FROM analysis_runs
+            WHERE ticker IN ({placeholders})
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY run_dt DESC) = 1
+            """,
+            tickers,
+        ).fetchall()
+    except Exception:
+        score_rows = []
+
+    _score_cols = [
+        "ticker", "T1", "T2", "T3", "T4", "F1", "F2", "F3", "F4", "F5", "F6",
+        "T1_sub_3m_price", "T1_sub_3m_vol", "T1_sub_12m_price", "T1_sub_12m_vol",
+        "T2_sub_3m_price", "T2_sub_3m_vol", "T2_sub_12m_price", "T2_sub_12m_vol",
+        "T3_sub_ma10_20", "T3_sub_ma20_50", "T3_sub_ma50_150", "T3_sub_ma150_200",
+        "T4_sub_has_big_up", "T4_sub_no_big_down",
+        "F1_sub_q_rev", "F1_sub_q_eps", "F2_sub_a_rev", "F2_sub_a_eps",
+        "F3_sub_q_rev_yoy", "F3_sub_q_eps_yoy", "F4_sub_a_rev_yoy", "F4_sub_a_eps_yoy",
+        "market_cap", "run_dt",
+    ]
+    score_map: dict[str, dict] = {}
+    for row in score_rows:
+        d = dict(zip(_score_cols, row))
+        score_map[d["ticker"]] = d
+
+    # ── Sector/industry from fundamentals ─────────────────────────────────────
+    try:
+        fund_rows = con.execute(
+            f"""
+            SELECT ticker, raw_info_json
+            FROM fundamentals
+            WHERE ticker IN ({placeholders})
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY fetch_date DESC) = 1
+            """,
+            tickers,
+        ).fetchall()
+    except Exception:
+        fund_rows = []
+
+    si_map: dict[str, tuple[str, str]] = {}
+    for ticker, raw_json in fund_rows:
+        try:
+            info = json.loads(raw_json) if raw_json else {}
+            si_map[ticker] = (info.get("sector") or "N/A", info.get("industry") or "N/A")
+        except Exception:
+            si_map[ticker] = ("N/A", "N/A")
+
+    # ── Earnings 1D px% closest to each trigger date ─────────────────────────
+    # Partition by (ticker, trigger_date) so each event gets its own lookup.
+    try:
+        earns_rows = con.execute(
+            f"""
+            WITH triggers(ticker, trigger_date) AS (VALUES {val_rows}),
+            ranked AS (
+                SELECT e.ticker,
+                       CAST(tr.trigger_date AS TEXT) AS trigger_date,
+                       e.one_day_change,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY e.ticker, tr.trigger_date
+                           ORDER BY ABS(DATEDIFF('day',
+                               CAST(e.earnings_date AS DATE),
+                               CAST(tr.trigger_date AS DATE)
+                           ))
+                       ) AS rn
+                FROM earnings_history e
+                JOIN triggers tr ON e.ticker = tr.ticker
+                WHERE e.earnings_date <= tr.trigger_date
+            )
+            SELECT ticker, trigger_date, one_day_change FROM ranked WHERE rn = 1
+            """,
+            val_params,
+        ).fetchall()
+    except Exception:
+        earns_rows = []
+
+    # Keyed by (ticker, trigger_date)
+    earns_map: dict[tuple[str, str], float | None] = {
+        (r[0], r[1]): r[2] for r in earns_rows
+    }
+
+    # ── Mkt cap from analysis_runs at each trigger date ───────────────────────
+    try:
+        trig_mc_rows = con.execute(
+            f"""
+            WITH triggers(ticker, trigger_date) AS (VALUES {val_rows})
+            SELECT ar.ticker,
+                   CAST(tr.trigger_date AS TEXT) AS trigger_date,
+                   ar.market_cap
+            FROM analysis_runs ar
+            JOIN triggers tr ON ar.ticker = tr.ticker
+            WHERE CAST(ar.run_dt AS DATE) = CAST(tr.trigger_date AS DATE)
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ar.ticker, tr.trigger_date ORDER BY ar.run_dt DESC
+            ) = 1
+            """,
+            val_params,
+        ).fetchall()
+    except Exception:
+        trig_mc_rows = []
+
+    trig_mc_map: dict[tuple[str, str], float | None] = {
+        (r[0], r[1]): r[2] for r in trig_mc_rows
+    }
+
+    from datetime import date as _date
+
+    def _days_between(d1: str | None, d2: str | None) -> int | None:
+        if not d1 or not d2:
+            return None
+        try:
+            return (_date.fromisoformat(d2) - _date.fromisoformat(d1)).days
+        except Exception:
+            return None
+
+    def _pct_change(new_val, base_val) -> float | None:
+        try:
+            if base_val and base_val != 0:
+                return round((float(new_val) / float(base_val) - 1) * 100, 2)
+        except Exception:
+            pass
+        return None
+
+    result: list[dict] = []
+    for ticker, td in pairs:
+        key = (ticker, td)
+        ph  = ph_map.get(key, {})
+        sc  = score_map.get(ticker, {})
+        sector, industry = si_map.get(ticker, ("N/A", "N/A"))
+
+        trig_close      = ph.get("trig_close")
+        trig_vol        = ph.get("trig_vol")
+        trig_dollar_vol = ph.get("trig_dollar_vol")
+        last_close      = ph.get("last_close")
+        last_vol        = ph.get("last_vol")
+        last_dollar_vol = ph.get("last_dollar_vol")
+        last_date       = ph.get("last_date")
+        max_high        = ph.get("max_high")
+        max_date        = ph.get("max_date")
+        max_close       = ph.get("max_close")
+        max_vol         = ph.get("max_vol")
+        max_dollar_vol  = ph.get("max_dollar_vol")
+        min_low         = ph.get("min_low")
+        min_date        = ph.get("min_date")
+        min_close       = ph.get("min_close")
+        min_vol         = ph.get("min_vol")
+        min_dollar_vol  = ph.get("min_dollar_vol")
+
+        trig_mc   = trig_mc_map.get(key)
+        latest_mc = sc.get("market_cap")
+        trig_mkt_cap_b = None
+        if trig_mc:
+            trig_mkt_cap_b = round(trig_mc / 1e9, 2)
+        elif latest_mc and trig_close and last_close and last_close != 0:
+            trig_mkt_cap_b = round(latest_mc * (trig_close / last_close) / 1e9, 2)
+
+        result.append({
+            "ticker":           ticker,
+            "trigger_date":     td,
+            "trig_close":       trig_close,
+            "trig_vol":         trig_vol,
+            "trig_dollar_vol":  trig_dollar_vol,
+            "latest_date":      last_date,
+            "latest_close":     last_close,
+            "latest_vol":       last_vol,
+            "latest_dollar_vol": last_dollar_vol,
+            "px_pct":           _pct_change(last_close, trig_close),
+            "vol_pct":          _pct_change(last_vol, trig_vol),
+            "max_high":         max_high,
+            "max_date":         max_date,
+            "max_close":        max_close,
+            "max_vol":          max_vol,
+            "max_dollar_vol":   max_dollar_vol,
+            "max_high_pct":     _pct_change(max_high, trig_close),
+            "max_vol_pct":      _pct_change(max_vol, trig_vol),
+            "min_low":          min_low,
+            "min_date":         min_date,
+            "min_close":        min_close,
+            "min_vol":          min_vol,
+            "min_dollar_vol":   min_dollar_vol,
+            "min_low_pct":      _pct_change(min_low, trig_close),
+            "min_vol_pct":      _pct_change(min_vol, trig_vol),
+            "days_since_trig":  _days_between(td, last_date),
+            "days_to_max":      _days_between(td, max_date),
+            "days_to_min":      _days_between(td, min_date),
+            "trig_mkt_cap_b":   trig_mkt_cap_b,
+            "earns_1d_px_pct":  earns_map.get(key),
+            "sector":           sector,
+            "industry":         industry,
+            "_run_row":         sc,
+        })
+
+    return result
 
 
 def update_earnings_extended(ticker: str, earnings_date: str, fields: dict) -> None:

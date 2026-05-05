@@ -160,7 +160,7 @@ earnings_cols AS (
     SELECT
         ticker,
         CAST(earnings_date AS DATE)    AS date,
-        one_day_change * 100           AS earns_1d_px_pct,
+        one_day_change                  AS earns_1d_px_pct,
         earns_1d_vol_pct,
         earns_5d_px_pct,
         earns_5d_vol_pct,
@@ -217,6 +217,37 @@ def _get_trigger_dates(
     con = storage._conn()
     rows = con.execute(sql, tickers + tickers).fetchall()
     return {r[0]: r[1] for r in rows if r[1] is not None}
+
+
+def _get_all_trigger_dates(
+    tickers: list[str],
+    conditions: list[dict],
+    logic: str,
+) -> list[tuple[str, str]]:
+    """Return [(ticker, date), ...] for EVERY row that satisfies conditions.
+
+    Unlike _get_trigger_dates which returns only the latest date per ticker,
+    this returns every matching date so the Event Scanner can show one row
+    per trigger event.
+    """
+    if not tickers or not conditions:
+        return []
+
+    placeholders = ", ".join(["?" for _ in tickers])
+    cond_sql = _build_condition_sql(conditions, logic)
+    cte = _MERGED_CTE.format(placeholders=placeholders)
+
+    sql = f"""
+    {cte}
+    SELECT ticker, CAST(date AS TEXT) AS trigger_date
+    FROM merged
+    WHERE {cond_sql}
+    ORDER BY ticker, date DESC
+    """
+
+    con = storage._conn()
+    rows = con.execute(sql, tickers + tickers).fetchall()
+    return [(r[0], r[1]) for r in rows if r[1] is not None]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,3 +349,59 @@ def _save_and_return(cache_key: str, results: dict, max_date: str | None) -> Non
             storage.save_trigger_cache(cache_key, results, max_date)
         except Exception:
             pass  # cache save failure is non-fatal
+
+
+def get_trigger_date_field_values(
+    pairs: list[tuple[str, str]],
+    field_names: list[str],
+) -> dict[tuple[str, str], dict[str, float | None]]:
+    """Return {(ticker, trigger_date): {field: value}} for given fields at each trigger event.
+
+    Uses the same merged CTE as compute_trigger_returns so all computed fields
+    (daily_px_pct, vol_vs_5d_avg_pct, earns_1d_px_pct, etc.) are available.
+    Accepts a list of (ticker, date) pairs so multiple trigger dates per ticker
+    are handled correctly.
+    """
+    if not pairs or not field_names:
+        return {}
+
+    tickers = list(dict.fromkeys(t for t, _ in pairs))
+    placeholders = ", ".join(["?" for _ in tickers])
+    val_rows = ", ".join("(?, ?)" for _ in pairs)
+    val_params: list = []
+    for t, d in pairs:
+        val_params.extend([t, d])
+
+    safe_fields = [f for f in field_names if f.replace("_", "").isalnum()]
+    if not safe_fields:
+        return {}
+
+    field_list = ", ".join(f"m.{f}" for f in safe_fields)
+
+    cte_text = _MERGED_CTE.format(placeholders=placeholders).strip()
+    if cte_text.upper().startswith("WITH "):
+        cte_body = cte_text[5:]
+    else:
+        cte_body = cte_text
+
+    sql = f"""
+    WITH triggers(ticker, trigger_date) AS (VALUES {val_rows}),
+    {cte_body}
+    SELECT m.ticker, CAST(m.date AS TEXT) AS trig_date, {field_list}
+    FROM merged m
+    JOIN triggers tr
+      ON m.ticker = tr.ticker AND m.date = CAST(tr.trigger_date AS DATE)
+    """
+
+    con = storage._conn()
+    try:
+        rows = con.execute(sql, val_params + tickers + tickers).fetchall()
+    except Exception:
+        return {}
+
+    result: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row[0], row[1])  # (ticker, date)
+        result[key] = {field: row[i + 2] for i, field in enumerate(safe_fields)}
+
+    return result

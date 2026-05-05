@@ -49,7 +49,10 @@ import vpn_switcher
 from indicators    import evaluate_all, score_indicators
 import storage
 import trigger_engine
-from trigger_engine import TRIG_FIELD_OPTIONS, TRIG_FIELD_DISPLAY, TRIG_OP_OPTIONS
+from trigger_engine import (
+    TRIG_FIELD_OPTIONS, TRIG_FIELD_DISPLAY, TRIG_OP_OPTIONS,
+    get_trigger_date_field_values,
+)
 from column_catalog import render_column_reference_tab
 from storage import (
     init_db, save_results, update_field, save_comment_for_ticker, save_status_for_ticker,
@@ -206,13 +209,23 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "Last Close Date", "Close", "Change %", "1D Vol%",
         "52W High", "52W Low", "From 52W High%", "From 52W Low%", "52W Pos%",
     ],
-    "52W & Historical High/Low": [
-        "52W High Close", "From 52W High Close%", "Days Since 52W High",
-        "52W Low Close",  "From 52W Low Close%",  "Days Since 52W Low",
-        "3Y High Close",  "From 3Y High Close%",
-        "3Y Low Close",   "From 3Y Low Close%",
-        "5D High Now", "22D High Now", "52W High Now",
+    "High/Low Now (Intraday)": [
+        "5D High Now", "22D High Now", "3M High Now", "52W High Now", "3Y High Now",
         "5D Low Now",  "22D Low Now",  "52W Low Now",
+        "Days Since 5D High", "Days Since 22D High", "Days Since 3M High",
+        "Days Since 52W High", "Days Since 3Y High",
+        "Days Since 52W Low",
+    ],
+    "High/Low Levels (Close-Based)": [
+        "From 5D High Close%", "From 22D High Close%", "From 3M High Close%",
+        "From 52W High Close%", "From 3Y High Close%",
+        "52W High Close", "52W Low Close", "From 52W Low Close%",
+        "3Y High Close",  "3Y Low Close",  "From 3Y Low Close%",
+    ],
+    "Up Streak": [
+        "Up Streak Days",
+        "Up Streak Px%", "Up Streak Vol%",
+        "Up Streak Avg Px%", "Up Streak Avg Vol%",
     ],
     "Price vs MA (%)": [
         "From SMA10%", "From SMA20%", "From SMA50%", "From SMA150%", "From SMA200%",
@@ -389,9 +402,23 @@ TECH_COL_MAP: dict[str, str] = {
     "made_high_5d":            "5D High Now",
     "made_high_22d":           "22D High Now",
     "made_high_252d":          "52W High Now",
+    "made_high_3m":            "3M High Now",
+    "made_high_3y":            "3Y High Now",
     "made_low_5d":             "5D Low Now",
     "made_low_22d":            "22D Low Now",
     "made_low_252d":           "52W Low Now",
+    "days_since_5d_high":      "Days Since 5D High",
+    "days_since_22d_high":     "Days Since 22D High",
+    "days_since_3m_high":      "Days Since 3M High",
+    "days_since_3y_high":      "Days Since 3Y High",
+    "pct_from_high_close_5d":  "From 5D High Close%",
+    "pct_from_high_close_22d": "From 22D High Close%",
+    "pct_from_high_close_3m":  "From 3M High Close%",
+    "up_streak_days":          "Up Streak Days",
+    "up_streak_px_pct":        "Up Streak Px%",
+    "up_streak_vol_pct":       "Up Streak Vol%",
+    "up_streak_avg_px_pct":    "Up Streak Avg Px%",
+    "up_streak_avg_vol_pct":   "Up Streak Avg Vol%",
 }
 # Reverse map: display name → tech_indicators field
 TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
@@ -400,7 +427,7 @@ TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
 TECH_BOOL_COLS = {
     "Breakout 55D", "Breakout 3M",
     "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
-    "5D High Now", "22D High Now", "52W High Now",
+    "5D High Now", "22D High Now", "52W High Now", "3M High Now", "3Y High Now",
     "5D Low Now",  "22D Low Now",  "52W Low Now",
     "Finalized",
 }
@@ -948,9 +975,24 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "5D High Now":   _bi(tc.get("made_high_5d")),
         "22D High Now":  _bi(tc.get("made_high_22d")),
         "52W High Now":  _bi(tc.get("made_high_252d")),
+        "3M High Now":   _bi(tc.get("made_high_3m")),
+        "3Y High Now":   _bi(tc.get("made_high_3y")),
         "5D Low Now":    _bi(tc.get("made_low_5d")),
         "22D Low Now":   _bi(tc.get("made_low_22d")),
         "52W Low Now":   _bi(tc.get("made_low_252d")),
+        "Days Since 5D High":  tc.get("days_since_5d_high"),
+        "Days Since 22D High": tc.get("days_since_22d_high"),
+        "Days Since 3M High":  tc.get("days_since_3m_high"),
+        "Days Since 3Y High":  tc.get("days_since_3y_high"),
+        "From 5D High Close%":  _f(tc.get("pct_from_high_close_5d")),
+        "From 22D High Close%": _f(tc.get("pct_from_high_close_22d")),
+        "From 3M High Close%":  _f(tc.get("pct_from_high_close_3m")),
+        # Up streak
+        "Up Streak Days":       tc.get("up_streak_days"),
+        "Up Streak Px%":        _f(tc.get("up_streak_px_pct")),
+        "Up Streak Vol%":       _f(tc.get("up_streak_vol_pct")),
+        "Up Streak Avg Px%":    _f(tc.get("up_streak_avg_px_pct")),
+        "Up Streak Avg Vol%":   _f(tc.get("up_streak_avg_vol_pct")),
     }
     # ── Earnings columns (from earnings_history) ──────────────────────────────
     e = earnings or {}
@@ -3388,6 +3430,10 @@ _ai_progress_autorefresh()
 if "ai_confirm_pending" in st.session_state:
     _ai_confirm_dialog(st.session_state["ai_confirm_pending"]["tickers"])
 
+# ── Register all saved tabs so their filter state is available before pending ops
+for _saved_tab in _load_prefs().get("scan_tabs", [{"id": "history", "name": "Market Scan"}]):
+    _register_scan_tab(_saved_tab["id"])
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Apply any pending filter/column ops (must run before any filter widgets render)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3717,6 +3763,9 @@ def render_scan_tab(tab_id: str) -> None:
         .stDataEditor [col-id="fundamental -ve"] .ag-group-value {
             white-space: pre-wrap !important;
         }
+        .stDataEditor [col-id="Sector"] { min-width: 160px; max-width: 160px; }
+        .stDataEditor [col-id="Industry"] { min-width: 72px; max-width: 72px; }
+        .stDataEditor [col-id="Mkt Cap ($B)"] { min-width: 72px; max-width: 72px; }
         </style>""",
         unsafe_allow_html=True,
     )
@@ -3733,20 +3782,75 @@ def render_scan_tab(tab_id: str) -> None:
                 if _sd.startswith(_ind + ".") and _sd in all_df_disp.columns:
                     _emoji_ind_cols.append(_sd)
 
-    _emoji_base = ["#", "Datetime"] + _emoji_ind_cols + ["Score"]
+    _emoji_base = ["#"] + _emoji_ind_cols + ["Score"]
     _emoji_placed = set(_emoji_base)
+    # Auto-inject active column filter cols then sort col immediately after Score
+    _active_filt_cols = list(st.session_state.get(f"col_filt_cols_{tab_id}", []))
+    for _fc in _active_filt_cols:
+        if _fc not in _emoji_placed:
+            if _fc not in all_df_disp.columns:
+                _fc_vals = {t: _pre_val_records.get(t, {}).get(_fc) for t in all_df_disp.index}
+                all_df_disp = all_df_disp.copy()
+                all_df_disp[_fc] = all_df_disp.index.map(_fc_vals)
+            _emoji_base.append(_fc)
+            _emoji_placed.add(_fc)
     if _sort_col not in _emoji_placed and _sort_col in all_df_disp.columns:
         _emoji_base.append(_sort_col)
         _emoji_placed.add(_sort_col)
+    # Mkt Cap / Sector / Industry sit right after filter and sort cols
+    for _msi in ["Mkt Cap ($B)", "Sector", "Industry"]:
+        if _msi not in _emoji_placed and _msi in all_df_disp.columns:
+            _emoji_base.append(_msi)
+            _emoji_placed.add(_msi)
+    # Extra fixed value cols shown after Mkt Cap / Sector / Industry
+    _extra_emoji_cols = [
+        "3M Wkly Avg Px%", "3M Wkly Avg Vol%",
+        "12M Wkly Avg Px%", "12M Wkly Avg Vol%",
+        "# Up≥10%", "# Dn≥10%",
+        "Q Rev YoY%", "Q EPS YoY%",
+        "A Rev YoY%", "A EPS YoY%",
+        "Fwd PE", "P/B",
+    ]
+    for _ec in _extra_emoji_cols:
+        if _ec not in _emoji_placed:
+            if _ec not in all_df_disp.columns:
+                _ec_vals = {t: _pre_val_records.get(t, {}).get(_ec) for t in all_df_disp.index}
+                all_df_disp = all_df_disp.copy()
+                all_df_disp[_ec] = all_df_disp.index.map(_ec_vals)
+            _emoji_base.append(_ec)
+            _emoji_placed.add(_ec)
+
+    # Apply narrow column_config widths for compact extra cols.
+    # make_column_config runs before injection so these cols have no entry yet;
+    # adding them here forces AG Grid to use "small" (~75px) instead of auto-wide.
+    _narrow_fmt: dict[str, str] = {
+        "3M Wkly Avg Px%":  "%.2f",
+        "3M Wkly Avg Vol%": "%.2f",
+        "12M Wkly Avg Px%": "%.2f",
+        "12M Wkly Avg Vol%":"%.2f",
+        "# Up≥10%":         "%d",
+        "# Dn≥10%":         "%d",
+        "Q Rev YoY%":       "%.2f",
+        "Q EPS YoY%":       "%.2f",
+        "A Rev YoY%":       "%.2f",
+        "A EPS YoY%":       "%.2f",
+        "Fwd PE":           "%.2f",
+        "P/B":              "%.2f",
+    }
+    for _nc, _nfmt in _narrow_fmt.items():
+        if _nc in all_df_disp.columns:
+            all_col_cfg[_nc] = st.column_config.NumberColumn(
+                _nc, format=_nfmt, width="small", disabled=True
+            )
 
     _emoji_fixed_right = [
-        "Mkt Cap ($B)", "Sector", "Industry",
         "Status", "Comments",
         "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
         "Company Summary", "Revenue Composition",
         "Company Name", "Company Description",
         "Next Earnings Date", "Next Earnings Time",
         "Close", "Change %", "Last Close Date",
+        "Datetime",
     ]
     _emoji_col_order = [c for c in _emoji_base if c in all_df_disp.columns]
     _emoji_placed = set(_emoji_col_order)
@@ -3758,7 +3862,7 @@ def render_scan_tab(tab_id: str) -> None:
         all_df_disp, column_config=all_col_cfg,
         column_order=_emoji_col_order,
         width="stretch", hide_index=False,
-        height=600,
+        height=720,
         key=_tab_extra_ss(tab_id, "emoji_editor"),
     )
     if st.button("💾 Save", key=_tab_extra_ss(tab_id, "save_all")):
@@ -3888,10 +3992,6 @@ def _add_scan_tab() -> None:
     _copy_tab_settings("history", new_id)
 
 
-# ── Register all saved tabs at startup ────────────────────────────────────────
-for _saved_tab in _get_scan_tabs():
-    _register_scan_tab(_saved_tab["id"])
-
 # ── Dynamic tabs ──────────────────────────────────────────────────────────────
 _scan_tabs_list = _get_scan_tabs()
 
@@ -3904,11 +4004,12 @@ with _plus_col_r:
         _add_scan_tab()
         st.rerun()
 
-_all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + ["🤖 AI Analysis", "📖 Column Reference"]
+_all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + ["🤖 AI Analysis", "📡 Event Scanner", "📖 Column Reference"]
 _all_tab_widgets = st.tabs(_all_tab_labels)
-_scan_tab_widgets = _all_tab_widgets[:-2]
-tab_ai  = _all_tab_widgets[-2]
-tab_ref = _all_tab_widgets[-1]
+_scan_tab_widgets = _all_tab_widgets[:-3]
+tab_ai      = _all_tab_widgets[-3]
+tab_event   = _all_tab_widgets[-2]
+tab_ref     = _all_tab_widgets[-1]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3989,6 +4090,220 @@ with tab_ai:
                         st.error(content)
                     else:
                         st.markdown(content)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB: Event Scanner
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ES_ID = "event_scanner"
+
+with tab_event:
+    st.markdown("### 📡 Event Scanner")
+    st.caption(
+        "Find tickers where a custom condition was recently met in price/earnings history, "
+        "then show returns since that date."
+    )
+
+    # ── Ticker filter (optional) ───────────────────────────────────────────────
+    _es_all_tickers = get_all_tickers()
+    _es_ticker_filter = st.multiselect(
+        "Ticker filter (leave empty = all tickers)",
+        options=_es_all_tickers,
+        default=[],
+        key="es_ticker_filter",
+        placeholder="Filter to specific tickers…",
+    )
+    _es_tickers = _es_ticker_filter if _es_ticker_filter else _es_all_tickers
+
+    # ── Condition builder ──────────────────────────────────────────────────────
+    with st.expander("🔍 Scan Conditions", expanded=True):
+        _es_logic_opts = ["AND", "OR"]
+        _es_logic = st.radio(
+            "Logic", _es_logic_opts, horizontal=True,
+            key="es_logic",
+        )
+        _render_cond_list(_ES_ID, "esc", "Conditions (latest date per ticker where ALL/ANY are met)")
+
+    # ── Date range (optional) ──────────────────────────────────────────────────
+    with st.expander("📅 Optional Date Range", expanded=False):
+        _es_c1, _es_c2 = st.columns(2)
+        with _es_c1:
+            _es_date_from = st.text_input("From date (YYYY-MM-DD)", key="es_date_from",
+                                          placeholder="e.g. 2024-01-01")
+        with _es_c2:
+            _es_date_to = st.text_input("To date (YYYY-MM-DD)", key="es_date_to",
+                                        placeholder="e.g. 2025-12-31")
+
+    # ── Run button ─────────────────────────────────────────────────────────────
+    _es_run = st.button("🚀 Run Scan", type="primary", key="es_run_btn")
+
+    if _es_run:
+        _es_conds = _read_cond_list(_ES_ID, "esc")
+        if not _es_conds:
+            st.warning("Add at least one condition to scan.")
+        else:
+            with st.spinner(f"Scanning {len(_es_tickers)} tickers…"):
+                from trigger_engine import _get_all_trigger_dates as _es_get_all
+                _es_pairs = _es_get_all(_es_tickers, _es_conds, _es_logic)
+
+                # Apply date range filter if set
+                _esdf = _es_date_from.strip()
+                _esdt = _es_date_to.strip()
+                if _esdf or _esdt:
+                    _es_pairs = [
+                        (t, d) for t, d in _es_pairs
+                        if (not _esdf or d >= _esdf) and (not _esdt or d <= _esdt)
+                    ]
+
+                st.session_state["_es_last_pairs"] = _es_pairs
+                st.session_state["_es_last_conds"] = _es_conds
+
+    # ── Results ────────────────────────────────────────────────────────────────
+    _es_pairs      = st.session_state.get("_es_last_pairs", [])
+    _es_last_conds = st.session_state.get("_es_last_conds", [])
+
+    if _es_pairs:
+        _es_n_events  = len(_es_pairs)
+        _es_n_tickers = len(dict.fromkeys(t for t, _ in _es_pairs))
+        st.caption(f"**{_es_n_events}** trigger event(s) across **{_es_n_tickers}** ticker(s)")
+
+        with st.spinner("Loading stats…"):
+            _es_stats = storage.get_event_scan_stats(_es_pairs)
+            _es_cond_fields = [c["field"] for c in _es_last_conds]
+            _es_cond_vals = (
+                get_trigger_date_field_values(_es_pairs, _es_cond_fields)
+                if _es_cond_fields else {}
+            )
+
+        _es_cond_disp = [TRIG_FIELD_DISPLAY.get(f, f) for f in _es_cond_fields]
+
+        # Build result table — one row per (ticker, trigger_date) pair
+        _es_rows = []
+        for _s in _es_stats:
+            _t         = _s["ticker"]
+            _td        = _s["trigger_date"]
+            _run_row   = _s.get("_run_row", {})
+            _score     = compute_score(_run_row)     if _run_row else None
+            _latest_mc = _run_row.get("market_cap")
+            _mkt_b     = round(_latest_mc / 1e9, 2) if _latest_mc else None
+            _cond_data = _es_cond_vals.get((_t, _td), {})
+
+            _row: dict = {
+                "Ticker":        _t,
+                "Score":         _score,
+                "Mkt Cap ($B)":  _mkt_b,
+                "Sector":        _s.get("sector")   or "N/A",
+                "Industry":      _s.get("industry") or "N/A",
+                "Trigger Date":  _td or "N/A",
+            }
+            for _cf, _cd in zip(_es_cond_fields, _es_cond_disp):
+                _row[_cd] = _f(_cond_data.get(_cf))
+            _row.update({
+                "Trigger Mkt Cap (Calc) ($B)": _s.get("trig_mkt_cap_b"),
+                "Px%":              _f(_s.get("px_pct")),
+                "Vol%":             _f(_s.get("vol_pct")),
+                "Max Px%":          _f(_s.get("max_high_pct")),
+                "Max Date":         _s.get("max_date") or "",
+                "Vol% at Max":      _f(_s.get("max_vol_pct")),
+                "Min Px%":          _f(_s.get("min_low_pct")),
+                "Min Date":         _s.get("min_date") or "",
+                "Vol% at Min":      _f(_s.get("min_vol_pct")),
+                "Last Date":        _s.get("latest_date") or "",
+                "Days Since Trigger": _s.get("days_since_trig"),
+                "Days to Max":      _s.get("days_to_max"),
+                "Days to Min":      _s.get("days_to_min"),
+                "Last Close":       _f(_s.get("latest_close")),
+                "Last Vol":         _s.get("latest_vol"),
+                "Last $Vol":        _f(_s.get("latest_dollar_vol")),
+                "Trigger Close":    _f(_s.get("trig_close")),
+                "Trigger Vol":      _s.get("trig_vol"),
+                "Trigger $Vol":     _f(_s.get("trig_dollar_vol")),
+                "Max Close":        _f(_s.get("max_close")),
+                "Max Vol":          _s.get("max_vol"),
+                "Max $Vol":         _f(_s.get("max_dollar_vol")),
+                "Min Close":        _f(_s.get("min_close")),
+                "Min Vol":          _s.get("min_vol"),
+                "Min $Vol":         _f(_s.get("min_dollar_vol")),
+            })
+            _es_rows.append(_row)
+
+        _es_df = pd.DataFrame(_es_rows)
+        if not _es_df.empty:
+            _es_sort_opts = ["Score", "Px%", "Vol%", "Max Px%", "Min Px%",
+                             "Trigger Date", "Days Since Trigger"] + _es_cond_disp
+            _es_sort = st.selectbox("Sort by", _es_sort_opts, key="es_sort_col")
+            _es_asc  = st.radio("Order", ["Desc", "Asc"], horizontal=True,
+                                key="es_sort_dir") == "Asc"
+            if _es_sort in _es_df.columns:
+                _es_df = _es_df.sort_values(_es_sort, ascending=_es_asc, na_position="last")
+
+            _es_col_cfg = {
+                "Ticker":          st.column_config.TextColumn("Ticker", width="small"),
+                "Score":           st.column_config.NumberColumn("Score", format="%.1f"),
+                "Mkt Cap ($B)":    st.column_config.NumberColumn("Mkt Cap ($B)", format="%.2f"),
+                "Sector":          st.column_config.TextColumn("Sector"),
+                "Industry":        st.column_config.TextColumn("Industry"),
+                "Trigger Date":    st.column_config.TextColumn("Trigger Date", width="small"),
+                "Trigger Mkt Cap (Calc) ($B)": st.column_config.NumberColumn(
+                    "Trig Mkt Cap ($B)", format="%.2f"),
+                "Px%":             st.column_config.NumberColumn("Px%",    format="%.2f"),
+                "Vol%":            st.column_config.NumberColumn("Vol%",   format="%.2f"),
+                "Max Px%":         st.column_config.NumberColumn("Max Px%",format="%.2f"),
+                "Max Date":        st.column_config.TextColumn("Max Date", width="small"),
+                "Vol% at Max":     st.column_config.NumberColumn("Vol% at Max", format="%.2f"),
+                "Min Px%":         st.column_config.NumberColumn("Min Px%",format="%.2f"),
+                "Min Date":        st.column_config.TextColumn("Min Date", width="small"),
+                "Vol% at Min":     st.column_config.NumberColumn("Vol% at Min", format="%.2f"),
+                "Last Date":       st.column_config.TextColumn("Last Date", width="small"),
+                "Days Since Trigger": st.column_config.NumberColumn("Days Since Trigger", format="%d"),
+                "Days to Max":     st.column_config.NumberColumn("Days to Max", format="%d"),
+                "Days to Min":     st.column_config.NumberColumn("Days to Min", format="%d"),
+                "Last Close":      st.column_config.NumberColumn("Last Close",    format="%.2f"),
+                "Last Vol":        st.column_config.NumberColumn("Last Vol",      format="%d"),
+                "Last $Vol":       st.column_config.NumberColumn("Last $Vol",     format="%.0f"),
+                "Trigger Close":   st.column_config.NumberColumn("Trigger Close", format="%.2f"),
+                "Trigger Vol":     st.column_config.NumberColumn("Trigger Vol",   format="%d"),
+                "Trigger $Vol":    st.column_config.NumberColumn("Trigger $Vol",  format="%.0f"),
+                "Max Close":       st.column_config.NumberColumn("Max Close",     format="%.2f"),
+                "Max Vol":         st.column_config.NumberColumn("Max Vol",       format="%d"),
+                "Max $Vol":        st.column_config.NumberColumn("Max $Vol",      format="%.0f"),
+                "Min Close":       st.column_config.NumberColumn("Min Close",     format="%.2f"),
+                "Min Vol":         st.column_config.NumberColumn("Min Vol",       format="%d"),
+                "Min $Vol":        st.column_config.NumberColumn("Min $Vol",      format="%.0f"),
+            }
+            # Add configs for condition field columns
+            for _cd in _es_cond_disp:
+                _es_col_cfg[_cd] = st.column_config.NumberColumn(_cd, format="%.2f")
+
+            # Fixed column order per spec
+            _es_fixed_cols = [
+                "Ticker", "Score", "Mkt Cap ($B)", "Sector", "Industry", "Trigger Date",
+            ]
+            _es_mid_cols = _es_cond_disp + [
+                "Trigger Mkt Cap (Calc) ($B)",
+                "Px%", "Vol%",
+                "Max Px%", "Max Date", "Vol% at Max",
+                "Min Px%", "Min Date", "Vol% at Min",
+                "Last Date", "Days Since Trigger", "Days to Max", "Days to Min",
+                "Last Close", "Last Vol", "Last $Vol",
+                "Trigger Close", "Trigger Vol", "Trigger $Vol",
+                "Max Close", "Max Vol", "Max $Vol",
+                "Min Close", "Min Vol", "Min $Vol",
+            ]
+            _es_col_order = [c for c in _es_fixed_cols + _es_mid_cols
+                             if c in _es_df.columns]
+
+            st.dataframe(
+                _es_df.reset_index(drop=True),
+                column_config=_es_col_cfg,
+                column_order=_es_col_order,
+                hide_index=True,
+                height=600,
+                use_container_width=True,
+            )
+    elif "es_run_btn" in st.session_state or "_es_last_pairs" in st.session_state:
+        if not _es_pairs:
+            st.info("No tickers matched the conditions.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB: Column Reference
