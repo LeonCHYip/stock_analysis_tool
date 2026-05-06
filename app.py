@@ -167,6 +167,8 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "Avg $Vol 20D / Mkt Cap%", "Avg $Vol 50D / Mkt Cap%",
     ],
     "Income Statement": [
+        "Q Revenue ($B)", "A Revenue ($B)", "Q Revenue YoY%", "A Revenue YoY%",
+        "Q EPS ($)", "A EPS ($)", "Q EPS YoY%", "A EPS YoY%",
         "Q Gross Profit ($B)", "A Gross Profit ($B)", "Q Gross Profit YoY%", "A Gross Profit YoY%",
         "Q Op Income ($B)", "A Op Income ($B)", "Q Op Income YoY%", "A Op Income YoY%",
         "Q Net Income ($B)", "A Net Income ($B)", "Q Net Income YoY%", "A Net Income YoY%",
@@ -188,7 +190,7 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     "Short Interest": [
         "Short % Float (Y)", "Short % Float (Calc)",
         "Short % Out (Y)", "Short % Out (Calc)", "Short % Impl Out",
-        "Days to Cover", "Shares Short (M)", "Float Shares (M)",
+        "Days to Cover", "Shares Short (M)", "Shares Short PM (M)", "Float Shares (M)",
         "Shares Out (M)", "Short MoM Chg%", "Short Interest Date", "Avg Vol (M)",
     ],
     "Insider Activity (6M)": [
@@ -215,6 +217,8 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "Days Since 5D High", "Days Since 22D High", "Days Since 3M High",
         "Days Since 52W High", "Days Since 3Y High",
         "Days Since 52W Low",
+        "Prior 5D High Days", "Prior 22D High Days", "Prior 3M High Days",
+        "Prior 52W High Days", "Prior 3Y High Days",
     ],
     "High/Low Levels (Close-Based)": [
         "From 5D High Close%", "From 22D High Close%", "From 3M High Close%",
@@ -411,6 +415,11 @@ TECH_COL_MAP: dict[str, str] = {
     "days_since_22d_high":     "Days Since 22D High",
     "days_since_3m_high":      "Days Since 3M High",
     "days_since_3y_high":      "Days Since 3Y High",
+    "days_since_prior_high_5d":   "Prior 5D High Days",
+    "days_since_prior_high_22d":  "Prior 22D High Days",
+    "days_since_prior_high_63d":  "Prior 3M High Days",
+    "days_since_prior_high_252d": "Prior 52W High Days",
+    "days_since_prior_high_3y":   "Prior 3Y High Days",
     "pct_from_high_close_5d":  "From 5D High Close%",
     "pct_from_high_close_22d": "From 22D High Close%",
     "pct_from_high_close_3m":  "From 3M High Close%",
@@ -451,10 +460,8 @@ _COL_FILTER_SKIP = {
     "Ticker", "Sector", "Industry",
     "Rec Key", "Company Name", "Company Description",
 } | _USER_NOTE_COLS
-_COL_FILTER_EMOJI = {
-    "MA10>20", "MA20>50", "MA50>150", "MA150>200",
-    "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
-    "Breakout 55D", "Breakout 3M", "Finalized",
+_COL_FILTER_EMOJI = TECH_BOOL_COLS | {
+    "MA10>20", "MA20>50", "MA50>150", "MA150>200",  # legacy column name variants
 }
 _COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
     "Last Earnings Time":  ["BMO", "AMC"],
@@ -537,8 +544,9 @@ if "_post_earns_updated" not in st.session_state:
     st.session_state["_post_earns_updated"] = True
     def _post_earns_bg():
         try:
-            from earnings_fetcher import update_post_earns_columns as _update_post_earns
+            from earnings_fetcher import update_post_earns_columns as _update_post_earns, backfill_extended_columns as _backfill_earns
             _update_post_earns()
+            _backfill_earns()
         except Exception as _e:
             print(f"[post-earns] Update failed: {_e}")
     threading.Thread(target=_post_earns_bg, daemon=True, name="post-earns-update").start()
@@ -984,6 +992,11 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "Days Since 22D High": tc.get("days_since_22d_high"),
         "Days Since 3M High":  tc.get("days_since_3m_high"),
         "Days Since 3Y High":  tc.get("days_since_3y_high"),
+        "Prior 5D High Days":   tc.get("days_since_prior_high_5d"),
+        "Prior 22D High Days":  tc.get("days_since_prior_high_22d"),
+        "Prior 3M High Days":   tc.get("days_since_prior_high_63d"),
+        "Prior 52W High Days":  tc.get("days_since_prior_high_252d"),
+        "Prior 3Y High Days":   tc.get("days_since_prior_high_3y"),
         "From 5D High Close%":  _f(tc.get("pct_from_high_close_5d")),
         "From 22D High Close%": _f(tc.get("pct_from_high_close_22d")),
         "From 3M High Close%":  _f(tc.get("pct_from_high_close_3m")),
@@ -1039,6 +1052,7 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     rec["Short % Impl Out"]     = round(_f(sh) / _f(si) * 100, 2) if sh and si else None
     rec["Days to Cover"]        = _f(f_db.get("short_ratio"))
     rec["Shares Short (M)"]     = round(_f(sh) / 1e6, 2) if sh else None
+    rec["Shares Short PM (M)"]  = round(_f(sh_pm) / 1e6, 2) if sh_pm else None
     rec["Float Shares (M)"]     = round(_f(fl) / 1e6, 2) if fl else None
     rec["Shares Out (M)"]       = round(_f(so) / 1e6, 2) if so else None
     rec["Short MoM Chg%"]       = round((_f(sh) - _f(sh_pm)) / abs(_f(sh_pm)) * 100, 2) \
@@ -1148,6 +1162,14 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
                                       if avg_dvol_50 and mkt_cap_raw else None
 
     # ── Income statement Q+A ──────────────────────────────────────────────────
+    rec["Q Revenue ($B)"]         = _b(f_db.get("q_revenue"))
+    rec["A Revenue ($B)"]         = _b(f_db.get("a_revenue"))
+    rec["Q Revenue YoY%"]         = _f(f_db.get("q_rev_yoy"))
+    rec["A Revenue YoY%"]         = _f(f_db.get("a_rev_yoy"))
+    rec["Q EPS ($)"]              = _f(f_db.get("q_eps"))
+    rec["A EPS ($)"]              = _f(f_db.get("a_eps"))
+    rec["Q EPS YoY%"]             = _f(f_db.get("q_eps_yoy"))
+    rec["A EPS YoY%"]             = _f(f_db.get("a_eps_yoy"))
     rec["Q Gross Profit ($B)"]    = _b(f_db.get("q_gross_profit"))
     rec["A Gross Profit ($B)"]    = _b(f_db.get("a_gross_profit"))
     rec["Q Gross Profit YoY%"]    = _f(f_db.get("q_gross_profit_yoy"))
@@ -2539,9 +2561,13 @@ def _actually_clear_filter_keys(tab_key: str) -> None:
 def _actually_apply_filter_group(tab_key: str, group: dict) -> None:
     """Apply a saved filter group dict to session state. Call before widgets render."""
     mapping = _TAB_FILTER_KEYS.get(tab_key, {})
+    _list_keys = {"f_ticker_multi", "f_dt", "f_sector", "f_industry"}
     for logical_key, ss_key in mapping.items():
         if logical_key in group:
-            st.session_state[ss_key] = group[logical_key]
+            val = group[logical_key]
+            if val is None and logical_key in _list_keys:
+                val = []
+            st.session_state[ss_key] = val
     st.session_state[f"filt_inds_{tab_key}"] = group.get("selected_inds", [])
     for ind, vals in group.get("ind_vals", {}).items():
         st.session_state[f"filt_vals_{tab_key}_{ind}"] = vals
@@ -2764,7 +2790,7 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
 
         # Load / Set default / Rename / Delete existing groups
         if group_names:
-            gg1, gg2, gg3 = st.columns([3, 1, 1])
+            gg1, gg2, gg3, gg4 = st.columns([3, 1, 1, 1])
             with gg1:
                 sel_group = st.selectbox(
                     "Group:", options=group_names,
@@ -2776,6 +2802,12 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
                     _queue_filter_group(tab_key, fg[sel_group])
                     st.rerun()
             with gg3:
+                if st.button("Update", key=f"filt_update_{tab_key}"):
+                    fg[sel_group] = _snapshot_filter_group(tab_key)
+                    _save_prefs(prefs)
+                    st.success(f"Updated '{sel_group}'")
+                    st.rerun()
+            with gg4:
                 if st.button("Set default", key=f"filt_setdef_{tab_key}"):
                     prefs.setdefault("filter_default", {})[tab_key] = sel_group
                     _save_prefs(prefs)
@@ -3862,7 +3894,7 @@ def render_scan_tab(tab_id: str) -> None:
         all_df_disp, column_config=all_col_cfg,
         column_order=_emoji_col_order,
         width="stretch", hide_index=False,
-        height=720,
+        height=1260,
         key=_tab_extra_ss(tab_id, "emoji_editor"),
     )
     if st.button("💾 Save", key=_tab_extra_ss(tab_id, "save_all")):
@@ -4299,7 +4331,7 @@ with tab_event:
                 column_order=_es_col_order,
                 hide_index=True,
                 height=600,
-                use_container_width=True,
+                width="stretch",
             )
     elif "es_run_btn" in st.session_state or "_es_last_pairs" in st.session_state:
         if not _es_pairs:

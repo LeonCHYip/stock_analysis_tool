@@ -501,6 +501,11 @@ def _migrate_add_columns(con) -> None:
         ("days_since_22d_high",         "INTEGER"),
         ("days_since_3m_high",          "INTEGER"),
         ("days_since_3y_high",          "INTEGER"),
+        ("days_since_prior_high_5d",    "INTEGER"),
+        ("days_since_prior_high_22d",   "INTEGER"),
+        ("days_since_prior_high_63d",   "INTEGER"),
+        ("days_since_prior_high_252d",  "INTEGER"),
+        ("days_since_prior_high_3y",    "INTEGER"),
         ("pct_from_high_close_5d",      "DOUBLE"),
         ("pct_from_high_close_22d",     "DOUBLE"),
         ("pct_from_high_close_3m",      "DOUBLE"),
@@ -539,6 +544,8 @@ def _migrate_add_columns(con) -> None:
             con.execute(f"ALTER TABLE tech_indicators ADD COLUMN {col} {dtype}")
 
     _migrate_earnings_surprise_to_double(con)
+    _backfill_high_low_flags(con)
+    _backfill_prior_high_days(con)
 
     # Add status column to analysis_runs if missing
     runs_cols = {row[0] for row in con.execute(
@@ -663,6 +670,122 @@ def _migrate_add_columns(con) -> None:
     for col, dtype in new_ph_cols:
         if col not in existing_ph:
             con.execute(f"ALTER TABLE price_history ADD COLUMN {col} {dtype}")
+
+
+def _backfill_high_low_flags(con) -> None:
+    """Recompute made_high_*/made_low_* booleans from price_history.
+
+    Runs whenever made_high_3y has any NULL rows (i.e. new column not yet backfilled,
+    or after schema additions). Also corrects made_low_* which previously used h_today
+    instead of l_today.
+    """
+    try:
+        needs = con.execute(
+            "SELECT COUNT(*) FROM tech_indicators WHERE made_high_3y IS NULL LIMIT 1"
+        ).fetchone()[0]
+    except Exception:
+        return
+    if not needs:
+        return
+
+    try:
+        con.execute("""
+            UPDATE tech_indicators AS ti
+            SET
+                made_high_5d   = CASE WHEN w.rn >= 5   THEN w.h >= w.max_h_5d   ELSE NULL END,
+                made_high_22d  = CASE WHEN w.rn >= 22  THEN w.h >= w.max_h_22d  ELSE NULL END,
+                made_high_252d = CASE WHEN w.rn >= 252 THEN w.h >= w.max_h_252d ELSE NULL END,
+                made_high_3m   = CASE WHEN w.rn >= 63  THEN w.h >= w.max_h_3m   ELSE NULL END,
+                made_high_3y   = w.h >= w.max_h_all,
+                made_low_5d    = CASE WHEN w.rn >= 5   THEN w.l <= w.min_l_5d   ELSE NULL END,
+                made_low_22d   = CASE WHEN w.rn >= 22  THEN w.l <= w.min_l_22d  ELSE NULL END,
+                made_low_252d  = CASE WHEN w.rn >= 252 THEN w.l <= w.min_l_252d ELSE NULL END
+            FROM (
+                SELECT
+                    ticker, date,
+                    COALESCE(high, close) AS h,
+                    COALESCE(low,  close) AS l,
+                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date) AS rn,
+                    MAX(COALESCE(high, close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS max_h_5d,
+                    MAX(COALESCE(high, close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN 21 PRECEDING AND CURRENT ROW) AS max_h_22d,
+                    MAX(COALESCE(high, close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN 62 PRECEDING AND CURRENT ROW) AS max_h_3m,
+                    MAX(COALESCE(high, close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS max_h_252d,
+                    MAX(COALESCE(high, close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS max_h_all,
+                    MIN(COALESCE(low,  close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS min_l_5d,
+                    MIN(COALESCE(low,  close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN 21 PRECEDING AND CURRENT ROW) AS min_l_22d,
+                    MIN(COALESCE(low,  close)) OVER (
+                        PARTITION BY ticker ORDER BY date
+                        ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS min_l_252d
+                FROM price_history
+            ) w
+            WHERE ti.ticker = w.ticker AND ti.as_of_date = w.date
+        """)
+        print("[storage] Backfilled made_high_*/made_low_* from price_history")
+    except Exception as e:
+        print(f"[storage] backfill_high_low_flags failed: {e}")
+
+
+def _backfill_prior_high_days(con) -> None:
+    """Compute days_since_prior_high_* for all tech_indicators rows using price_history.
+
+    'Prior high' excludes today's OHLC — the window is the N bars immediately before
+    today. 0 = yesterday was the prior high; N-1 = the high was N-1 days ago.
+
+    Uses DuckDB's ARG_MAX(rn, h) window function to find the row number of the max high
+    in each prior window, then computes days = current_rn - 1 - argmax_rn.
+    """
+    try:
+        needs = con.execute(
+            "SELECT COUNT(*) FROM tech_indicators WHERE days_since_prior_high_252d IS NULL LIMIT 1"
+        ).fetchone()[0]
+    except Exception:
+        return
+    if not needs:
+        return
+
+    try:
+        con.execute("""
+            UPDATE tech_indicators AS ti
+            SET
+                days_since_prior_high_5d   = CASE WHEN w.rn > 5   THEN w.rn - 1 - w.am_5d   ELSE NULL END,
+                days_since_prior_high_22d  = CASE WHEN w.rn > 22  THEN w.rn - 1 - w.am_22d  ELSE NULL END,
+                days_since_prior_high_63d  = CASE WHEN w.rn > 63  THEN w.rn - 1 - w.am_63d  ELSE NULL END,
+                days_since_prior_high_252d = CASE WHEN w.rn > 252 THEN w.rn - 1 - w.am_252d ELSE NULL END,
+                days_since_prior_high_3y   = CASE WHEN w.rn > 1   THEN w.rn - 1 - w.am_3y   ELSE NULL END
+            FROM (
+                WITH base AS (
+                    SELECT ticker, date,
+                           COALESCE(high, close) AS h,
+                           ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date) AS rn
+                    FROM price_history
+                )
+                SELECT ticker, date, rn,
+                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 5   PRECEDING AND 1 PRECEDING) AS am_5d,
+                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 22  PRECEDING AND 1 PRECEDING) AS am_22d,
+                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 63  PRECEDING AND 1 PRECEDING) AS am_63d,
+                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING) AS am_252d,
+                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS am_3y
+                FROM base
+            ) w
+            WHERE ti.ticker = w.ticker AND ti.as_of_date = w.date
+        """)
+        print("[storage] Backfilled days_since_prior_high_* from price_history")
+    except Exception as e:
+        print(f"[storage] backfill_prior_high_days failed: {e}")
 
 
 def _migrate_earnings_surprise_to_double(con) -> None:

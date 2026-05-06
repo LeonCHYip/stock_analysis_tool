@@ -365,16 +365,17 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             days_since_52w_high = int(len(close_52w) - 1 - idx_high)
             days_since_52w_low  = int(len(close_52w) - 1 - idx_low)
 
-        # Whether today's OHLC intraday high is the high of the window
+        # Whether today's intraday high/low is the extreme of the window
         h_today = _safe(high.iloc[-1]) or 0.0
+        l_today = _safe(low.iloc[-1])  or 0.0
         made_high_5d   = bool(h_today >= float(high.tail(5).max()))   if n >= 5   else None
         made_high_22d  = bool(h_today >= float(high.tail(22).max()))  if n >= 22  else None
         made_high_252d = bool(h_today >= float(high.tail(252).max())) if n >= 252 else None
         made_high_3m   = bool(h_today >= float(high.tail(63).max()))  if n >= 63  else None
         made_high_3y   = bool(h_today >= float(high.max()))           if n >= 1   else None
-        made_low_5d    = bool(h_today <= float(low.tail(5).min()))    if n >= 5   else None
-        made_low_22d   = bool(h_today <= float(low.tail(22).min()))   if n >= 22  else None
-        made_low_252d  = bool(h_today <= float(low.tail(252).min()))  if n >= 252 else None
+        made_low_5d    = bool(l_today <= float(low.tail(5).min()))    if n >= 5   else None
+        made_low_22d   = bool(l_today <= float(low.tail(22).min()))   if n >= 22  else None
+        made_low_252d  = bool(l_today <= float(low.tail(252).min()))  if n >= 252 else None
 
         # Days since intraday high in each window (0 = today is the high)
         def _days_since_intraday_high(window: pd.Series) -> int | None:
@@ -387,6 +388,26 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         days_since_22d_high = _days_since_intraday_high(high.tail(22))  if n >= 22  else None
         days_since_3m_high  = _days_since_intraday_high(high.tail(63))  if n >= 63  else None
         days_since_3y_high  = _days_since_intraday_high(high)           if n >= 1   else None
+
+        # Days since the prior-window high, EXCLUDING today (0 = yesterday was the high).
+        # Useful for measuring how long a consolidation lasted before a breakout.
+        def _days_since_prior_high(series: pd.Series, window: int) -> int | None:
+            """Argmax of the `window` bars immediately before today."""
+            if len(series) <= window:
+                return None
+            prior = series.iloc[len(series) - 1 - window : len(series) - 1]
+            return int(len(prior) - 1 - prior.values.argmax())
+
+        days_since_prior_high_5d   = _days_since_prior_high(high, 5)
+        days_since_prior_high_22d  = _days_since_prior_high(high, 22)
+        days_since_prior_high_63d  = _days_since_prior_high(high, 63)
+        days_since_prior_high_252d = _days_since_prior_high(high, 252)
+        # 3Y: use all available history before today (mirrors made_high_3y semantics)
+        if n > 1:
+            prior_all = high.iloc[:n - 1]
+            days_since_prior_high_3y = int(len(prior_all) - 1 - prior_all.values.argmax())
+        else:
+            days_since_prior_high_3y = None
 
         # Close-based pct from high for short windows
         high_close_5d  = _safe(close.tail(5).max())   if n >= 5  else None
@@ -633,6 +654,11 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "days_since_22d_high":     days_since_22d_high,
             "days_since_3m_high":      days_since_3m_high,
             "days_since_3y_high":      days_since_3y_high,
+            "days_since_prior_high_5d":   days_since_prior_high_5d,
+            "days_since_prior_high_22d":  days_since_prior_high_22d,
+            "days_since_prior_high_63d":  days_since_prior_high_63d,
+            "days_since_prior_high_252d": days_since_prior_high_252d,
+            "days_since_prior_high_3y":   days_since_prior_high_3y,
             "pct_from_high_close_5d":  pct_from_high_close_5d,
             "pct_from_high_close_22d": pct_from_high_close_22d,
             "pct_from_high_close_3m":  pct_from_high_close_3m,

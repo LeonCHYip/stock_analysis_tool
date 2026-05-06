@@ -321,6 +321,11 @@ COLUMNS = [
     _c("Days Since 52W High",  "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_52w_high",   "int",  "Trading days since the 52-week intraday high was set"),
     _c("Days Since 3Y High",   "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_3y_high",    "int",  "Trading days since the 3-year intraday high was set"),
     _c("Days Since 52W Low",   "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_52w_low",    "int",  "Trading days since the 52-week intraday low was set"),
+    _c("Prior 5D High Days",   "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_prior_high_5d",   "int",  "Days ago the prior 5-day high occurred, excluding today (0 = yesterday; 4 = 5 days ago)"),
+    _c("Prior 22D High Days",  "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_prior_high_22d",  "int",  "Days ago the prior 22-day high occurred, excluding today (0 = yesterday)"),
+    _c("Prior 3M High Days",   "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_prior_high_63d",  "int",  "Days ago the prior 3-month high occurred, excluding today (0 = yesterday)"),
+    _c("Prior 52W High Days",  "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_prior_high_252d", "int",  "Days ago the prior 52-week high occurred, excluding today. High value = long consolidation before breakout"),
+    _c("Prior 3Y High Days",   "High/Low Now (Intraday)", _YFD, _SC, "computed", "days_since_prior_high_3y",   "int",  "Days ago the prior all-time (3Y) high occurred, excluding today"),
 
     # ── High/Low Levels (Close-Based) ─────────────────────────────────────────
     _c("From 5D High Close%",  "High/Low Levels (Close-Based)", _YFD, _SC, "computed", "pct_from_high_close_5d",  "float%", "% below the 5-day closing high (negative means below)"),
