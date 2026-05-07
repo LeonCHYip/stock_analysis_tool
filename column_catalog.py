@@ -529,7 +529,7 @@ def render_column_reference_tab() -> None:
 
     st.dataframe(
         df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Description": st.column_config.TextColumn(width="large"),

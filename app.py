@@ -77,7 +77,7 @@ EMOJI = {"PASS": "✅", "PARTIAL": "⭕", "FAIL": "❌", "NA": "⚪️"}
 EMOJI_TO_DB = {v: k for k, v in EMOJI.items()}
 EMOJI_OPTIONS = ["✅", "⭕", "❌", "⚪️"]
 STATUS_OPTIONS = ["", "必買", "買", "等", "研究", "賭", "X"]
-SOURCE_OPTIONS = ["", "高分", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "其他"]
+SOURCE_OPTIONS = ["", "高分", "BO", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "朋友", "其他"]
 
 TICKERS_FILE = Path(__file__).parent / "tickers.txt"
 
@@ -468,7 +468,7 @@ _COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
     "Last Earnings Time":  ["BMO", "AMC"],
     "Next Earnings Time":  ["BMO", "AMC"],
     "Status":              ["", "必買", "買", "等", "研究", "賭", "X"],
-    "Source":              ["", "高分", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "其他"],
+    "Source":              ["", "高分", "BO", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "朋友", "其他"],
 }
 _COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date", "Swing High Date", "Swing Low Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
@@ -2224,8 +2224,9 @@ _TAB_FILTER_KEYS: dict[str, dict[str, str]] = {
         "f_industry":     "hist_f_industry",
         "mc_lo":          "hist_mc_lo",
         "mc_hi":          "hist_mc_hi",
-        "show_sub":       "all_queries_show_sub",
-        "only_latest":    "hist_only_latest",
+        "show_sub":          "all_queries_show_sub",
+        "only_latest":       "hist_only_latest",
+        "only_latest_close": "hist_only_latest_close",
     },
 }
 
@@ -2245,8 +2246,9 @@ _TAB_FILTER_DEFAULTS: dict[str, dict[str, object]] = {
         "f_industry":     [],
         "mc_lo":          None,
         "mc_hi":          None,
-        "show_sub":       False,
-        "only_latest":    True,
+        "show_sub":          False,
+        "only_latest":       False,
+        "only_latest_close": True,
     },
 }
 
@@ -2263,8 +2265,9 @@ def _tab_filter_keys(tab_id: str) -> dict:
         "f_industry":     f"{tab_id}_f_industry",
         "mc_lo":          f"{tab_id}_mc_lo",
         "mc_hi":          f"{tab_id}_mc_hi",
-        "show_sub":       f"{tab_id}_show_sub",
-        "only_latest":    f"{tab_id}_only_latest",
+        "show_sub":          f"{tab_id}_show_sub",
+        "only_latest":       f"{tab_id}_only_latest",
+        "only_latest_close": f"{tab_id}_only_latest_close",
     }
 
 
@@ -3549,8 +3552,9 @@ def render_scan_tab(tab_id: str) -> None:
     # Pre-read widget states for data fetching before widget rendering
     _f_tickers_pre   = st.session_state.get(tk["f_ticker_multi"], [])
     _f_dts_pre       = st.session_state.get(tk["f_dt"], [])
-    _only_latest_pre = st.session_state.get(tk["only_latest"], True)
-    _show_sub_pre    = st.session_state.get(tk["show_sub"], False)
+    _only_latest_pre       = st.session_state.get(tk["only_latest"], False)
+    _only_latest_close_pre = st.session_state.get(tk["only_latest_close"], True)
+    _show_sub_pre          = st.session_state.get(tk["show_sub"], False)
     _f_sectors_pre   = st.session_state.get(tk["f_sector"], [])
     _mc_lo_pre       = st.session_state.get(tk["mc_lo"], None)
     _mc_hi_pre       = st.session_state.get(tk["mc_hi"], None)
@@ -3570,7 +3574,7 @@ def render_scan_tab(tab_id: str) -> None:
     )
     total_before = len(filt_rows)
 
-    if _only_latest_pre:
+    if _only_latest_pre or _only_latest_close_pre:
         _seen: dict[str, str] = {}
         for r in filt_rows:
             t, dt = r["ticker"], r.get("analysis_datetime", "")
@@ -3592,6 +3596,13 @@ def render_scan_tab(tab_id: str) -> None:
     _tickers_pre   = list({r["ticker"] for r in filt_rows})
     fund_map       = get_all_fundamentals_for_run(_tickers_pre)
     tech_map       = get_tech_for_tickers(_tickers_pre)
+
+    if _only_latest_close_pre:
+        _close_dates = {t: tc.get("as_of_date", "") for t, tc in tech_map.items() if tc.get("as_of_date")}
+        if _close_dates:
+            _max_close = max(_close_dates.values())
+            filt_rows = [r for r in filt_rows if _close_dates.get(r["ticker"], "") == _max_close]
+
     si_map         = _extract_si(fund_map)
     ne_map         = _extract_ne(fund_map)
     net_map        = _extract_net(fund_map)
@@ -3785,15 +3796,18 @@ def render_scan_tab(tab_id: str) -> None:
         _sort_col = st.session_state.get(_tab_extra_ss(tab_id, "sort_col"), "Score")
         _sorted_tickers = []
 
-    # ── Show sub-indicators | Latest per ticker | Row count ───────────────────
-    row8c1, row8c2, row8c3 = st.columns(3)
+    # ── Show sub-indicators | Latest per ticker | Latest close | Row count ─────
+    row8c1, row8c2, row8c3, row8c4 = st.columns(4)
     with row8c1:
         all_show_sub = st.checkbox("Show sub-indicators", value=False,
                                    key=tk["show_sub"])
     with row8c2:
-        only_latest = st.checkbox("Latest entry per ticker only", value=True,
+        only_latest = st.checkbox("Latest entry per ticker only", value=False,
                                   key=tk["only_latest"])
     with row8c3:
+        st.checkbox("Latest close date only", value=True,
+                    key=tk["only_latest_close"])
+    with row8c4:
         st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
 
     st.markdown(
