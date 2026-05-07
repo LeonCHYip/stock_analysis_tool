@@ -553,6 +553,8 @@ def _migrate_add_columns(con) -> None:
     ).fetchall()}
     if "status" not in runs_cols:
         con.execute("ALTER TABLE analysis_runs ADD COLUMN status TEXT DEFAULT ''")
+    if "source" not in runs_cols:
+        con.execute("ALTER TABLE analysis_runs ADD COLUMN source TEXT DEFAULT ''")
     for _col in ("company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg"):
         if _col not in runs_cols:
             con.execute(f"ALTER TABLE analysis_runs ADD COLUMN {_col} TEXT")
@@ -1101,6 +1103,15 @@ def save_status_for_ticker(ticker: str, status: str) -> None:
     con.execute(
         "UPDATE analysis_runs SET status = ? WHERE ticker = ?",
         [status, ticker],
+    )
+
+
+def save_source_for_ticker(ticker: str, source: str) -> None:
+    """Update source for ALL analysis_runs rows of this ticker."""
+    con = _conn()
+    con.execute(
+        "UPDATE analysis_runs SET source = ? WHERE ticker = ?",
+        [source, ticker],
     )
 
 

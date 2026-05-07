@@ -56,7 +56,7 @@ from trigger_engine import (
 from column_catalog import render_column_reference_tab
 from storage import (
     init_db, save_results, update_field, save_comment_for_ticker, save_status_for_ticker,
-    save_user_field_for_ticker,
+    save_source_for_ticker, save_user_field_for_ticker,
     get_all_run_datetimes, get_latest_run_datetime,
     get_summary_for_run, get_detail_for_run, get_all_summaries,
     get_detail_filtered, get_all_tickers,
@@ -76,7 +76,8 @@ CST = ZoneInfo("America/Chicago")
 EMOJI = {"PASS": "✅", "PARTIAL": "⭕", "FAIL": "❌", "NA": "⚪️"}
 EMOJI_TO_DB = {v: k for k, v in EMOJI.items()}
 EMOJI_OPTIONS = ["✅", "⭕", "❌", "⚪️"]
-STATUS_OPTIONS = ["", "必買", "買", "等", "研究", "X"]
+STATUS_OPTIONS = ["", "必買", "買", "等", "研究", "賭", "X"]
+SOURCE_OPTIONS = ["", "高分", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "其他"]
 
 TICKERS_FILE = Path(__file__).parent / "tickers.txt"
 
@@ -84,7 +85,7 @@ TICKERS_FILE = Path(__file__).parent / "tickers.txt"
 # IMPORTANT: Keep column_catalog.py in sync — update it whenever you add,
 # rename, or remove columns here or in _build_value_record().
 VALUE_COL_GROUPS: dict[str, list[str]] = {
-    "User": ["Status"],
+    "User": ["Source", "Status"],
     # ── Indicator-derived groups (from analysis detail JSON) ──────────────────
     "Price & Volume — Daily (T1)": [
         "3M Avg Px%", "3M Avg Vol%", "12M Avg Px%", "12M Avg Vol%",
@@ -466,7 +467,8 @@ _COL_FILTER_EMOJI = TECH_BOOL_COLS | {
 _COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
     "Last Earnings Time":  ["BMO", "AMC"],
     "Next Earnings Time":  ["BMO", "AMC"],
-    "Status":              ["", "必買", "買", "等", "研究", "X"],
+    "Status":              ["", "必買", "買", "等", "研究", "賭", "X"],
+    "Source":              ["", "高分", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "其他"],
 }
 _COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date", "Swing High Date", "Swing Low Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
@@ -807,6 +809,7 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "Datetime":            row.get("analysis_datetime") or "",
         "Company Summary":     row.get("company_summary") or "",
         "Revenue Composition": row.get("revenue_composition") or "",
+        "Source":              row.get("source") or "",
         "Status":              row.get("status") or "",
         "Comments":        row.get("comments") or "",
         "technical +ve":   row.get("tech_pos") or "",
@@ -1556,6 +1559,7 @@ def build_summary_df(rows: list[dict],
         rec["F Score"]         = compute_fund_score(r)
         rec["Company Summary"]     = r.get("company_summary") or ""
         rec["Revenue Composition"] = r.get("revenue_composition") or ""
+        rec["Source"]              = r.get("source") or ""
         rec["Status"]              = r.get("status") or ""
         rec["Comments"]        = r.get("comments") or ""
         rec["technical +ve"]   = r.get("tech_pos") or ""
@@ -1600,6 +1604,7 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
     disp_to_db = {v: k for k, v in SUB_DISPLAY.items()}
     disp_to_db.update({ind: ind for ind in MAIN_IND_COLS})
     disp_to_db["Comments"]        = "comments"
+    disp_to_db["Source"]          = "source"
     disp_to_db["Status"]          = "status"
     disp_to_db["Company Summary"]     = "company_summary"
     disp_to_db["Revenue Composition"] = "revenue_composition"
@@ -1640,6 +1645,8 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
                 save_comment_for_ticker(str(ticker), str(new_val) if new_val is not None else "")
             elif db_col == "status":
                 save_status_for_ticker(str(ticker), str(new_val) if new_val is not None else "")
+            elif db_col == "source":
+                save_source_for_ticker(str(ticker), str(new_val) if new_val is not None else "")
             elif db_col in ("company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg"):
                 save_user_field_for_ticker(str(ticker), db_col, str(new_val) if new_val is not None else "")
 
@@ -1661,6 +1668,10 @@ def make_column_config(df: pd.DataFrame) -> dict:
             )
         elif col == "Score":
             config[col] = st.column_config.NumberColumn("Score", format="%.1f", disabled=True)
+        elif col == "Source":
+            config[col] = st.column_config.SelectboxColumn(
+                "Source", options=SOURCE_OPTIONS, required=False
+            )
         elif col == "Status":
             config[col] = st.column_config.SelectboxColumn(
                 "Status", options=STATUS_OPTIONS, required=False
@@ -2947,6 +2958,10 @@ def _value_col_config(cols: list[str]) -> dict:
             cfg[col] = st.column_config.TextColumn("Company Name", width="medium", disabled=True)
         elif col == "Company Description":
             cfg[col] = st.column_config.TextColumn("Company Description", width="large", disabled=True)
+        elif col == "Source":
+            cfg[col] = st.column_config.SelectboxColumn(
+                "Source", options=SOURCE_OPTIONS, required=False, disabled=False
+            )
         elif col == "Status":
             cfg[col] = st.column_config.SelectboxColumn(
                 "Status", options=STATUS_OPTIONS, required=False, disabled=False
@@ -3155,7 +3170,7 @@ def render_value_table(tickers: list[str], detail_map: dict,
                     "Last Earnings Date", "Last Earnings Time", "Earns 1D Px%",
                     "Close", "Change %", "Last Close Date"}
     data_cols = [c for c in (sel_cols if sel_cols else group_cols)
-                 if c not in _fixed_right and c != "Score" and c != "Status" and c != "Comments"
+                 if c not in _fixed_right and c != "Score" and c != "Source" and c != "Status" and c != "Comments"
                  and c not in _USER_NOTE_COLS]
     # Sort col auto-inject: placed after Score (not prepended to data_cols)
     _sort_inject = []
@@ -3172,7 +3187,7 @@ def render_value_table(tickers: list[str], detail_map: dict,
     show_cols = (
         ["Ticker", "#", "Datetime"] + data_cols + ["Score"] + _sort_inject
         + ["Mkt Cap ($B)", "Sector", "Industry",
-           "Status", "Comments",
+           "Source", "Status", "Comments",
            "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
            "Company Summary", "Revenue Composition",
            "Company Name", "Company Description",
@@ -3237,6 +3252,10 @@ def render_value_table(tickers: list[str], detail_map: dict,
                 orig_comment = str(df.loc[ticker, "Comments"]) if ticker in df.index else ""
                 if new_comment != orig_comment:
                     save_comment_for_ticker(str(ticker), new_comment)
+                new_source = str(vrow.get("Source") or "")
+                orig_source = str(df.loc[ticker, "Source"]) if ticker in df.index else ""
+                if new_source != orig_source:
+                    save_source_for_ticker(str(ticker), new_source)
                 new_status = str(vrow.get("Status") or "")
                 orig_status = str(df.loc[ticker, "Status"]) if ticker in df.index else ""
                 if new_status != orig_status:
@@ -3876,7 +3895,7 @@ def render_scan_tab(tab_id: str) -> None:
             )
 
     _emoji_fixed_right = [
-        "Status", "Comments",
+        "Source", "Status", "Comments",
         "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
         "Company Summary", "Revenue Composition",
         "Company Name", "Company Description",
