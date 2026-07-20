@@ -18,6 +18,8 @@ import numpy as np
 import ta
 from zoneinfo import ZoneInfo
 
+from yf_session import YF_SESSION
+
 CST = ZoneInfo("America/Chicago")
 
 
@@ -31,7 +33,7 @@ def normalize_ticker(ticker: str) -> str:
         return ticker
     for suffix in ["", ".NS", ".BO"]:
         try:
-            if not yf.Ticker(ticker + suffix).history(period="1d").empty:
+            if not yf.Ticker(ticker + suffix, session=YF_SESSION).history(period="1d").empty:
                 return ticker + suffix
         except Exception:
             pass
@@ -239,7 +241,7 @@ def fetch_technical(ticker: str,
     """
     try:
         sym   = normalize_ticker(ticker)
-        stock = yf.Ticker(sym)
+        stock = yf.Ticker(sym, session=YF_SESSION)
         data  = stock.history(period="3y", interval="1d", auto_adjust=False)
 
         if data.empty:
@@ -276,6 +278,7 @@ def fetch_technical_bulk(tickers: list[str],
             auto_adjust=False,
             threads=True,
             progress=False,
+            session=YF_SESSION,
         )
     except Exception as e:
         print(f"  [bulk_tech] Download failed: {e}")
@@ -418,7 +421,7 @@ def fetch_fundamental(ticker: str, skip_normalize: bool = False) -> dict:
 
     try:
         sym   = ticker if skip_normalize else normalize_ticker(ticker)
-        stock = yf.Ticker(sym)
+        stock = yf.Ticker(sym, session=YF_SESSION)
         info  = _fetch_info(stock)
 
         qf = _fetch_qf(stock)   # newest quarter = col 0

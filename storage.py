@@ -13,6 +13,7 @@ Public API mirrors db.py so app.py can switch with minimal changes.
 
 from __future__ import annotations
 import json
+import time
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -21,6 +22,8 @@ from zoneinfo import ZoneInfo
 import duckdb
 
 DB_PATH = Path(__file__).parent / "stock_analysis_v2.duckdb"
+
+_backfills_done: bool = False  # run heavy backfills only once per Python process
 CST = ZoneInfo("America/Chicago")
 
 # ── Indicator column definitions (mirror db.py) ───────────────────────────────
@@ -93,6 +96,10 @@ CREATE TABLE IF NOT EXISTS tech_indicators (
     ma20_gt_ma50        BOOLEAN,
     ma50_gt_ma150       BOOLEAN,
     ma150_gt_ma200      BOOLEAN,
+    slope10_gt_slope20  BOOLEAN,
+    slope20_gt_slope50  BOOLEAN,
+    slope50_gt_slope150 BOOLEAN,
+    slope150_gt_slope200 BOOLEAN,
     sma50_slope_20d     DOUBLE,
     pct_from_sma200     DOUBLE,
     -- Trend
@@ -453,7 +460,20 @@ def _conn() -> "_LockedCursor":
     if _global_conn is None:
         with _init_lock:
             if _global_conn is None:
-                _global_conn = duckdb.connect(str(DB_PATH))
+                # Retry for up to 60 s when another process holds the DuckDB write lock
+                # (e.g. a previous Streamlit instance still finishing its scan).
+                for attempt in range(60):
+                    try:
+                        _global_conn = duckdb.connect(str(DB_PATH))
+                        break
+                    except Exception as exc:
+                        if attempt == 59:
+                            raise RuntimeError(
+                                f"Cannot open DuckDB after 60 s — another process may "
+                                f"still hold the file lock. Stop the old Streamlit instance "
+                                f"and restart. (Original error: {exc})"
+                            ) from exc
+                        time.sleep(1.0)
     return _LockedCursor()
 
 
@@ -509,6 +529,8 @@ def _migrate_add_columns(con) -> None:
         ("pct_from_high_close_5d",      "DOUBLE"),
         ("pct_from_high_close_22d",     "DOUBLE"),
         ("pct_from_high_close_3m",      "DOUBLE"),
+        ("big_up_5p_count_90d",         "INTEGER"),
+        ("big_dn_5p_count_90d",         "INTEGER"),
         ("up_streak_days",              "INTEGER"),
         ("up_streak_px_pct",            "DOUBLE"),
         ("up_streak_vol_pct",           "DOUBLE"),
@@ -526,6 +548,10 @@ def _migrate_add_columns(con) -> None:
         ("sma20_slope_10d",        "DOUBLE"),
         ("sma150_slope_20d",       "DOUBLE"),
         ("sma200_slope_20d",       "DOUBLE"),
+        ("slope10_gt_slope20",     "BOOLEAN"),
+        ("slope20_gt_slope50",     "BOOLEAN"),
+        ("slope50_gt_slope150",    "BOOLEAN"),
+        ("slope150_gt_slope200",   "BOOLEAN"),
         ("rel_vol_20d",            "DOUBLE"),
         ("rel_vol_50d",            "DOUBLE"),
         ("up_down_vol_ratio_20d",  "DOUBLE"),
@@ -544,8 +570,11 @@ def _migrate_add_columns(con) -> None:
             con.execute(f"ALTER TABLE tech_indicators ADD COLUMN {col} {dtype}")
 
     _migrate_earnings_surprise_to_double(con)
-    _backfill_high_low_flags(con)
-    _backfill_prior_high_days(con)
+    global _backfills_done
+    if not _backfills_done:
+        _backfill_high_low_flags(con)
+        _backfill_prior_high_days(con)
+        _backfills_done = True
 
     # Add status column to analysis_runs if missing
     runs_cols = {row[0] for row in con.execute(
@@ -736,7 +765,7 @@ def _backfill_high_low_flags(con) -> None:
             ) w
             WHERE ti.ticker = w.ticker AND ti.as_of_date = w.date
         """)
-        print("[storage] Backfilled made_high_*/made_low_* from price_history")
+        print(f"[storage] Backfilled made_high_*/made_low_* for {needs} rows")
     except Exception as e:
         print(f"[storage] backfill_high_low_flags failed: {e}")
 
@@ -785,7 +814,7 @@ def _backfill_prior_high_days(con) -> None:
             ) w
             WHERE ti.ticker = w.ticker AND ti.as_of_date = w.date
         """)
-        print("[storage] Backfilled days_since_prior_high_* from price_history")
+        print(f"[storage] Backfilled days_since_prior_high_* for {needs} rows")
     except Exception as e:
         print(f"[storage] backfill_prior_high_days failed: {e}")
 

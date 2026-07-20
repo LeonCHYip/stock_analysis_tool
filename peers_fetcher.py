@@ -12,6 +12,8 @@ new scan to ensure fresh data.
 import time
 import requests
 import yfinance as yf
+
+from yf_session import YF_SESSION
 import numpy as np
 
 _YAHOO_HEADERS = {
@@ -94,7 +96,7 @@ def _get_valuation(ticker: str) -> dict:
 
     empty = {"forward_pe": None, "pb": None}
     try:
-        info = yf.Ticker(ticker).info
+        info = yf.Ticker(ticker, session=YF_SESSION).info
         if len(info) >= 5:
             result = {"forward_pe": _clean(info.get("forwardPE")),
                       "pb":         _clean(info.get("priceToBook"))}

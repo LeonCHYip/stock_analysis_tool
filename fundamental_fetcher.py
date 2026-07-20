@@ -33,6 +33,7 @@ import numpy as np
 import yfinance as yf
 
 import storage
+from yf_session import YF_SESSION
 
 CST = ZoneInfo("America/Chicago")
 _RETRY_DELAYS = [5, 10, 20]
@@ -260,7 +261,7 @@ def _normalize(ticker: str) -> str:
         return ticker
     for suffix in ["", ".NS", ".BO"]:
         try:
-            if not yf.Ticker(ticker + suffix).history(period="1d").empty:
+            if not yf.Ticker(ticker + suffix, session=YF_SESSION).history(period="1d").empty:
                 return ticker + suffix
         except Exception:
             pass
@@ -311,7 +312,7 @@ def fetch_fundamental(ticker: str,
 
     try:
         sym   = ticker if skip_normalize else _normalize(ticker)
-        stock = yf.Ticker(sym)
+        stock = yf.Ticker(sym, session=YF_SESSION)
 
         # ── Call 1: quoteSummary ──────────────────────────────────────────────
         qs = _fetch_quote_summary(stock)

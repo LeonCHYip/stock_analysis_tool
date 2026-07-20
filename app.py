@@ -6,13 +6,92 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 import copy
+import faulthandler
 import json
+import logging
+import os
+import resource
 import threading
 import concurrent.futures
 import time
 from datetime import datetime, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# Catch native crashes (SIGSEGV, SIGBUS, SIGABRT from numpy/DuckDB/etc.)
+# and print a full Python traceback to stderr even without a Python exception.
+faulthandler.enable(all_threads=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scan logger — writes to scan_debug.log in the project root so logs persist
+# across browser reconnects and can be inspected after a crash or disconnect.
+# ─────────────────────────────────────────────────────────────────────────────
+_LOG_PATH = Path(__file__).parent / "scan_debug.log"
+_scan_logger = logging.getLogger("scan")
+if not _scan_logger.handlers:
+    _fh = logging.FileHandler(_LOG_PATH, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _scan_logger.addHandler(_fh)
+    _scan_logger.setLevel(logging.DEBUG)
+
+
+try:
+    import psutil
+    _PSUTIL_PROC = psutil.Process()
+except Exception:
+    _PSUTIL_PROC = None
+
+
+def _rss_mb() -> float:
+    """Current RSS in MB (psutil). Falls back to peak RSS if psutil missing."""
+    if _PSUTIL_PROC is not None:
+        return _PSUTIL_PROC.memory_info().rss / 1024 / 1024
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
+
+
+def _peak_mb() -> float:
+    """Peak RSS in MB (macOS: ru_maxrss is bytes). Never decreases."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024
+
+
+def _nthreads() -> int:
+    """OS-level thread count (includes native threads psutil sees but Python doesn't)."""
+    if _PSUTIL_PROC is not None:
+        return _PSUTIL_PROC.num_threads()
+    return threading.active_count()
+
+
+def _res_str() -> str:
+    """One-line resource snapshot for log lines."""
+    return (f"rss={_rss_mb():.0f}MB peak={_peak_mb():.0f}MB "
+            f"threads={_nthreads()} pythreads={threading.active_count()}")
+
+
+def _slog(msg: str) -> None:
+    """Write to scan_debug.log and stdout, flushing immediately so an abrupt
+    kill cannot leave the final lines buffered."""
+    print(msg, flush=True)
+    _scan_logger.info(msg)
+
+
+# Unique ID for THIS script execution. Streamlit re-executes app.py in a fresh
+# module namespace on every rerun (widget change, reconnect, hot-reload), so a
+# new exec_id with the SAME pid = rerun inside the same process; a new pid =
+# full process restart. PID alone cannot distinguish these.
+_SCRIPT_EXEC_ID = f"{os.getpid()}-{time.time_ns()}"
+_slog(f"[startup] SCRIPT EXEC  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
+
+# Heartbeat: one daemon thread per process logs resources every 10s, so if the
+# process dies we know the time of death within 10s and the resource trend up
+# to that moment. Guarded via threading.enumerate() because module-level flags
+# in app.py do NOT persist across Streamlit reruns (fresh namespace each time).
+if not any(t.name == "diag-heartbeat" for t in threading.enumerate()):
+    def _heartbeat():
+        while True:
+            time.sleep(10)
+            _slog(f"[hb] {_res_str()}")
+    threading.Thread(target=_heartbeat, daemon=True, name="diag-heartbeat").start()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User preferences (persisted to JSON)
@@ -46,6 +125,7 @@ import fundamental_fetcher
 from fundamental_fetcher import fetch_fundamental
 from peers_fetcher import get_peer_valuations, clear_peer_cache
 import vpn_switcher
+from yf_session import get_fund_pool, close_thread_curl
 from indicators    import evaluate_all, score_indicators
 import storage
 import trigger_engine
@@ -129,7 +209,7 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
         "MA10", "MA20", "MA50", "MA150", "MA200",
     ],
     "Big Moves 90d (T4)": [
-        "# Up≥10%", "# Dn≥10%",
+        "# Up≥5%", "# Dn≥5%", "# Up≥10%", "# Dn≥10%",
     ],
     "Quarterly (F1/F3)": [
         "Q Rev", "Q EPS", "Q End Date", "Q Rev YoY%", "Q EPS YoY%",
@@ -291,6 +371,9 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     "MA Alignment (Raw)": [
         "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
     ],
+    "MA Slope Alignment": [
+        "Slope10>Slope20", "Slope20>Slope50", "Slope50>Slope150", "Slope150>Slope200",
+    ],
     "Tech Metadata": [
         "Finalized",
     ],
@@ -368,6 +451,10 @@ TECH_COL_MAP: dict[str, str] = {
     "ma20_gt_ma50":        "MA20>MA50",
     "ma50_gt_ma150":       "MA50>MA150",
     "ma150_gt_ma200":      "MA150>MA200",
+    "slope10_gt_slope20":   "Slope10>Slope20",
+    "slope20_gt_slope50":   "Slope20>Slope50",
+    "slope50_gt_slope150":  "Slope50>Slope150",
+    "slope150_gt_slope200": "Slope150>Slope200",
     "as_of_date":          "Last Close Date",
     "is_finalized":        "Finalized",
     "daily_pct_change":    "Change %",
@@ -437,6 +524,7 @@ TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
 TECH_BOOL_COLS = {
     "Breakout 55D", "Breakout 3M",
     "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
+    "Slope10>Slope20", "Slope20>Slope50", "Slope50>Slope150", "Slope150>Slope200",
     "5D High Now", "22D High Now", "52W High Now", "3M High Now", "3Y High Now",
     "5D Low Now",  "22D Low Now",  "52W Low Now",
     "Finalized",
@@ -458,8 +546,7 @@ _USER_NOTE_COLS = {
 }
 
 _COL_FILTER_SKIP = {
-    "Ticker", "Sector", "Industry",
-    "Rec Key", "Company Name", "Company Description",
+    "Ticker", "Company Description",
 } | _USER_NOTE_COLS
 _COL_FILTER_EMOJI = TECH_BOOL_COLS | {
     "MA10>20", "MA20>50", "MA50>150", "MA150>200",  # legacy column name variants
@@ -469,7 +556,15 @@ _COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
     "Next Earnings Time":  ["BMO", "AMC"],
     "Status":              ["", "必買", "買", "等", "研究", "賭", "X"],
     "Source":              ["", "高分", "BO", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "朋友", "其他"],
+    "Rec Key":             ["strongBuy", "buy", "hold", "underperform", "sell", "strongSell"],
+    "Sector": [
+        "Technology", "Healthcare", "Industrials", "Consumer Cyclical",
+        "Basic Materials", "Consumer Defensive", "Financial Services",
+        "Communication Services", "Energy", "Real Estate", "Utilities",
+    ],
 }
+# Free-text contains-match columns (case-insensitive substring)
+_COL_FILTER_TEXT_SEARCH: set[str] = {"Industry", "Company Name"}
 _COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date", "Swing High Date", "Swing Low Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
 # All user-filterable value columns (ordered, deduplicated)
@@ -506,52 +601,95 @@ try:
 except Exception as _init_err:
     print(f"[storage] init_db warning: {_init_err}")
 
-if "_startup_finalized" not in st.session_state:
-    st.session_state["_startup_finalized"] = True
-    try:
-        storage.mark_old_tech_finalized()
-    except Exception as _e:
-        print(f"[startup] mark_old_tech_finalized failed: {_e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Process-level startup tasks
+#
+# Previously guarded by st.session_state, which resets on every browser
+# reconnect.  Each reconnect spawned duplicate daemon threads AND ran
+# mark_old_tech_finalized() in the main Streamlit thread — which blocked on
+# _db_lock held by those daemon threads, preventing WebSocket heartbeats and
+# causing cascading "connection error" → reconnect → repeat cycles.
+#
+# Fix: guard with a module-level dict + Lock so each task runs exactly once
+# per Python process regardless of how many sessions connect or reconnect.
+# All DuckDB work moves into daemon threads so the main thread never blocks.
+# ─────────────────────────────────────────────────────────────────────────────
+_PROC_STARTUP_LOCK = threading.Lock()
+_PROC_STARTUP: dict = {
+    "finalized":  False,
+    "earnings":   False,
+    "post_earns": False,
+    "stale":      {"count": 0, "target": ""},
+}
 
-# Detect stale tech data on startup (single SQL query — no downloads).
-# We store the count in session_state so the warning banner can show it.
-if "_stale_check_done" not in st.session_state:
-    st.session_state["_stale_check_done"] = True
-    try:
-        from market_calendar import get_last_trading_day_before_today, nyse_close_passed_today as _nyse_closed, et_today as _et_today
-        _target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
-        if _target:
-            st.session_state["_stale_target_date"] = _target
-            st.session_state["_stale_count"] = len(storage.get_tickers_with_stale_tech(_target))
-    except Exception as _e:
-        print(f"[startup] stale check failed: {_e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Process-level scan state — survives browser reconnects / session resets.
+# When a session disconnects and reconnects, the new session syncs from here
+# instead of seeing an empty state, which would leave the old scan running
+# headless alongside any newly launched scan.
+# ─────────────────────────────────────────────────────────────────────────────
+_PROC_SCAN_LOCK = threading.Lock()
+_PROC_SCAN: dict | None = None   # None = no scan running
 
-if "_earnings_fetched" not in st.session_state:
-    st.session_state["_earnings_fetched"] = True
-    def _earnings_bg():
-        try:
-            from earnings_fetcher import run_daily_fetch as _earnings_daily
-            from storage import get_latest_earnings_date as _get_latest_earnings_date
-            _since = _get_latest_earnings_date()
-            if _since:
-                print(f"[earnings] Latest earnings date in DB: {_since} — fetching from there")
-                _earnings_daily(since_date=_since)
-            else:
-                _earnings_daily(lookback_days=7)
-        except Exception as _e:
-            print(f"[earnings] Daily fetch failed: {_e}")
-    threading.Thread(target=_earnings_bg, daemon=True, name="earnings-daily").start()
+with _PROC_STARTUP_LOCK:
+    if not _PROC_STARTUP["finalized"]:
+        _PROC_STARTUP["finalized"] = True
+        def _finalize_bg():
+            try:
+                storage.mark_old_tech_finalized()
+            except Exception as _e:
+                print(f"[startup] mark_old_tech_finalized failed: {_e}")
+        threading.Thread(target=_finalize_bg, daemon=True, name="startup-finalize").start()
 
-if "_post_earns_updated" not in st.session_state:
-    st.session_state["_post_earns_updated"] = True
-    def _post_earns_bg():
-        try:
-            from earnings_fetcher import update_post_earns_columns as _update_post_earns, backfill_extended_columns as _backfill_earns
-            _update_post_earns()
-            _backfill_earns()
-        except Exception as _e:
-            print(f"[post-earns] Update failed: {_e}")
-    threading.Thread(target=_post_earns_bg, daemon=True, name="post-earns-update").start()
+    if not _PROC_STARTUP["stale"]["target"]:
+        def _stale_check_bg():
+            try:
+                from market_calendar import get_last_trading_day_before_today, nyse_close_passed_today as _nyse_closed, et_today as _et_today
+                _target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
+                if _target:
+                    _count = len(storage.get_tickers_with_stale_tech(_target))
+                    with _PROC_STARTUP_LOCK:
+                        _PROC_STARTUP["stale"]["count"] = _count
+                        _PROC_STARTUP["stale"]["target"] = _target
+            except Exception as _e:
+                print(f"[startup] stale check failed: {_e}")
+        threading.Thread(target=_stale_check_bg, daemon=True, name="startup-stale-check").start()
+
+    if not _PROC_STARTUP["earnings"]:
+        _PROC_STARTUP["earnings"] = True
+        def _earnings_bg():
+            try:
+                _slog(f"[earnings] THREAD START  name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
+                from earnings_fetcher import run_daily_fetch as _earnings_daily
+                from storage import get_latest_earnings_date as _get_latest_earnings_date
+                _since = _get_latest_earnings_date()
+                if _since:
+                    print(f"[earnings] Latest earnings date in DB: {_since} — fetching from there")
+                    _earnings_daily(since_date=_since)
+                else:
+                    _earnings_daily(lookback_days=7)
+                _slog(f"[earnings] THREAD DONE   name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
+            except Exception as _e:
+                print(f"[earnings] Daily fetch failed: {_e}")
+        threading.Thread(target=_earnings_bg, daemon=True, name="earnings-daily").start()
+
+    if not _PROC_STARTUP["post_earns"]:
+        _PROC_STARTUP["post_earns"] = True
+        def _post_earns_bg():
+            try:
+                _slog(f"[post-earns] THREAD START  name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
+                from earnings_fetcher import update_post_earns_columns as _update_post_earns, backfill_extended_columns as _backfill_earns
+                _update_post_earns()
+                _backfill_earns()
+                _slog(f"[post-earns] THREAD DONE   name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
+            except Exception as _e:
+                print(f"[post-earns] Update failed: {_e}")
+        threading.Thread(target=_post_earns_bg, daemon=True, name="post-earns-update").start()
+
+# Sync stale count into session_state on every rerun so the banner updates
+# once the background stale-check thread finishes.
+st.session_state["_stale_count"]       = _PROC_STARTUP["stale"]["count"]
+st.session_state["_stale_target_date"] = _PROC_STARTUP["stale"]["target"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state init
@@ -568,6 +706,19 @@ _ss("scan_thread",            None)
 _ss("scan_pause_event",       None)
 _ss("scan_stop_event",        None)
 _ss("scan_progress",          {})
+
+# Adopt any scan running from a prior session so a browser reconnect does not
+# orphan the background thread (and so a new "Run Scan" properly stops it).
+with _PROC_SCAN_LOCK:
+    _active_scan = _PROC_SCAN
+if _active_scan is not None:
+    _prog = _active_scan.get("progress", {})
+    if not _prog.get("finished"):
+        st.session_state.scan_progress    = _prog
+        st.session_state.scan_pause_event = _active_scan["pause_event"]
+        st.session_state.scan_stop_event  = _active_scan["stop_event"]
+        if not st.session_state.get("last_analysis_dt"):
+            st.session_state.last_analysis_dt = _active_scan["analysis_dt"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -841,6 +992,8 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "MA150":          _f(t3.get("MA150")),
         "MA200":          _f(t3.get("MA200")),
         # T4 — big move counts (int)
+        "# Up≥5%":        tc.get("big_up_5p_count_90d"),
+        "# Dn≥5%":        tc.get("big_dn_5p_count_90d"),
         "# Up≥10%":       t4.get("Big Up Days Count"),
         "# Dn≥10%":       t4.get("Big Down Days Count"),
         # F1/F3 — quarterly (float)
@@ -943,6 +1096,10 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "MA20>MA50":       _bi(tc.get("ma20_gt_ma50")),
         "MA50>MA150":      _bi(tc.get("ma50_gt_ma150")),
         "MA150>MA200":     _bi(tc.get("ma150_gt_ma200")),
+        "Slope10>Slope20":   _bi(tc.get("slope10_gt_slope20")),
+        "Slope20>Slope50":   _bi(tc.get("slope20_gt_slope50")),
+        "Slope50>Slope150":  _bi(tc.get("slope50_gt_slope150")),
+        "Slope150>Slope200": _bi(tc.get("slope150_gt_slope200")),
         "Last Close Date":  str(tc.get("as_of_date") or "N/A"),
         "Finalized":        _bi(tc.get("is_finalized")),
         "Change %":         _f(tc.get("daily_pct_change")),
@@ -1249,8 +1406,8 @@ def load_ticker_list() -> list[str]:
 
 # Batch scan settings
 SCAN_BATCH_SIZE     = 100   # tickers per bulk technical download
-SCAN_FUND_WORKERS   = 5     # parallel threads for fundamental + peer fetches
-SCAN_BATCH_COOLDOWN = 10    # seconds to rest between batches
+SCAN_FUND_WORKERS   = 3     # parallel threads for fundamental + peer fetches (keep low to avoid Yahoo rate limits)
+SCAN_BATCH_COOLDOWN = 30    # seconds to rest between batches (give Yahoo Finance time to recover)
 
 # Mullvad VPN rotation — countries cycled through between batches
 VPN_COUNTRIES = ["us", "nl", "de", "se", "ch", "gb", "ca", "fr"]
@@ -1307,6 +1464,7 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
         "total": total, "done": 0, "current": "", "finished": False,
         "error": None, "failures": {},  # {ticker: {reason, missing_fields}}
     })
+    _slog(f"[scan] START  {total} tickers  run={analysis_dt}")
 
     done = 0
     for batch_start in range(0, total, SCAN_BATCH_SIZE):
@@ -1323,6 +1481,8 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
 
         batch = tickers[batch_start: batch_start + SCAN_BATCH_SIZE]
         batch_num = batch_start // SCAN_BATCH_SIZE + 1
+        total_batches = (total + SCAN_BATCH_SIZE - 1) // SCAN_BATCH_SIZE
+        _slog(f"[scan] BATCH {batch_num}/{total_batches}  {batch[0]}…{batch[-1]}  ({len(batch)} tickers)  done={done}  {_res_str()}")
         progress["current"] = f"Batch {batch_num}: {batch[0]}…{batch[-1]} (bulk download)"
 
         # ── Step 1: one bulk download for the whole batch ─────────────────────
@@ -1334,8 +1494,11 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
         if daily_date:
             bulk_tech = fetch_technical_bulk(batch, daily_date, weekly_date)
         else:
+            # Pass _slog (not a silent lambda) so the yf.download START/DONE
+            # diagnostic lines inside fetch_and_store_bulk reach scan_debug.log.
             bulk_tech = fetch_technical_bulk_v2(batch, weekly_latest_date=weekly_date,
-                                                log=lambda m: None)
+                                                log=_slog)
+        _slog(f"[scan] BATCH {batch_num} tech done  {_res_str()}")
 
         # ── Step 2: parallel fund + peer fetches ──────────────────────────────
         progress["current"] = f"Batch {batch_num}: {batch[0]}…{batch[-1]} (fund + peers)"
@@ -1369,7 +1532,10 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
             done += skipped_count
             progress["done"] = done
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_FUND_WORKERS)
+        # Persistent process-lifetime pool: fund workers use yfinance's curl
+        # session, and curl handles owned by dead threads crash the process
+        # when garbage-collected. Never create per-batch pools here.
+        pool = get_fund_pool(SCAN_FUND_WORKERS)
         future_map = {pool.submit(_run_fund_and_peers, t, fetch_peers): t for t in valid_batch}
         try:
             for future in concurrent.futures.as_completed(future_map):
@@ -1408,17 +1574,22 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                 done += 1
                 progress["done"] = done
         finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+            # Cancel not-yet-started work for this batch; keep the pool alive.
+            for f in future_map:
+                f.cancel()
+        rl_count = len(rate_limited_tickers)
+        _slog(f"[scan] BATCH {batch_num} fund done  done={done}/{total}  {_res_str()}"
+              + (f"  rate-limited={rl_count}" if rl_count else ""))
 
         # ── Step 2b: re-queue rate-limited tickers after VPN switch ───────────
         if rate_limited_tickers and vpn_switched_this_batch and not stop_event.is_set():
             progress["current"] = (
                 f"Re-processing {len(rate_limited_tickers)} rate-limited tickers on new IP…"
             )
-            # Use 2 workers — gentle on the freshly switched IP
-            retry_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            # Reuse the persistent pool (per-batch pools leave dead threads
+            # whose curl handles crash the process when garbage-collected)
             retry_map = {
-                retry_pool.submit(_run_fund_and_peers, t, fetch_peers): t
+                pool.submit(_run_fund_and_peers, t, fetch_peers): t
                 for t in rate_limited_tickers
             }
             try:
@@ -1435,10 +1606,12 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                     except Exception:
                         pass
             finally:
-                retry_pool.shutdown(wait=False, cancel_futures=True)
+                for f in retry_map:
+                    f.cancel()
 
         # ── Step 3: cooldown + optional proactive VPN switch ──────────────────
         if batch_start + SCAN_BATCH_SIZE < total and not stop_event.is_set():
+            _slog(f"[scan] COOLDOWN {SCAN_BATCH_COOLDOWN}s")
             progress["current"] = f"Cooldown {SCAN_BATCH_COOLDOWN}s before next batch…"
             for _ in range(SCAN_BATCH_COOLDOWN * 10):
                 if stop_event.is_set():
@@ -1467,7 +1640,7 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                     f"Re-scan missing F1-F6 ({rescan_done}/{len(missing_f6)}): "
                     f"{rs_batch[0]}…{rs_batch[-1]}"
                 )
-                rs_pool = concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_FUND_WORKERS)
+                rs_pool = get_fund_pool(SCAN_FUND_WORKERS)
                 rs_map  = {rs_pool.submit(_run_fund_and_peers, t, fetch_peers): t
                            for t in rs_batch}
                 try:
@@ -1489,7 +1662,8 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                         rescan_done += 1
                         progress["rescan_done"] = rescan_done
                 finally:
-                    rs_pool.shutdown(wait=False, cancel_futures=True)
+                    for f in rs_map:
+                        f.cancel()
                 # Brief cooldown between re-scan batches
                 if rs_start + RESCAN_BATCH < len(missing_f6) and not stop_event.is_set():
                     for _ in range(30):
@@ -1498,8 +1672,35 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                         time.sleep(0.1)
 
     fundamental_fetcher.set_stop_event(None)
+
+    # Backfill any AMC/BMO earnings rows whose next-day price is now available
+    try:
+        from earnings_fetcher import backfill_extended_columns as _backfill_earns
+        _backfill_earns()
+    except Exception as _e:
+        print(f"[scan] post-scan earnings backfill failed: {_e}")
+
+    # Recompute rolling post-earnings metrics with fresh price data
+    try:
+        from earnings_fetcher import update_post_earns_columns as _update_post_earns
+        _update_post_earns()
+    except Exception as _e:
+        print(f"[scan] post-scan post-earns update failed: {_e}")
+
+    # Close this thread's curl handle before the scan thread exits — a handle
+    # left behind by a dead thread aborts the process when garbage-collected.
+    close_thread_curl()
+
     progress["finished"] = True
     progress["current"]  = ""
+    _slog(f"[scan] DONE  {done}/{total} tickers processed")
+
+    # Clear the module-level scan record so a reconnecting session doesn't
+    # re-adopt a finished scan and block launching a fresh one.
+    global _PROC_SCAN
+    with _PROC_SCAN_LOCK:
+        if _PROC_SCAN is not None and _PROC_SCAN.get("stop_event") is stop_event:
+            _PROC_SCAN = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2244,7 +2445,7 @@ _TAB_FILTER_DEFAULTS: dict[str, dict[str, object]] = {
         "f_dt":           [],
         "f_sector":       [],
         "f_industry":     [],
-        "mc_lo":          None,
+        "mc_lo":          1.0,
         "mc_hi":          None,
         "show_sub":          False,
         "only_latest":       False,
@@ -2296,14 +2497,15 @@ def _register_scan_tab(tab_id: str) -> None:
         _TAB_FILTER_KEYS[tab_id] = _tab_filter_keys(tab_id)
     if tab_id not in _TAB_FILTER_DEFAULTS:
         _TAB_FILTER_DEFAULTS[tab_id] = {
-            "f_ticker_multi": [],
-            "f_dt":           [],
-            "f_sector":       [],
-            "f_industry":     [],
-            "mc_lo":          None,
-            "mc_hi":          None,
-            "show_sub":       False,
-            "only_latest":    True,
+            "f_ticker_multi":    [],
+            "f_dt":              [],
+            "f_sector":          [],
+            "f_industry":        [],
+            "mc_lo":             1.0,
+            "mc_hi":             None,
+            "show_sub":          False,
+            "only_latest":       True,
+            "only_latest_close": True,
         }
 
 
@@ -2574,14 +2776,18 @@ def _actually_clear_filter_keys(tab_key: str) -> None:
 
 def _actually_apply_filter_group(tab_key: str, group: dict) -> None:
     """Apply a saved filter group dict to session state. Call before widgets render."""
-    mapping = _TAB_FILTER_KEYS.get(tab_key, {})
+    mapping  = _TAB_FILTER_KEYS.get(tab_key, {})
+    defaults = _TAB_FILTER_DEFAULTS.get(tab_key, {})
     _list_keys = {"f_ticker_multi", "f_dt", "f_sector", "f_industry"}
     for logical_key, ss_key in mapping.items():
         if logical_key in group:
             val = group[logical_key]
-            if val is None and logical_key in _list_keys:
-                val = []
-            st.session_state[ss_key] = val
+        else:
+            # Key absent from old saved group — use registered default so widgets never get None
+            val = defaults.get(logical_key)
+        if val is None and logical_key in _list_keys:
+            val = []
+        st.session_state[ss_key] = val
     st.session_state[f"filt_inds_{tab_key}"] = group.get("selected_inds", [])
     for ind, vals in group.get("ind_vals", {}).items():
         st.session_state[f"filt_vals_{tab_key}_{ind}"] = vals
@@ -2590,6 +2796,8 @@ def _actually_apply_filter_group(tab_key: str, group: dict) -> None:
     for col in group.get("col_filt_cols", []):
         if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
             st.session_state[f"col_filt_catvals_{tab_key}_{col}"] = group.get(f"_cfcatvals_{col}", [])
+        elif col in _COL_FILTER_TEXT_SEARCH:
+            st.session_state[f"col_filt_textval_{tab_key}_{col}"] = group.get(f"_cftextval_{col}", "")
         else:
             st.session_state[f"col_filt_op_{tab_key}_{col}"]     = group.get(f"_cfop_{col}", ">=")
             st.session_state[f"col_filt_numval_{tab_key}_{col}"] = group.get(f"_cfval_{col}")
@@ -2642,6 +2850,8 @@ def _snapshot_filter_group(tab_key: str) -> dict:
     for col in col_filt_cols:
         if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
             group[f"_cfcatvals_{col}"] = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
+        elif col in _COL_FILTER_TEXT_SEARCH:
+            group[f"_cftextval_{col}"] = st.session_state.get(f"col_filt_textval_{tab_key}_{col}", "")
         else:
             group[f"_cfop_{col}"]  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
             group[f"_cfval_{col}"] = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
@@ -2716,6 +2926,12 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
                     options=_COL_FILTER_TEXT_CAT[col],
                     key=f"col_filt_catvals_{tab_key}_{col}",
                 )
+            elif col in _COL_FILTER_TEXT_SEARCH:
+                st.text_input(
+                    f"{col} contains:",
+                    key=f"col_filt_textval_{tab_key}_{col}",
+                    placeholder="partial match (case-insensitive)",
+                )
             elif col in _COL_FILTER_DATES:
                 dc1, dc2, dc3 = st.columns([2, 1, 3])
                 with dc1:
@@ -2761,6 +2977,10 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
             catvals = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
             if catvals:
                 col_filter[col] = {"type": "cat", "vals": set(catvals)}
+        elif col in _COL_FILTER_TEXT_SEARCH:
+            val = st.session_state.get(f"col_filt_textval_{tab_key}_{col}", "")
+            if val:
+                col_filter[col] = {"type": "text", "val": val}
         elif col in _COL_FILTER_DATES:
             op  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
             val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}", "")
@@ -2887,6 +3107,8 @@ def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
     t = spec["type"]
     if t == "cat":
         return str(val) in spec["vals"]
+    if t == "text":
+        return spec["val"].lower() in str(val).lower()
     op, fv = spec["op"], spec["val"]
     if t == "date":
         sval = str(val)
@@ -3388,6 +3610,7 @@ F6 P/B ≤ Peer Median
 
 def _launch_scan(ticker_list: list[str], label: str) -> None:
     """Start a scan thread for the given ticker list."""
+    global _PROC_SCAN
     if not ticker_list:
         st.sidebar.error("No tickers to process. Enter tickers or check tickers.txt.")
         return
@@ -3397,13 +3620,28 @@ def _launch_scan(ticker_list: list[str], label: str) -> None:
     fetch_peers = st.session_state.get("fetch_peers", True)
     vpn_rotate  = st.session_state.get("vpn_rotate",  False)
 
+    # Stop any running scan — both the session-level event and the module-level
+    # event (which may belong to a different session that has since disconnected).
+    with _PROC_SCAN_LOCK:
+        if _PROC_SCAN is not None:
+            _PROC_SCAN["stop_event"].set()
     if st.session_state.scan_stop_event:
         st.session_state.scan_stop_event.set()
-        time.sleep(0.2)
+    time.sleep(0.2)
 
     pause_event = threading.Event()
     stop_event  = threading.Event()
     progress    = {}
+
+    # Register at module level BEFORE starting the thread so a reconnect
+    # during the first batch can already adopt this scan.
+    with _PROC_SCAN_LOCK:
+        _PROC_SCAN = {
+            "progress":    progress,
+            "pause_event": pause_event,
+            "stop_event":  stop_event,
+            "analysis_dt": analysis_dt,
+        }
 
     st.session_state.scan_pause_event  = pause_event
     st.session_state.scan_stop_event   = stop_event
@@ -3413,12 +3651,16 @@ def _launch_scan(ticker_list: list[str], label: str) -> None:
     st.session_state.last_detail_map   = {}
     st.session_state["last_inds_live"] = {}
 
-    t = threading.Thread(
-        target=scan_thread_func,
-        args=(ticker_list, analysis_dt, daily_str, weekly_str,
-              pause_event, stop_event, progress, fetch_peers, vpn_rotate),
-        daemon=True,
-    )
+    def _scan_entry():
+        try:
+            scan_thread_func(ticker_list, analysis_dt, daily_str, weekly_str,
+                             pause_event, stop_event, progress, fetch_peers, vpn_rotate)
+        finally:
+            # Always release this thread's curl handle, even if the scan
+            # raised — a dead thread's handle aborts the process when GC'd.
+            close_thread_curl()
+
+    t = threading.Thread(target=_scan_entry, daemon=True, name="scan-thread")
     st.session_state.scan_thread = t
     t.start()
     st.sidebar.success(label)
@@ -3556,7 +3798,7 @@ def render_scan_tab(tab_id: str) -> None:
     _only_latest_close_pre = st.session_state.get(tk["only_latest_close"], True)
     _show_sub_pre          = st.session_state.get(tk["show_sub"], False)
     _f_sectors_pre   = st.session_state.get(tk["f_sector"], [])
-    _mc_lo_pre       = st.session_state.get(tk["mc_lo"], None)
+    _mc_lo_pre       = st.session_state.get(tk["mc_lo"], 1.0)
     _mc_hi_pre       = st.session_state.get(tk["mc_hi"], None)
     _cust_start_pre  = st.session_state.get(_tab_extra_ss(tab_id, "cust_start"), "").strip()
     _cust_end_pre    = st.session_state.get(_tab_extra_ss(tab_id, "cust_end"), "").strip()
@@ -3636,7 +3878,7 @@ def render_scan_tab(tab_id: str) -> None:
     # ── Row 2: Mkt cap + custom period dates ──────────────────────────────────
     mc1, mc2, cp1, cp2 = st.columns(4)
     with mc1:
-        mc_lo = st.number_input("Mkt Cap min ($B)", value=None, min_value=0.0,
+        mc_lo = st.number_input("Mkt Cap min ($B)", value=1.0, min_value=0.0,
                                 placeholder="no min", key=tk["mc_lo"],
                                 format="%.2f", step=1.0)
     with mc2:
@@ -3766,9 +4008,29 @@ def render_scan_tab(tab_id: str) -> None:
 
         _sort_vals = pd.Series({t: _pre_val_records.get(t, {}).get(_sort_col)
                                  for t in all_df["Ticker"]})
-        _sort_vals = _sort_vals.replace({"N/A": None, "": None})
-        _sort_rank = _sort_vals.rank(method="min", ascending=_sort_asc, na_option="bottom").astype(int)
-        _sort_vals = _sort_vals.sort_values(ascending=_sort_asc, na_position="last")
+        # Normalize all empty/missing sentinels so None is always sorted last
+        _SORT_NONE = {"N/A", "", "None", "nan", "NaN"}
+        _sort_vals = _sort_vals.map(
+            lambda v: pd.NA if (v is None or (isinstance(v, str) and v in _SORT_NONE)
+                                or (isinstance(v, float) and pd.isna(v))) else v
+        )
+        # Rank with nulls at bottom; separate non-null / null to avoid dtype issues
+        _sv_non_null = _sort_vals.dropna()
+        _sv_null     = _sort_vals[_sort_vals.isna()]
+        try:
+            _rank_non_null = _sv_non_null.rank(method="min", ascending=_sort_asc).astype(int)
+        except TypeError:
+            _rank_non_null = pd.Series(range(1, len(_sv_non_null) + 1),
+                                       index=_sv_non_null.sort_values(ascending=_sort_asc).index,
+                                       dtype=int)
+        _rank_null  = pd.Series(len(_sv_non_null) + 1, index=_sv_null.index, dtype=int)
+        _sort_rank  = pd.concat([_rank_non_null, _rank_null])
+        # Sorted order: non-null values first (in correct direction), nulls last
+        try:
+            _sv_sorted = _sv_non_null.sort_values(ascending=_sort_asc)
+        except TypeError:
+            _sv_sorted = _sv_non_null
+        _sort_vals = pd.concat([_sv_sorted, _sv_null])
         _sorted_tickers = list(_sort_vals.index)
         _t_order_map = {t: i for i, t in enumerate(_sorted_tickers)}
         all_df = (all_df

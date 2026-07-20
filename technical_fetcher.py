@@ -15,14 +15,38 @@ Key differences from data_fetcher.py:
 from __future__ import annotations
 import json
 import math
+import socket
+import threading
 import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
+
+try:
+    import psutil as _psutil
+    _DIAG_PROC = _psutil.Process()
+except Exception:
+    _DIAG_PROC = None
+
+
+def _diag_res() -> str:
+    """One-line resource snapshot for diagnostic log lines."""
+    if _DIAG_PROC is None:
+        return "rss=? threads=?"
+    return (f"rss={_DIAG_PROC.memory_info().rss / 1024 / 1024:.0f}MB "
+            f"threads={_DIAG_PROC.num_threads()}")
+
+# Prevent yf.download(threads=False) from hanging indefinitely on a dead TCP
+# connection (e.g. after a VPN switch kills in-flight sockets).
+# This timeout applies per socket read/write operation, not per whole request,
+# so legitimate large downloads still complete; only stalled connections fire.
+socket.setdefaulttimeout(120)
 
 import numpy as np
 import pandas as pd
 import ta
 import yfinance as yf
+
+from yf_session import YF_SESSION
 
 from market_calendar import (
     get_missing_trading_days, nyse_close_passed_today,
@@ -273,6 +297,14 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         sma50_slope_20d  = _slope(sma50,  20)
         sma150_slope_20d = _slope(sma150, 20)
         sma200_slope_20d = _slope(sma200, 20)
+
+        def _slope_gt(a, b):
+            return (a > b) if (a is not None and b is not None) else None
+
+        slope10_gt_slope20   = _slope_gt(sma10_slope_10d,  sma20_slope_10d)
+        slope20_gt_slope50   = _slope_gt(sma20_slope_10d,  sma50_slope_20d)
+        slope50_gt_slope150  = _slope_gt(sma50_slope_20d,  sma150_slope_20d)
+        slope150_gt_slope200 = _slope_gt(sma150_slope_20d, sma200_slope_20d)
 
         # % distance from each MA
         def _pct_from_ma(close_val, ma_val) -> float | None:
@@ -532,13 +564,13 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
                     break
             up_streak_days = streak
             if streak > 0:
-                streak_close = close.iloc[-streak:]
                 streak_vol   = volume.replace(0, np.nan).iloc[-streak:]
-                prior_close  = close.iloc[max(0, n - streak * 2): n - streak]
                 prior_vol    = volume.replace(0, np.nan).iloc[max(0, n - streak * 2): n - streak]
-                if len(prior_close) > 0 and prior_close.mean() != 0:
+                # Price: total gain from close before streak to today's close
+                pre_streak_close = float(close.iloc[n - streak - 1]) if n > streak else None
+                if pre_streak_close and pre_streak_close != 0:
                     up_streak_px_pct = _safe(
-                        (streak_close.mean() / prior_close.mean() - 1) * 100
+                        (float(close.iloc[-1]) / pre_streak_close - 1) * 100
                     )
                 if len(prior_vol) > 0 and prior_vol.mean() != 0:
                     up_streak_vol_pct = _safe(
@@ -572,6 +604,10 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
                 "vol_above_avg": (vol > avg_vol) if (vol and avg_vol) else None,
             }
             (big_up_events if pct >= 10 else big_down_events).append(event)
+        # 5% threshold counts (includes 10%+ days)
+        _pct_90 = pct_change.iloc[-90:].dropna()
+        big_up_5p_count_90d = int((_pct_90 >= 5).sum())
+        big_dn_5p_count_90d = int((_pct_90 <= -5).sum())
 
         # ── T1/T2 comparison dicts (for indicator compatibility) ──────────────
         weekly = (
@@ -710,6 +746,11 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "sma20_slope_10d":     sma20_slope_10d,
             "sma150_slope_20d":    sma150_slope_20d,
             "sma200_slope_20d":    sma200_slope_20d,
+            # MA slope alignment booleans
+            "slope10_gt_slope20":   slope10_gt_slope20,
+            "slope20_gt_slope50":   slope20_gt_slope50,
+            "slope50_gt_slope150":  slope50_gt_slope150,
+            "slope150_gt_slope200": slope150_gt_slope200,
             # Relative volume & up/down vol ratio
             "rel_vol_20d":         rel_vol_20d,
             "rel_vol_50d":         rel_vol_50d,
@@ -723,6 +764,8 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "pct_from_swing_low":  pct_from_swing_low,
             "big_up_events_90d":   json.dumps(big_up_events, default=str),
             "big_down_events_90d": json.dumps(big_down_events, default=str),
+            "big_up_5p_count_90d": big_up_5p_count_90d,
+            "big_dn_5p_count_90d": big_dn_5p_count_90d,
             "daily_vs_3m":         json.dumps(daily_3m,   default=str),
             "daily_vs_12m":        json.dumps(daily_12m,  default=str),
             "weekly_vs_3m":        json.dumps(weekly_3m,  default=str),
@@ -818,7 +861,9 @@ def fetch_and_store_bulk(tickers: list[str],
 
     for i in range(0, len(tickers), _BATCH_SIZE):
         batch = tickers[i: i + _BATCH_SIZE]
-        log(f"  [tech] Downloading batch {i//100 + 1} ({len(batch)} tickers)…")
+        _t0 = time.time()
+        log(f"  [tech] yf.download START  batch={i//100 + 1}  tickers={len(batch)}"
+            f"  thread={threading.current_thread().name}  {_diag_res()}")
         try:
             raw = yf.download(
                 tickers=batch,
@@ -826,11 +871,15 @@ def fetch_and_store_bulk(tickers: list[str],
                 end=_end,
                 group_by="ticker",
                 auto_adjust=False,
-                threads=True,
+                threads=False,
                 progress=False,
+                session=YF_SESSION,
             )
+            log(f"  [tech] yf.download DONE   batch={i//100 + 1}  elapsed={time.time()-_t0:.1f}s"
+                f"  shape={raw.shape}  {_diag_res()}")
         except Exception as e:
-            log(f"  [tech] Batch download failed: {e}")
+            log(f"  [tech] yf.download ERROR  batch={i//100 + 1}  elapsed={time.time()-_t0:.1f}s"
+                f"  err={type(e).__name__}: {e}  {_diag_res()}")
             for t in batch:
                 results[t] = {"error": f"Batch download failed: {e}"}
             continue
@@ -973,8 +1022,9 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
                 end=_end,
                 group_by="ticker",
                 auto_adjust=False,
-                threads=True,
+                threads=False,
                 progress=False,
+                session=YF_SESSION,
             )
         except Exception as e:
             log(f"  [tech] Re-fetch batch failed: {e}")
