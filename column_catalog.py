@@ -26,7 +26,8 @@ def _c(n, g, src, freq, rc, inp, typ, desc):
 # Sorted by VALUE_COL_GROUPS order, then alphabetically within each group.
 COLUMNS = [
     # ── User ──────────────────────────────────────────────────────────────────
-    _c("Status", "User", _QS, _UT, "raw", "status", "str", "User watch-list tag (必買/買/等/研究/X)"),
+    _c("Source", "User", _QS, _UT, "raw", "source", "str", "How this ticker was discovered (高分/BO/暴升/財報升/streak/小紅書/Twitter/Reddit/朋友/其他)"),
+    _c("Status", "User", _QS, _UT, "raw", "status", "str", "User watch-list tag (必買/買/等/研究/賭/X)"),
 
     # ── Price & Volume — Daily (T1) ────────────────────────────────────────────
     _c("12M Avg Px%",  "Price & Volume — Daily (T1)", _YFD, _SC, "computed", "daily_vs_12m.price_pct_change",  "float%", "Avg daily close: latest 63D vs prior 63D ending 12M ago (T1.3)"),
@@ -104,6 +105,8 @@ COLUMNS = [
     _c("MA50",  "MA Values (T3)", _IND, _SC, "computed", "ma_values.MA50",  "float", "50-day SMA value from indicator T3 detail"),
 
     # ── Big Moves 90d (T4) ────────────────────────────────────────────────────
+    _c("# Dn≥5%",  "Big Moves 90d (T4)", _YFD, _SC, "computed", "big_dn_5p_count_90d", "int", "Days with ≥5% decline in trailing 90 days (includes 10%+ days)"),
+    _c("# Up≥5%",  "Big Moves 90d (T4)", _YFD, _SC, "computed", "big_up_5p_count_90d", "int", "Days with ≥5% gain in trailing 90 days (includes 10%+ days)"),
     _c("# Dn≥10%", "Big Moves 90d (T4)", _IND, _SC, "computed", "big_down_events", "int", "Days with ≥10% decline in 90D (T4.2; fewer is better)"),
     _c("# Up≥10%", "Big Moves 90d (T4)", _IND, _SC, "computed", "big_up_events",   "int", "Days with ≥10% gain in 90D (T4.1)"),
 
@@ -193,6 +196,14 @@ COLUMNS = [
     _c("Avg $Vol 50D / Mkt Cap%", "Avg $Vol / Mkt Cap", _YFD, _SC, "computed", "avg_dollar_vol_50d / market_cap", "float%", "50D avg dollar volume as % of mkt cap (liquidity proxy)"),
 
     # ── Income Statement ──────────────────────────────────────────────────────
+    _c("Q Revenue ($B)",      "Income Statement", _TS, _SC, "raw",      "q_revenue",                   "float",  "Latest quarterly revenue in billions (from fundamentals DB)"),
+    _c("A Revenue ($B)",      "Income Statement", _TS, _SC, "raw",      "a_revenue",                   "float",  "Latest annual revenue in billions (from fundamentals DB)"),
+    _c("Q Revenue YoY%",      "Income Statement", _TS, _SC, "computed", "q_rev_yoy",                   "float%", "Quarterly revenue YoY % change"),
+    _c("A Revenue YoY%",      "Income Statement", _TS, _SC, "computed", "a_rev_yoy",                   "float%", "Annual revenue YoY % change"),
+    _c("Q EPS ($)",           "Income Statement", _TS, _SC, "raw",      "q_eps",                       "float",  "Latest quarterly EPS in dollars"),
+    _c("A EPS ($)",           "Income Statement", _TS, _SC, "raw",      "a_eps",                       "float",  "Latest annual EPS in dollars"),
+    _c("Q EPS YoY%",          "Income Statement", _TS, _SC, "computed", "q_eps_yoy",                   "float%", "Quarterly EPS YoY % change"),
+    _c("A EPS YoY%",          "Income Statement", _TS, _SC, "computed", "a_eps_yoy",                   "float%", "Annual EPS YoY % change"),
     _c("A EBITDA ($B)",       "Income Statement", _TS, _SC, "raw",      "annualEBITDA",                "float",  "Latest annual EBITDA in billions"),
     _c("A EBITDA YoY%",       "Income Statement", _TS, _SC, "computed", "annualEBITDA",                "float%", "Annual EBITDA YoY % change"),
     _c("A Gross Profit ($B)", "Income Statement", _TS, _SC, "raw",      "annualGrossProfit",           "float",  "Latest annual gross profit in billions"),
@@ -255,6 +266,7 @@ COLUMNS = [
     _c("Days to Cover",       "Short Interest", _QS, _SC, "raw",      "shortRatio",                             "float",  "Days to cover = shares short / avg daily volume"),
     _c("Float Shares (M)",    "Short Interest", _QS, _SC, "raw",      "floatShares",                            "float",  "Float shares in millions"),
     _c("Shares Short (M)",    "Short Interest", _QS, _SC, "raw",      "sharesShort",                            "float",  "Shares short in millions"),
+    _c("Shares Short PM (M)", "Short Interest", _QS, _SC, "raw",      "sharesShortPriorMonth",                  "float",  "Prior-month shares short in millions (for MoM trend)"),
     _c("Shares Out (M)",      "Short Interest", _QS, _SC, "raw",      "sharesOutstanding",                      "float",  "Shares outstanding in millions"),
     _c("Short % Float (Calc)","Short Interest", _QS, _SC, "computed", "sharesShort / floatShares",              "float%", "Short interest as % of float (computed)"),
     _c("Short % Float (Y)",   "Short Interest", _QS, _SC, "raw",      "shortPercentOfFloat",                    "float%", "Short interest as % of float (Yahoo reported)"),
@@ -364,6 +376,10 @@ COLUMNS = [
     _c("SMA20 Slope 10D",  "MA Slopes", _YFD, _SC, "computed", "sma20_slope_10d",  "float", "SMA20 slope over last 10 days"),
     _c("SMA200 Slope 20D", "MA Slopes", _YFD, _SC, "computed", "sma200_slope_20d", "float", "SMA200 slope over last 20 days"),
     _c("SMA50 Slope 20D",  "MA Slopes", _YFD, _SC, "computed", "sma50_slope_20d",  "float", "SMA50 slope over last 20 days"),
+    _c("Slope10>Slope20",   "MA Slopes", _YFD, _SC, "computed", "slope10_gt_slope20",   "bool", "SMA10 10D slope > SMA20 10D slope; None if either slope unavailable"),
+    _c("Slope20>Slope50",   "MA Slopes", _YFD, _SC, "computed", "slope20_gt_slope50",   "bool", "SMA20 10D slope > SMA50 20D slope; None if either slope unavailable"),
+    _c("Slope50>Slope150",  "MA Slopes", _YFD, _SC, "computed", "slope50_gt_slope150",  "bool", "SMA50 20D slope > SMA150 20D slope; None if either slope unavailable"),
+    _c("Slope150>Slope200", "MA Slopes", _YFD, _SC, "computed", "slope150_gt_slope200", "bool", "SMA150 20D slope > SMA200 20D slope; None if either slope unavailable"),
 
     # ── EMA & Slope ───────────────────────────────────────────────────────────
     _c("EMA200", "EMA & Slope", _YFD, _SC, "raw", "ema200",  "float", "200-day exponential moving average"),
