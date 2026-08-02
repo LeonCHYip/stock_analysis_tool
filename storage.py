@@ -409,6 +409,45 @@ CREATE TABLE IF NOT EXISTS price_history (
 );
 """
 
+_DDL_SWING_PRICE_HISTORY = """
+CREATE TABLE IF NOT EXISTS swing_price_history (
+    ticker  TEXT   NOT NULL,
+    date    DATE   NOT NULL,
+    open    DOUBLE,
+    high    DOUBLE,
+    low     DOUBLE,
+    close   DOUBLE,
+    volume  BIGINT,
+    PRIMARY KEY (ticker, date)
+);
+"""
+# Fully split/dividend-adjusted OHLCV (yf.download auto_adjust=True), separate
+# from price_history (raw, ~3y, rewritten every scan). Populated on-demand,
+# per-ticker, up to 30y, only for tickers analyzed in Swing Cycle Analysis.
+# Deliberately isolated: price_history feeds unbounded-window scan indicators
+# (made_high_3y, days_since_prior_high_3y — see _backfill_high_low_flags /
+# _backfill_prior_high_days) whose "_3y" semantics depend on price_history
+# only ever spanning ~3 years per ticker. Mixing decades of extra history in
+# there would silently corrupt those columns for any backfilled ticker.
+# Adjusted values can shift retroactively for OLD dates whenever a NEW split
+# or dividend occurs, so refreshing this table must replace a ticker's entire
+# row set (see save_swing_price_history), never just append the latest day.
+
+_DDL_SWING_PRICE_HISTORY_META = """
+CREATE TABLE IF NOT EXISTS swing_price_history_meta (
+    ticker      TEXT PRIMARY KEY,
+    fetched_on  TEXT NOT NULL
+);
+"""
+# Freshness is tracked by the ET calendar date the fetch happened on, NOT by
+# comparing the cached data's MAX(date) against an "expected" trading day --
+# yfinance can lag the expected latest trading day by a day even when a fresh
+# download was JUST performed, which would make an expected-date comparison
+# see the cache as permanently stale and re-download on every single call,
+# defeating the cache entirely. "Same ET calendar day as last fetch" is what
+# swing_analysis.fetch_and_cache_swing_history actually needs: reuse freely
+# within a day, refetch (and fully replace) once a new day begins.
+
 _DDL_TRIGGER_CACHE = """
 CREATE TABLE IF NOT EXISTS trigger_cache (
     cache_key        TEXT    NOT NULL,
@@ -489,6 +528,8 @@ def init_db() -> None:
     con.execute(_DDL_EARNINGS)
     con.execute(_DDL_EARNINGS_LOG)
     con.execute(_DDL_PRICE_HISTORY)
+    con.execute(_DDL_SWING_PRICE_HISTORY)
+    con.execute(_DDL_SWING_PRICE_HISTORY_META)
     con.execute(_DDL_TRIGGER_CACHE)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
@@ -1756,6 +1797,64 @@ def save_price_history(ticker: str, rows: list[tuple]) -> None:
             "INSERT OR REPLACE INTO price_history (ticker, date, close, volume) VALUES (?, ?, ?, ?)",
             [(ticker, r[0], r[1], r[2]) for r in rows],
         )
+
+
+# ── Swing-cycle-analysis price history (separate from price_history) ───────────
+# See _DDL_SWING_PRICE_HISTORY above for why this is a dedicated table.
+
+def get_swing_price_history(ticker: str) -> list[tuple]:
+    """Return cached [(date_str, open, high, low, close, volume), ...] for
+    `ticker`, ordered by date ascending. Empty list if nothing cached yet.
+    Values are fully split/dividend-adjusted (see swing_analysis.py)."""
+    con = _conn()
+    return con.execute(
+        "SELECT date::TEXT, open, high, low, close, volume "
+        "FROM swing_price_history WHERE ticker = ? ORDER BY date",
+        [ticker],
+    ).fetchall()
+
+
+def get_swing_history_fetch_date(ticker: str) -> str | None:
+    """Return the ET calendar date `ticker`'s swing history was last fetched
+    on, or None if never fetched. Used for cache-freshness (see
+    _DDL_SWING_PRICE_HISTORY_META) -- deliberately NOT the data's own
+    MAX(date), which can lag the expected trading day and cause false
+    staleness on every check."""
+    con = _conn()
+    row = con.execute(
+        "SELECT fetched_on FROM swing_price_history_meta WHERE ticker = ?",
+        [ticker],
+    ).fetchone()
+    return row[0] if row else None
+
+
+def save_swing_price_history(ticker: str, rows: list[tuple], fetched_on: str) -> None:
+    """Replace ALL cached rows for `ticker` with `rows`, and record the ET
+    calendar date this fetch happened on.
+
+    Full delete-then-insert, not an incremental upsert: a new split or
+    dividend can retroactively change adjusted values for OLD dates too, so a
+    partial/incremental update could leave stale rows behind. `con` is reused
+    across all statements so they happen under one lock acquisition (see
+    _LockedCursor / _db_lock).
+
+    Args:
+        ticker: ticker symbol
+        rows: list of (date_str, open, high, low, close, volume) tuples
+        fetched_on: ET calendar date (YYYY-MM-DD) this fetch was performed on
+    """
+    con = _conn()
+    con.execute("DELETE FROM swing_price_history WHERE ticker = ?", [ticker])
+    if rows:
+        con.executemany(
+            "INSERT INTO swing_price_history (ticker, date, open, high, low, close, volume) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(ticker, r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows],
+        )
+    con.execute(
+        "INSERT OR REPLACE INTO swing_price_history_meta (ticker, fetched_on) VALUES (?, ?)",
+        [ticker, fetched_on],
+    )
 
 
 def _pct(new_val, old_val) -> float | None:

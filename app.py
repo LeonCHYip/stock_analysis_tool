@@ -134,6 +134,7 @@ from trigger_engine import (
     get_trigger_date_field_values,
 )
 from column_catalog import render_column_reference_tab
+from swing_analysis import analyze_swings
 from storage import (
     init_db, save_results, update_field, save_comment_for_ticker, save_status_for_ticker,
     save_source_for_ticker, save_user_field_for_ticker,
@@ -4331,11 +4332,14 @@ with _plus_col_r:
         _add_scan_tab()
         st.rerun()
 
-_all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + ["🤖 AI Analysis", "📡 Event Scanner", "📖 Column Reference"]
+_all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + [
+    "🤖 AI Analysis", "📡 Event Scanner", "🔀 Swing Cycle Analysis", "📖 Column Reference",
+]
 _all_tab_widgets = st.tabs(_all_tab_labels)
-_scan_tab_widgets = _all_tab_widgets[:-3]
-tab_ai      = _all_tab_widgets[-3]
-tab_event   = _all_tab_widgets[-2]
+_scan_tab_widgets = _all_tab_widgets[:-4]
+tab_ai      = _all_tab_widgets[-4]
+tab_event   = _all_tab_widgets[-3]
+tab_swing   = _all_tab_widgets[-2]
 tab_ref     = _all_tab_widgets[-1]
 
 
@@ -4631,6 +4635,113 @@ with tab_event:
     elif "es_run_btn" in st.session_state or "_es_last_pairs" in st.session_state:
         if not _es_pairs:
             st.info("No tickers matched the conditions.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB: Swing Cycle Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_swing:
+    st.markdown("### 🔀 Swing Cycle Analysis")
+    st.caption(
+        "Detect Bottom → Peak → Bottom price-swing cycles for one ticker using a "
+        "reproducible, rule-based percentage-reversal method (no subjective chart-reading). "
+        "Price history is fully split/dividend-adjusted and cached per ticker for the "
+        "rest of the trading day."
+    )
+    st.info(
+        "**Look-ahead-bias note:** turning-point dates mark the historical price "
+        "extreme. Confirmation dates mark when the reversal rule had accumulated "
+        "enough information to recognize that turning point — always later. "
+        "Any trading-signal use must be based on confirmation dates, not the "
+        "extreme dates, to avoid look-ahead bias.",
+        icon="⚠️",
+    )
+
+    with st.form("swing_analysis_form"):
+        _sw_c1, _sw_c2, _sw_c3 = st.columns(3)
+        with _sw_c1:
+            _sw_ticker = st.text_input("Ticker", value="", placeholder="e.g. AAPL",
+                                       key="sw_ticker").strip().upper()
+        with _sw_c2:
+            _sw_price_col_label = st.selectbox(
+                "Price field for detection",
+                options=["Close", "High", "Low", "Typical (H+L+C)/3"],
+                key="sw_price_col",
+            )
+        with _sw_c3:
+            _sw_reversal_pct = st.number_input(
+                "Reversal threshold %", min_value=0.5, max_value=90.0,
+                value=8.0, step=0.5, key="sw_reversal_pct",
+            )
+
+        _sw_c4, _sw_c5, _sw_c6 = st.columns(3)
+        with _sw_c4:
+            _sw_min_duration = st.number_input(
+                "Minimum swing duration (trading days)", min_value=0, max_value=60,
+                value=5, step=1, key="sw_min_duration",
+            )
+        with _sw_c5:
+            _sw_start_date = st.date_input("Start date (optional)", value=None, key="sw_start_date")
+        with _sw_c6:
+            _sw_end_date = st.date_input("End date (optional)", value=None, key="sw_end_date")
+
+        _sw_run = st.form_submit_button("Run Swing Analysis", type="primary")
+
+    _SW_PRICE_COL_MAP = {
+        "Close": "close", "High": "high", "Low": "low", "Typical (H+L+C)/3": "typical",
+    }
+
+    if _sw_run:
+        if not _sw_ticker:
+            st.error("Enter a ticker.")
+        else:
+            with st.spinner(f"Analyzing {_sw_ticker}…"):
+                try:
+                    _sw_cycles_df, _sw_data = analyze_swings(
+                        ticker=_sw_ticker,
+                        reversal_pct=_sw_reversal_pct,
+                        min_duration=int(_sw_min_duration),
+                        price_column=_SW_PRICE_COL_MAP[_sw_price_col_label],
+                        start_date=_sw_start_date.isoformat() if _sw_start_date else None,
+                        end_date=_sw_end_date.isoformat() if _sw_end_date else None,
+                    )
+                    st.session_state["sw_result"] = (_sw_ticker, _sw_cycles_df)
+                except ValueError as e:
+                    st.error(str(e))
+                    st.session_state.pop("sw_result", None)
+
+    if "sw_result" in st.session_state:
+        _sw_res_ticker, _sw_res_df = st.session_state["sw_result"]
+        if _sw_res_df.empty:
+            st.info(f"No complete swing cycles found for {_sw_res_ticker} with the current settings. "
+                    "Try a lower reversal threshold or a wider date range.")
+        else:
+            st.markdown(f"#### Results — {_sw_res_ticker}")
+            _sw_m1, _sw_m2, _sw_m3, _sw_m4 = st.columns(4)
+            _sw_m1.metric("Completed cycles", len(_sw_res_df))
+            _sw_m2.metric("Median up return", f"{_sw_res_df['Up Return %'].median():.1f}%")
+            _sw_m3.metric("Median drawdown", f"{_sw_res_df['Down Return %'].median():.1f}%")
+            _sw_m4.metric("Median days to peak", f"{_sw_res_df['Bottom-to-Peak Trading Days'].median():.0f}")
+
+            _sw_col_cfg = {
+                "Up Return %":   st.column_config.NumberColumn("Up Return %", format="%.2f%%"),
+                "Down Return %": st.column_config.NumberColumn("Down Return %", format="%.2f%%"),
+                "Cycle Return %": st.column_config.NumberColumn("Cycle Return %", format="%.2f%%"),
+                "Start Bottom Price": st.column_config.NumberColumn("Start Bottom Price", format="%.2f"),
+                "Peak Price":         st.column_config.NumberColumn("Peak Price", format="%.2f"),
+                "End Bottom Price":   st.column_config.NumberColumn("End Bottom Price", format="%.2f"),
+            }
+            st.dataframe(
+                _sw_res_df, column_config=_sw_col_cfg, hide_index=True,
+                height=500, width="stretch",
+            )
+
+            st.download_button(
+                "Download CSV",
+                data=_sw_res_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"swing_cycles_{_sw_res_ticker}.csv",
+                mime="text/csv",
+            )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB: Column Reference
