@@ -6,6 +6,7 @@ Run: streamlit run app.py
 
 from __future__ import annotations
 import copy
+import uuid
 import faulthandler
 import json
 import logging
@@ -135,6 +136,7 @@ from trigger_engine import (
 )
 from column_catalog import render_column_reference_tab
 from swing_analysis import analyze_swings
+import backtester as bt
 from storage import (
     init_db, save_results, update_field, save_comment_for_ticker, save_status_for_ticker,
     save_source_for_ticker, save_user_field_for_ticker,
@@ -3131,11 +3133,20 @@ def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
 def apply_col_filter(tickers: list[str], col_filter: dict,
                      detail_map: dict, rows_by_ticker: dict,
                      fund_map: dict, tech_map: dict,
-                     earnings_map: dict | None = None) -> list[str]:
-    """Return subset of tickers whose value-table records pass all column filters."""
+                     earnings_map: dict | None = None,
+                     returns_map: dict | None = None) -> list[str]:
+    """Return subset of tickers whose value-table records pass all column filters.
+
+    returns_map must be supplied to filter correctly on any price_history-derived
+    column (5D/1M/.../Cust/Trig Px%/Vol%) -- those columns are populated from
+    _build_value_record's `returns` argument, not detail/fund/tech, so without
+    it every such column is None for every ticker and any filter on them
+    silently excludes everything.
+    """
     if not col_filter:
         return tickers
     em = earnings_map or {}
+    rm = returns_map or {}
     out = []
     for t in tickers:
         rec = _build_value_record(
@@ -3145,6 +3156,7 @@ def apply_col_filter(tickers: list[str], col_filter: dict,
             fund_map.get(t, {}),
             tech_map.get(t, {}),
             em.get(t),
+            rm.get(t),
         )
         if all(_col_filter_passes(rec, col, spec) for col, spec in col_filter.items()):
             out.append(t)
@@ -3926,39 +3938,31 @@ def render_scan_tab(tab_id: str) -> None:
         if t in t_det:
             detail_map[t] = t_det[t]
 
-    if col_filter:
-        _rows_by_ticker_all = {r["ticker"]: r for r in filt_rows}
-        _earnings_map_cf = get_latest_earnings_for_tickers(
-            [r["ticker"] for r in filt_rows]
-        ) if filt_rows else {}
-        _pass = set(apply_col_filter(
-            [r["ticker"] for r in filt_rows], col_filter, detail_map,
-            _rows_by_ticker_all, fund_map, tech_map,
-            earnings_map=_earnings_map_cf,
-        ))
-        filt_rows = [r for r in filt_rows if r["ticker"] in _pass]
-
-    # ── Pre-build value records ───────────────────────────────────────────────
-    _rows_by_ticker = {r["ticker"]: r for r in filt_rows}
-    _earnings_map   = get_latest_earnings_for_tickers(list(_rows_by_ticker)) if filt_rows else {}
-
-    _ph_tickers = list(_rows_by_ticker.keys())
-    _ph_returns: dict[str, dict] = storage.compute_returns_for_tickers(_ph_tickers) if _ph_tickers else {}
+    # ── Price-history-derived returns (spot/rolling, custom period, trigger) ──
+    # Computed BEFORE the column filter runs, over the FULL pre-filter ticker
+    # set. Any filter on a returns-derived column (5D/1M/.../Cust/Trig Px%/
+    # Vol%) needs this data to evaluate correctly -- these columns are
+    # populated from _build_value_record's `returns` arg, not detail/fund/
+    # tech. Previously this block ran only AFTER col_filter, so during
+    # filtering every such column was None for every ticker and any filter
+    # on them silently excluded everything, no matter how many records
+    # actually matched.
+    _ph_tickers_all = [r["ticker"] for r in filt_rows]
+    _ph_returns: dict[str, dict] = storage.compute_returns_for_tickers(_ph_tickers_all) if _ph_tickers_all else {}
 
     from datetime import date as _date, timedelta as _td
     _today_str = _date.today().isoformat()
-    _cust_s = _cust_start_pre or storage.get_nth_trading_day_back(_ph_tickers, 22) or (
+    _cust_s = _cust_start_pre or storage.get_nth_trading_day_back(_ph_tickers_all, 22) or (
         _date.today() - _td(days=31)
     ).isoformat()
     _cust_e = _cust_end_pre or _today_str
-    _cust_returns = storage.get_custom_period_returns(_ph_tickers, _cust_s, _cust_e) if _ph_tickers else {}
+    _cust_returns = storage.get_custom_period_returns(_ph_tickers_all, _cust_s, _cust_e) if _ph_tickers_all else {}
     for _t, _cr in _cust_returns.items():
         _ph_returns.setdefault(_t, {}).update(_cr)
 
-    # ── Trigger-based returns ─────────────────────────────────────────────────
-    if _ph_tickers and _trig_start_conds_pre:
+    if _ph_tickers_all and _trig_start_conds_pre:
         _trig_results = trigger_engine.compute_trigger_returns(
-            _ph_tickers,
+            _ph_tickers_all,
             _trig_start_conds_pre,
             _trig_start_logic_pre,
             _trig_end_conds_pre,
@@ -3966,6 +3970,22 @@ def render_scan_tab(tab_id: str) -> None:
         )
         for _t, _tr in _trig_results.items():
             _ph_returns.setdefault(_t, {}).update(_tr)
+
+    if col_filter:
+        _rows_by_ticker_all = {r["ticker"]: r for r in filt_rows}
+        _earnings_map_cf = get_latest_earnings_for_tickers(_ph_tickers_all) if filt_rows else {}
+        _pass = set(apply_col_filter(
+            _ph_tickers_all, col_filter, detail_map,
+            _rows_by_ticker_all, fund_map, tech_map,
+            earnings_map=_earnings_map_cf,
+            returns_map=_ph_returns,
+        ))
+        filt_rows = [r for r in filt_rows if r["ticker"] in _pass]
+
+    # ── Pre-build value records ───────────────────────────────────────────────
+    _rows_by_ticker = {r["ticker"]: r for r in filt_rows}
+    _earnings_map   = get_latest_earnings_for_tickers(list(_rows_by_ticker)) if filt_rows else {}
+    _ph_tickers     = list(_rows_by_ticker.keys())   # post-filter subset of _ph_tickers_all
 
     _pre_val_records: dict[str, dict] = {
         t: _build_value_record(
@@ -4333,14 +4353,16 @@ with _plus_col_r:
         st.rerun()
 
 _all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + [
-    "🤖 AI Analysis", "📡 Event Scanner", "🔀 Swing Cycle Analysis", "📖 Column Reference",
+    "🤖 AI Analysis", "📡 Event Scanner", "🔀 Swing Cycle Analysis",
+    "🧪 Strategy Backtester", "📖 Column Reference",
 ]
 _all_tab_widgets = st.tabs(_all_tab_labels)
-_scan_tab_widgets = _all_tab_widgets[:-4]
-tab_ai      = _all_tab_widgets[-4]
-tab_event   = _all_tab_widgets[-3]
-tab_swing   = _all_tab_widgets[-2]
-tab_ref     = _all_tab_widgets[-1]
+_scan_tab_widgets = _all_tab_widgets[:-5]
+tab_ai       = _all_tab_widgets[-5]
+tab_event    = _all_tab_widgets[-4]
+tab_swing    = _all_tab_widgets[-3]
+tab_backtest = _all_tab_widgets[-2]
+tab_ref      = _all_tab_widgets[-1]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4742,6 +4764,448 @@ with tab_swing:
                 file_name=f"swing_cycles_{_sw_res_ticker}.csv",
                 mime="text/csv",
             )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB: Strategy Backtester
+# ══════════════════════════════════════════════════════════════════════════════
+
+_BT_BUY_METHODS = {
+    "Fixed monetary amount per buy": "fixed_amount",
+    "Fixed share quantity per buy": "fixed_shares",
+    "Fixed % of starting capital": "pct_starting_capital",
+    "Fixed % of available cash": "pct_available_cash",
+    "Fixed % of total portfolio value at first buy (same $ amount every buy)": "pct_total_value_at_first_buy",
+    "Equal allocation of remaining cash across remaining buys": "equal_cash_remaining",
+    "Equal $ amount = starting capital / max buys": "equal_starting_capital_over_max_buys",
+    "Custom per-trade table": "custom_table",
+}
+_BT_SELL_METHODS = {
+    "Sell entire position": "entire_position",
+    "Fixed monetary amount": "fixed_amount",
+    "Fixed share quantity": "fixed_shares",
+    "Fixed % of current shares": "pct_shares",
+    "Fixed % of position at first sell (same share count every sell)": "pct_shares_at_first_sell",
+    "Custom per-trade table": "custom_table",
+}
+_BT_FIRST_BUY_KINDS = {
+    "Price X% below historical high": "pct_below_historical_high",
+    "Rolling Y-day high/low breakout": "rolling_high_low_pct",
+    "Price X% above/below a moving average": "ma_state_pct",
+    "RSI oversold (state condition)": "rsi_state",
+}
+_BT_SELL_KINDS = {
+    "Price X% above avg purchase price (profit target)": "profit_target_pct",
+    "Price X% below avg purchase price (stop loss)": "stop_loss_pct",
+    "Trailing stop X% from peak since first buy": "trailing_stop_pct",
+    "Hold for X trading days": "hold_days",
+    "Rolling Y-day high/low breakout/breakdown": "rolling_high_low_pct",
+    "Price X% above/below a moving average": "ma_state_pct",
+    "RSI overbought (state condition)": "rsi_state",
+}
+
+
+def _bt_label(key: str) -> str:
+    return key.replace("_", " ").title().replace("Pct", "%")
+
+
+def _bt_render_metrics_table(d: dict) -> None:
+    rows = [{"Metric": _bt_label(k), "Value": v} for k, v in d.items() if not k.startswith("_")]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def _bt_render_result(result_dict: dict) -> None:
+    """Render a backtest result (from a live run or a loaded prior run).
+    result_dict keys: ticker, summary (with a nested "buy_and_hold" key --
+    folded in rather than stored as a separate DB column/field, see the
+    save/load call sites), warnings, transactions (df), daily_history (df)."""
+    for w in result_dict.get("warnings") or []:
+        st.warning(w)
+
+    summary = result_dict["summary"]
+    bh = summary.get("buy_and_hold", {})
+    perf = summary.get("performance", {})
+    risk = summary.get("risk", {})
+
+    st.markdown(f"#### Results — {result_dict['ticker']}")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Final Value", f"${perf.get('final_portfolio_value', 0):,.0f}")
+    m2.metric("Total Return", f"{perf.get('total_return_pct', 0):.2f}%")
+    excess = bh.get("excess_return_pct", "N/A")
+    m3.metric("Excess Return vs B&H", f"{excess:.2f}%" if excess != "N/A" else "N/A")
+    m4.metric("Max Drawdown", f"{risk.get('max_drawdown_pct', 0):.2f}%" if risk.get('max_drawdown_pct') != "N/A" else "N/A")
+
+    with st.expander("Strategy Period"):
+        _bt_render_metrics_table(summary.get("strategy_period", {}))
+    with st.expander("Trading Activity"):
+        _bt_render_metrics_table(summary.get("trading_activity", {}))
+    with st.expander("Performance"):
+        _bt_render_metrics_table(perf)
+    with st.expander("Risk"):
+        _bt_render_metrics_table(risk)
+    with st.expander("Trade Statistics"):
+        _bt_render_metrics_table(summary.get("trade_statistics", {}))
+    with st.expander("Buy & Hold Comparison"):
+        _bt_render_metrics_table(bh)
+
+    txn_df = result_dict["transactions"]
+    st.markdown("**Transactions**")
+    if txn_df.empty:
+        st.info("No transactions were executed for this run.")
+    else:
+        bt_txn_col_cfg = {
+            "realized_return_pct": st.column_config.NumberColumn("Realized Return %", format="%.2f%%"),
+            "portfolio_return_pct_after": st.column_config.NumberColumn("Portfolio Return %", format="%.2f%%"),
+            "execution_price": st.column_config.NumberColumn("Execution Price", format="%.2f"),
+            "avg_purchase_price_after": st.column_config.NumberColumn("Avg Purchase Price", format="%.2f"),
+        }
+        st.dataframe(txn_df, column_config=bt_txn_col_cfg, hide_index=True,
+                     height=400, width="stretch")
+        st.download_button(
+            "Download Transactions CSV",
+            data=txn_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"backtest_transactions_{result_dict['ticker']}.csv",
+            mime="text/csv",
+            key=f"bt_dl_txn_{result_dict.get('run_id', 'live')}",
+        )
+
+    daily_df = result_dict["daily_history"]
+    with st.expander(f"Daily Portfolio History ({len(daily_df)} rows)"):
+        if daily_df.empty:
+            st.info("No daily history recorded.")
+        else:
+            st.dataframe(daily_df, hide_index=True, height=400, width="stretch")
+            st.download_button(
+                "Download Daily History CSV",
+                data=daily_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"backtest_daily_history_{result_dict['ticker']}.csv",
+                mime="text/csv",
+                key=f"bt_dl_daily_{result_dict.get('run_id', 'live')}",
+            )
+
+
+with tab_backtest:
+    st.markdown("### 🧪 Strategy Backtester")
+    st.caption(
+        "Simulate buying/selling one ticker historically under configurable entry, "
+        "recurring-buy, exit, and position-sizing rules — cash, shares, transactions, "
+        "and daily portfolio value, without look-ahead bias. Price history is fully "
+        "split/dividend-adjusted and cached per ticker, same as Swing Cycle Analysis."
+    )
+
+    with st.expander("Load a previous run"):
+        _bt_load_tickers = storage.get_backtest_run_tickers()
+        _bt_load_ticker_f = st.multiselect("Filter by ticker", options=_bt_load_tickers, key="bt_load_ticker_f")
+        _bt_load_runs = storage.get_backtest_runs(
+            ticker=_bt_load_ticker_f[0] if len(_bt_load_ticker_f) == 1 else None
+        )
+        if _bt_load_ticker_f and len(_bt_load_ticker_f) > 1:
+            _bt_load_runs = [r for r in _bt_load_runs if r["ticker"] in _bt_load_ticker_f]
+        if not _bt_load_runs:
+            st.info("No saved backtest runs yet.")
+        else:
+            _bt_run_opts = {
+                f"{r['ticker']} · {r['start_date']}→{r['end_date']} · saved {r['created_at']} · {r['status']}": r["run_id"]
+                for r in _bt_load_runs
+            }
+            _bt_sel_label = st.selectbox("Select a run", options=list(_bt_run_opts.keys()), key="bt_load_sel")
+            if st.button("Load", key="bt_load_btn"):
+                _bt_run_id = _bt_run_opts[_bt_sel_label]
+                _bt_run = storage.get_backtest_run(_bt_run_id)
+                _bt_txns = pd.DataFrame(storage.get_backtest_transactions(_bt_run_id))
+                _bt_daily = pd.DataFrame(storage.get_backtest_daily_history(_bt_run_id))
+                st.session_state["bt_result"] = {
+                    "run_id": _bt_run_id, "ticker": _bt_run["ticker"],
+                    "summary": _bt_run["summary"],   # buy_and_hold already nested inside, see save path
+                    "warnings": _bt_run["warnings"], "transactions": _bt_txns, "daily_history": _bt_daily,
+                }
+
+    st.markdown("**Structural choices (reactive — pick these before filling in the rest)**")
+    _bt_s1, _bt_s2, _bt_s3, _bt_s4 = st.columns(4)
+    with _bt_s1:
+        _bt_max_buys = st.number_input("Max buys", min_value=1, max_value=2000, value=20, key="bt_max_buys")
+    with _bt_s2:
+        _bt_max_sells = st.number_input("Max sells", min_value=1, max_value=2000, value=20, key="bt_max_sells")
+    with _bt_s3:
+        _bt_buy_method_label = st.selectbox("Buy sizing method", options=list(_BT_BUY_METHODS.keys()), key="bt_buy_method")
+    with _bt_s4:
+        _bt_sell_method_label = st.selectbox("Sell sizing method", options=list(_BT_SELL_METHODS.keys()), key="bt_sell_method")
+    _bt_buy_method = _BT_BUY_METHODS[_bt_buy_method_label]
+    _bt_sell_method = _BT_SELL_METHODS[_bt_sell_method_label]
+
+    _bt_s5, _bt_s6 = st.columns(2)
+    with _bt_s5:
+        _bt_fb_kind_label = st.selectbox("First-buy trigger type", options=list(_BT_FIRST_BUY_KINDS.keys()), key="bt_fb_kind")
+    with _bt_s6:
+        _bt_sell_kind_label = st.selectbox("Sell trigger type", options=list(_BT_SELL_KINDS.keys()), key="bt_sell_kind")
+    _bt_fb_kind = _BT_FIRST_BUY_KINDS[_bt_fb_kind_label]
+    _bt_sell_kind = _BT_SELL_KINDS[_bt_sell_kind_label]
+
+    with st.form("backtest_form"):
+        st.markdown("**Basic Settings**")
+        _bt_c1, _bt_c2, _bt_c3 = st.columns(3)
+        with _bt_c1:
+            _bt_ticker = st.text_input("Ticker", value="", placeholder="blank = SOXL", key="bt_ticker").strip().upper()
+        with _bt_c2:
+            _bt_start_date = st.date_input("Start date (blank = max history)", value=None, key="bt_start_date")
+        with _bt_c3:
+            _bt_end_date = st.date_input("End date (blank = latest available)", value=None, key="bt_end_date")
+
+        _bt_c4, _bt_c5, _bt_c6 = st.columns(3)
+        with _bt_c4:
+            _bt_capital = st.number_input("Starting capital ($)", min_value=1.0, value=1_000_000.0,
+                                          step=10_000.0, key="bt_capital")
+        with _bt_c5:
+            _bt_fee = st.number_input("Transaction fee ($)", min_value=0.0, value=0.0, step=1.0, key="bt_fee")
+        with _bt_c6:
+            _bt_slippage = st.number_input("Slippage (%)", min_value=0.0, value=0.0, step=0.1, key="bt_slippage")
+
+        _bt_c7, _bt_c8, _bt_c9 = st.columns(3)
+        with _bt_c7:
+            _bt_fractional = st.checkbox("Allow fractional shares", value=True, key="bt_fractional")
+        with _bt_c8:
+            _bt_eob_label = st.selectbox(
+                "End of backtest",
+                options=["Mark to market (keep position)", "Sell entire position on final date"],
+                key="bt_eob",
+            )
+        with _bt_c9:
+            _bt_exec_basis_label = st.selectbox(
+                "Recurring-buy execution basis", options=["Adjusted Close", "Adjusted Open"], key="bt_exec_basis"
+            )
+
+        _bt_c10, _bt_c11 = st.columns(2)
+        with _bt_c10:
+            _bt_overflow_label = st.selectbox(
+                "If a buy exceeds available cash",
+                options=["Reduce to max affordable", "Skip transaction", "Stop backtest with error"],
+                key="bt_overflow",
+            )
+        with _bt_c11:
+            _bt_prevent_same_day = st.checkbox("Prevent same-day sell-then-buy", value=False, key="bt_prevent_same_day")
+
+        st.markdown(f"**First-Buy Trigger — {_bt_fb_kind_label}**")
+        _bt_fb_pct_below = _bt_fb_lookback = _bt_fb_reference = _bt_fb_direction = None
+        _bt_fb_pct = _bt_fb_ma_type = _bt_fb_ma_period = None
+        _bt_fb_rsi_period = _bt_fb_rsi_threshold = None
+        if _bt_fb_kind == "pct_below_historical_high":
+            _bt_fb_pct_below = st.number_input("X% below historical high", min_value=0.1, max_value=99.0,
+                                               value=8.0, step=0.5, key="bt_fb_pct_below")
+        elif _bt_fb_kind == "rolling_high_low_pct":
+            _bt_fbr1, _bt_fbr2, _bt_fbr3, _bt_fbr4 = st.columns(4)
+            with _bt_fbr1:
+                _bt_fb_reference = st.selectbox("Reference", options=["rolling_high", "rolling_low"], key="bt_fb_reference")
+            with _bt_fbr2:
+                _bt_fb_direction = st.selectbox("Direction", options=["below", "above"], key="bt_fb_direction_roll")
+            with _bt_fbr3:
+                _bt_fb_lookback = st.number_input("Lookback (trading days)", min_value=2, max_value=1000,
+                                                  value=20, key="bt_fb_lookback")
+            with _bt_fbr4:
+                _bt_fb_pct = st.number_input("X% distance", min_value=0.01, value=10.0, step=0.5, key="bt_fb_pct_roll")
+        elif _bt_fb_kind == "ma_state_pct":
+            _bt_fbm1, _bt_fbm2, _bt_fbm3, _bt_fbm4 = st.columns(4)
+            with _bt_fbm1:
+                _bt_fb_ma_type = st.selectbox("MA type", options=["SMA", "EMA"], key="bt_fb_ma_type")
+            with _bt_fbm2:
+                _bt_fb_ma_period = st.number_input("MA period", min_value=2, max_value=500, value=50, key="bt_fb_ma_period")
+            with _bt_fbm3:
+                _bt_fb_direction = st.selectbox("Direction", options=["below", "above"], key="bt_fb_direction_ma")
+            with _bt_fbm4:
+                _bt_fb_pct = st.number_input("X% distance", min_value=0.01, value=5.0, step=0.5, key="bt_fb_pct_ma")
+        else:  # rsi_state
+            _bt_fbi1, _bt_fbi2 = st.columns(2)
+            with _bt_fbi1:
+                _bt_fb_rsi_period = st.number_input("RSI period", min_value=2, max_value=100, value=14, key="bt_fb_rsi_period")
+            with _bt_fbi2:
+                _bt_fb_rsi_threshold = st.number_input("Buy when RSI below", min_value=1.0, max_value=99.0,
+                                                        value=30.0, step=1.0, key="bt_fb_rsi_threshold")
+
+        st.markdown("**Recurring-Buy Trigger**")
+        _bt_c14, _bt_c15 = st.columns(2)
+        with _bt_c14:
+            st.selectbox("Trigger type", options=["Periodic — every X trading days"], key="bt_rb_type")
+        with _bt_c15:
+            _bt_rb_interval = st.number_input("Interval (trading days)", min_value=1, max_value=500,
+                                              value=20, key="bt_rb_interval")
+
+        st.markdown(f"**Sell Trigger — {_bt_sell_kind_label}**")
+        _bt_sell_pct = _bt_sell_hold_days = None
+        _bt_sell_s_lookback = _bt_sell_s_reference = _bt_sell_s_direction = None
+        _bt_sell_s_ma_type = _bt_sell_s_ma_period = None
+        _bt_sell_s_rsi_period = _bt_sell_s_rsi_threshold = None
+        if _bt_sell_kind in ("profit_target_pct", "stop_loss_pct", "trailing_stop_pct"):
+            _bt_sell_pct = st.number_input("X%", min_value=0.01, value=20.0, step=0.5, key="bt_sell_pct",
+                                           help="Trailing stop must be under 100% (100%+ implies selling at $0). "
+                                                "Profit target and stop loss have no upper limit.")
+        elif _bt_sell_kind == "hold_days":
+            _bt_sell_hold_days = st.number_input("Hold for X trading days", min_value=1, max_value=2000,
+                                                 value=20, key="bt_sell_hold_days")
+        elif _bt_sell_kind == "rolling_high_low_pct":
+            _bt_sr1, _bt_sr2, _bt_sr3, _bt_sr4 = st.columns(4)
+            with _bt_sr1:
+                _bt_sell_s_reference = st.selectbox("Reference", options=["rolling_high", "rolling_low"], key="bt_sell_reference")
+            with _bt_sr2:
+                _bt_sell_s_direction = st.selectbox("Direction", options=["below", "above"], key="bt_sell_direction_roll")
+            with _bt_sr3:
+                _bt_sell_s_lookback = st.number_input("Lookback (trading days)", min_value=2, max_value=1000,
+                                                      value=20, key="bt_sell_lookback")
+            with _bt_sr4:
+                _bt_sell_pct = st.number_input("X% distance", min_value=0.01, value=10.0, step=0.5, key="bt_sell_pct_roll")
+        elif _bt_sell_kind == "ma_state_pct":
+            _bt_sm1, _bt_sm2, _bt_sm3, _bt_sm4 = st.columns(4)
+            with _bt_sm1:
+                _bt_sell_s_ma_type = st.selectbox("MA type", options=["SMA", "EMA"], key="bt_sell_ma_type")
+            with _bt_sm2:
+                _bt_sell_s_ma_period = st.number_input("MA period", min_value=2, max_value=500, value=50, key="bt_sell_ma_period")
+            with _bt_sm3:
+                _bt_sell_s_direction = st.selectbox("Direction", options=["below", "above"], key="bt_sell_direction_ma")
+            with _bt_sm4:
+                _bt_sell_pct = st.number_input("X% distance", min_value=0.01, value=5.0, step=0.5, key="bt_sell_pct_ma")
+        else:  # rsi_state
+            _bt_si1, _bt_si2 = st.columns(2)
+            with _bt_si1:
+                _bt_sell_s_rsi_period = st.number_input("RSI period", min_value=2, max_value=100, value=14, key="bt_sell_rsi_period")
+            with _bt_si2:
+                _bt_sell_s_rsi_threshold = st.number_input("Sell when RSI above", min_value=1.0, max_value=99.0,
+                                                            value=70.0, step=1.0, key="bt_sell_rsi_threshold")
+
+        st.markdown("**Buy Sizing Parameters**")
+        _bt_buy_amount = _bt_buy_shares = _bt_buy_pct = None
+        _bt_buy_custom_df = None
+        if _bt_buy_method == "fixed_amount":
+            _bt_buy_amount = st.number_input("Amount per buy ($)", min_value=0.01, value=50_000.0, key="bt_buy_amount")
+        elif _bt_buy_method == "fixed_shares":
+            _bt_buy_shares = st.number_input("Shares per buy", min_value=0.01, value=100.0, key="bt_buy_shares")
+        elif _bt_buy_method in ("pct_starting_capital", "pct_available_cash", "pct_total_value_at_first_buy"):
+            _bt_buy_pct = st.number_input("Percent (%)", min_value=0.01, max_value=100.0, value=5.0, key="bt_buy_pct")
+        elif _bt_buy_method == "custom_table":
+            _bt_buy_default_tbl = pd.DataFrame({
+                "seq": list(range(1, int(_bt_max_buys) + 1)),
+                "unit": ["amount"] * int(_bt_max_buys),
+                "value": [50_000.0] * int(_bt_max_buys),
+            })
+            _bt_buy_custom_df = st.data_editor(
+                _bt_buy_default_tbl, hide_index=True, key="bt_buy_custom_tbl",
+                column_config={"unit": st.column_config.SelectboxColumn(options=["amount", "shares", "pct_cash"])},
+            )
+        else:
+            st.caption("No extra parameter needed for this method.")
+
+        st.markdown("**Sell Sizing Parameters**")
+        _bt_sell_amount = _bt_sell_shares = _bt_sell_pct_param = None
+        _bt_sell_custom_df = None
+        if _bt_sell_method == "fixed_amount":
+            _bt_sell_amount = st.number_input("Amount per sell ($)", min_value=0.01, value=50_000.0, key="bt_sell_amount")
+        elif _bt_sell_method == "fixed_shares":
+            _bt_sell_shares = st.number_input("Shares per sell", min_value=0.01, value=100.0, key="bt_sell_shares")
+        elif _bt_sell_method == "pct_shares":
+            _bt_sell_pct_param = st.number_input("Percent of current shares (%)", min_value=0.01, max_value=100.0,
+                                                 value=100.0, key="bt_sell_pct_param")
+        elif _bt_sell_method == "pct_shares_at_first_sell":
+            _bt_sell_pct_param = st.number_input(
+                "Percent of position at first sell (%)", min_value=0.01, max_value=100.0,
+                value=50.0, key="bt_sell_pct_first_sell",
+                help="E.g. 50% sells the original position in exactly 2 equal-sized sells, "
+                     "regardless of how the price moves in between.",
+            )
+        elif _bt_sell_method == "custom_table":
+            _bt_sell_default_tbl = pd.DataFrame({
+                "seq": list(range(1, int(_bt_max_sells) + 1)),
+                "unit": ["pct_shares"] * int(_bt_max_sells),
+                "value": [100.0] * int(_bt_max_sells),
+            })
+            _bt_sell_custom_df = st.data_editor(
+                _bt_sell_default_tbl, hide_index=True, key="bt_sell_custom_tbl",
+                column_config={"unit": st.column_config.SelectboxColumn(options=["amount", "shares", "pct_shares"])},
+            )
+        else:
+            st.caption("No extra parameter needed for this method.")
+
+        _bt_run = st.form_submit_button("Run Backtest", type="primary")
+
+    if _bt_run:
+        _bt_ticker = _bt_ticker or "SOXL"
+        _bt_buy_sizing = bt.BuySizingConfig(
+            method=_bt_buy_method, amount=_bt_buy_amount, shares=_bt_buy_shares, pct=_bt_buy_pct,
+            custom_table=_bt_buy_custom_df.to_dict("records") if _bt_buy_custom_df is not None else None,
+        )
+        _bt_sell_sizing = bt.SellSizingConfig(
+            method=_bt_sell_method, amount=_bt_sell_amount, shares=_bt_sell_shares, pct=_bt_sell_pct_param,
+            custom_table=_bt_sell_custom_df.to_dict("records") if _bt_sell_custom_df is not None else None,
+        )
+        _bt_params = bt.BacktestParams(
+            ticker=_bt_ticker,
+            start_date=str(_bt_start_date) if _bt_start_date else None,
+            end_date=str(_bt_end_date) if _bt_end_date else None,
+            starting_capital=_bt_capital, max_buys=int(_bt_max_buys), max_sells=int(_bt_max_sells),
+            allow_fractional_shares=_bt_fractional, transaction_fee=_bt_fee, slippage_pct=_bt_slippage,
+            end_of_backtest_action=("sell_final_date" if _bt_eob_label.startswith("Sell") else "mark_to_market"),
+            execution_price_basis=("adjusted_open" if _bt_exec_basis_label == "Adjusted Open" else "adjusted_close"),
+            cash_overflow_policy={
+                "Reduce to max affordable": "reduce_to_max_affordable",
+                "Skip transaction": "skip",
+                "Stop backtest with error": "stop_with_error",
+            }[_bt_overflow_label],
+            prevent_same_day_buy_sell=_bt_prevent_same_day,
+            first_buy=bt.FirstBuyTriggerConfig(
+                kind=_bt_fb_kind,
+                pct_below=_bt_fb_pct_below if _bt_fb_pct_below is not None else 8.0,
+                lookback_days=int(_bt_fb_lookback) if _bt_fb_lookback is not None else None,
+                reference=_bt_fb_reference, direction=_bt_fb_direction, pct=_bt_fb_pct,
+                ma_type=_bt_fb_ma_type, ma_period=int(_bt_fb_ma_period) if _bt_fb_ma_period is not None else None,
+                rsi_period=int(_bt_fb_rsi_period) if _bt_fb_rsi_period is not None else 14,
+                rsi_threshold=_bt_fb_rsi_threshold if _bt_fb_rsi_threshold is not None else 30.0,
+            ),
+            recurring_buy=bt.RecurringBuyTriggerConfig(interval_trading_days=int(_bt_rb_interval)),
+            sell=bt.SellTriggerConfig(
+                kind=_bt_sell_kind,
+                pct=_bt_sell_pct if _bt_sell_pct is not None else 20.0,
+                hold_days=int(_bt_sell_hold_days) if _bt_sell_hold_days is not None else None,
+                lookback_days=int(_bt_sell_s_lookback) if _bt_sell_s_lookback is not None else None,
+                reference=_bt_sell_s_reference, direction=_bt_sell_s_direction,
+                ma_type=_bt_sell_s_ma_type,
+                ma_period=int(_bt_sell_s_ma_period) if _bt_sell_s_ma_period is not None else None,
+                rsi_period=int(_bt_sell_s_rsi_period) if _bt_sell_s_rsi_period is not None else 14,
+                rsi_threshold=_bt_sell_s_rsi_threshold if _bt_sell_s_rsi_threshold is not None else 70.0,
+            ),
+            buy_sizing=_bt_buy_sizing, sell_sizing=_bt_sell_sizing,
+        )
+        with st.spinner(f"Backtesting {_bt_ticker}…"):
+            try:
+                _bt_result = bt.run_backtest(_bt_params)
+            except ValueError as e:
+                st.error(str(e))
+                _bt_result = None
+
+        if _bt_result is not None:
+            if _bt_result.status == "error":
+                st.error(f"Backtest stopped: {_bt_result.error_message}")
+            # Fold buy_and_hold into summary before persisting/caching --
+            # backtest_runs has no separate column for it, and this keeps
+            # the live-run and loaded-run result shapes identical (see
+            # _bt_render_result's docstring).
+            _bt_summary = {**_bt_result.summary, "buy_and_hold": _bt_result.buy_and_hold}
+            _bt_run_id = uuid.uuid4().hex
+            storage.save_backtest_run(
+                # _bt_params.start_date/end_date, not the raw widget values:
+                # run_backtest() resolves a blank date to the actual earliest/
+                # latest available price-history date in place on _bt_params.
+                run_id=_bt_run_id, ticker=_bt_ticker,
+                start_date=_bt_params.start_date, end_date=_bt_params.end_date,
+                params=bt.params_to_dict(_bt_params), summary=_bt_summary,
+                warnings=_bt_result.warnings, status=_bt_result.status,
+                error_message=_bt_result.error_message,
+                transactions=_bt_result.transactions.to_dict("records"),
+                daily_history=_bt_result.daily_history.to_dict("records"),
+            )
+            st.session_state["bt_result"] = {
+                "run_id": _bt_run_id, "ticker": _bt_ticker,
+                "summary": _bt_summary,
+                "warnings": _bt_result.warnings,
+                "transactions": _bt_result.transactions, "daily_history": _bt_result.daily_history,
+            }
+
+    if "bt_result" in st.session_state:
+        _bt_render_result(st.session_state["bt_result"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB: Column Reference

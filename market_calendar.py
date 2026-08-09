@@ -106,3 +106,17 @@ def nyse_close_passed_today() -> bool:
     Used to decide whether to set is_finalized=True for today's tech data.
     """
     return datetime.now(_ET).hour >= 16
+
+
+def next_trading_day_on_or_after(d: str | date) -> str | None:
+    """
+    Return the first NYSE trading day on or after `d` as an ISO string.
+    Used by the backtester to roll a scheduled date forward when it falls on
+    a weekend/holiday.  A 14-calendar-day lookahead window is generous for
+    any real NYSE gap (longest is ~9 days around Christmas/New Year); None
+    signals a caller bug or a date far outside the calendar's known range,
+    not a normal weekend/holiday case.
+    """
+    start = pd.Timestamp(str(d)).date()
+    candidates = get_trading_days(start, start + timedelta(days=14))
+    return candidates[0] if candidates else None

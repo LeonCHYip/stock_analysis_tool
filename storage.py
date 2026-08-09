@@ -13,6 +13,7 @@ Public API mirrors db.py so app.py can switch with minimal changes.
 
 from __future__ import annotations
 import json
+import math
 import time
 import threading
 from pathlib import Path
@@ -448,6 +449,76 @@ CREATE TABLE IF NOT EXISTS swing_price_history_meta (
 # swing_analysis.fetch_and_cache_swing_history actually needs: reuse freely
 # within a day, refetch (and fully replace) once a new day begins.
 
+_DDL_BACKTEST_RUNS = """
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    run_id        TEXT PRIMARY KEY,
+    ticker        TEXT NOT NULL,
+    created_at    TIMESTAMP NOT NULL,
+    start_date    TEXT NOT NULL,
+    end_date      TEXT NOT NULL,
+    params_json   TEXT NOT NULL,
+    summary_json  TEXT NOT NULL,
+    warnings_json TEXT,
+    status        TEXT NOT NULL,
+    error_message TEXT
+);
+"""
+# params/summary are blobbed as JSON (matching fundamentals.raw_info_json)
+# because both are always read-and-displayed-whole, never filtered by
+# sub-field in SQL -- a blob avoids ~50 nullable summary columns.
+
+_DDL_BACKTEST_TRANSACTIONS = """
+CREATE TABLE IF NOT EXISTS backtest_transactions (
+    run_id                      TEXT    NOT NULL,
+    trade_num                   INTEGER NOT NULL,
+    date                        DATE    NOT NULL,
+    ticker                      TEXT    NOT NULL,
+    side                        TEXT    NOT NULL,
+    trigger_type                TEXT    NOT NULL,
+    trigger_description         TEXT,
+    execution_price             DOUBLE,
+    quantity                    DOUBLE,
+    transaction_amount          DOUBLE,
+    transaction_fee             DOUBLE,
+    realized_pnl                DOUBLE,
+    realized_return_pct         DOUBLE,
+    shares_after                DOUBLE,
+    avg_purchase_price_after    DOUBLE,
+    stock_value_after           DOUBLE,
+    cash_after                  DOUBLE,
+    total_value_after           DOUBLE,
+    portfolio_return_pct_after  DOUBLE,
+    days_since_prev_trade       INTEGER,
+    days_since_first_buy        INTEGER,
+    PRIMARY KEY (run_id, trade_num)
+);
+"""
+# transactions/daily_history stay normalized (unlike backtest_runs' blobs)
+# because the UI needs to sort/filter/CSV-export them as tables.
+
+_DDL_BACKTEST_DAILY_HISTORY = """
+CREATE TABLE IF NOT EXISTS backtest_daily_history (
+    run_id                  TEXT   NOT NULL,
+    date                    DATE   NOT NULL,
+    adj_close               DOUBLE,
+    cash                    DOUBLE,
+    shares                  DOUBLE,
+    avg_purchase_price      DOUBLE,
+    stock_value             DOUBLE,
+    total_value             DOUBLE,
+    daily_return_pct        DOUBLE,
+    cumulative_return_pct   DOUBLE,
+    drawdown_pct            DOUBLE,
+    historical_high         DOUBLE,
+    rolling_ref_high_low    DOUBLE,
+    ma_ref                  DOUBLE,
+    buy_signal               BOOLEAN,
+    sell_signal               BOOLEAN,
+    PRIMARY KEY (run_id, date)
+);
+"""
+# ma_ref is reserved for later trigger types (MA-based); always NULL today.
+
 _DDL_TRIGGER_CACHE = """
 CREATE TABLE IF NOT EXISTS trigger_cache (
     cache_key        TEXT    NOT NULL,
@@ -530,6 +601,9 @@ def init_db() -> None:
     con.execute(_DDL_PRICE_HISTORY)
     con.execute(_DDL_SWING_PRICE_HISTORY)
     con.execute(_DDL_SWING_PRICE_HISTORY_META)
+    con.execute(_DDL_BACKTEST_RUNS)
+    con.execute(_DDL_BACKTEST_TRANSACTIONS)
+    con.execute(_DDL_BACKTEST_DAILY_HISTORY)
     con.execute(_DDL_TRIGGER_CACHE)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
@@ -1855,6 +1929,154 @@ def save_swing_price_history(ticker: str, rows: list[tuple], fetched_on: str) ->
         "INSERT OR REPLACE INTO swing_price_history_meta (ticker, fetched_on) VALUES (?, ?)",
         [ticker, fetched_on],
     )
+
+
+# ── Backtest runs ────────────────────────────────────────────────────────────
+
+_BT_TXN_COLS = [
+    "trade_num", "date", "ticker", "side", "trigger_type", "trigger_description",
+    "execution_price", "quantity", "transaction_amount", "transaction_fee",
+    "realized_pnl", "realized_return_pct", "shares_after", "avg_purchase_price_after",
+    "stock_value_after", "cash_after", "total_value_after", "portfolio_return_pct_after",
+    "days_since_prev_trade", "days_since_first_buy",
+]
+_BT_DAILY_COLS = [
+    "date", "adj_close", "cash", "shares", "avg_purchase_price", "stock_value",
+    "total_value", "daily_return_pct", "cumulative_return_pct", "drawdown_pct",
+    "historical_high", "rolling_ref_high_low", "ma_ref", "buy_signal", "sell_signal",
+]
+
+
+def _bt_clean(v):
+    """NaN -> None. transactions/daily_history commonly arrive as
+    DataFrame.to_dict('records') output, where pandas silently upcasts a
+    column to float64 and turns any None into NaN the moment ONE other row
+    in that column holds a real number (e.g. days_since_prev_trade is None
+    only for the very first trade). A bare NaN blows up DuckDB's INTEGER
+    columns (ConversionException) and would otherwise get silently stored
+    in DOUBLE columns where the in-memory value was really None/NULL."""
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
+
+
+def save_backtest_run(run_id: str, ticker: str, start_date: str, end_date: str,
+                       params: dict, summary: dict, warnings: list[str],
+                       status: str, error_message: str | None,
+                       transactions: list[dict], daily_history: list[dict]) -> None:
+    """Persist one completed (or errored) backtest run: header + full
+    transaction log + full daily portfolio history.
+
+    Full delete-then-insert for the two child tables under one `_conn()`
+    call (one lock acquisition), matching save_swing_price_history's
+    pattern -- defensive against retries; a fresh run_id normally means no
+    prior rows exist.
+    """
+    con = _conn()
+    con.execute(
+        "INSERT OR REPLACE INTO backtest_runs "
+        "(run_id, ticker, created_at, start_date, end_date, params_json, "
+        " summary_json, warnings_json, status, error_message) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [run_id, ticker, datetime.now(CST), start_date, end_date,
+         json.dumps(params), json.dumps(summary), json.dumps(warnings),
+         status, error_message],
+    )
+
+    con.execute("DELETE FROM backtest_transactions WHERE run_id = ?", [run_id])
+    if transactions:
+        col_list = ", ".join(_BT_TXN_COLS)
+        placeholders = ", ".join(["?"] * (len(_BT_TXN_COLS) + 1))
+        con.executemany(
+            f"INSERT INTO backtest_transactions (run_id, {col_list}) VALUES ({placeholders})",
+            [[run_id] + [_bt_clean(row.get(c)) for c in _BT_TXN_COLS] for row in transactions],
+        )
+
+    con.execute("DELETE FROM backtest_daily_history WHERE run_id = ?", [run_id])
+    if daily_history:
+        col_list = ", ".join(_BT_DAILY_COLS)
+        placeholders = ", ".join(["?"] * (len(_BT_DAILY_COLS) + 1))
+        con.executemany(
+            f"INSERT INTO backtest_daily_history (run_id, {col_list}) VALUES ({placeholders})",
+            [[run_id] + [_bt_clean(row.get(c)) for c in _BT_DAILY_COLS] for row in daily_history],
+        )
+
+
+def get_backtest_runs(ticker: str | None = None, limit: int = 100) -> list[dict]:
+    """Return backtest_runs header rows (params/summary NOT parsed), newest first."""
+    con = _conn()
+    if ticker:
+        rows = con.execute(
+            "SELECT run_id, ticker, created_at, start_date, end_date, status "
+            "FROM backtest_runs WHERE ticker = ? ORDER BY created_at DESC LIMIT ?",
+            [ticker.upper(), limit],
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT run_id, ticker, created_at, start_date, end_date, status "
+            "FROM backtest_runs ORDER BY created_at DESC LIMIT ?",
+            [limit],
+        ).fetchall()
+    cols = ["run_id", "ticker", "created_at", "start_date", "end_date", "status"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_backtest_run(run_id: str) -> dict | None:
+    """Return one backtest_runs header row with params_json/summary_json/
+    warnings_json parsed into Python objects, or None if run_id not found."""
+    con = _conn()
+    row = con.execute(
+        "SELECT run_id, ticker, created_at, start_date, end_date, params_json, "
+        "summary_json, warnings_json, status, error_message "
+        "FROM backtest_runs WHERE run_id = ?",
+        [run_id],
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "run_id": row[0], "ticker": row[1], "created_at": row[2],
+        "start_date": row[3], "end_date": row[4],
+        "params": json.loads(row[5]), "summary": json.loads(row[6]),
+        "warnings": json.loads(row[7]) if row[7] else [],
+        "status": row[8], "error_message": row[9],
+    }
+
+
+def get_backtest_transactions(run_id: str) -> list[dict]:
+    """Return all transaction rows for `run_id`, ordered by trade_num."""
+    con = _conn()
+    rows = con.execute(
+        f"SELECT {', '.join(_BT_TXN_COLS)} FROM backtest_transactions "
+        "WHERE run_id = ? ORDER BY trade_num",
+        [run_id],
+    ).fetchall()
+    return [dict(zip(_BT_TXN_COLS, r)) for r in rows]
+
+
+def get_backtest_daily_history(run_id: str) -> list[dict]:
+    """Return all daily portfolio rows for `run_id`, ordered by date."""
+    con = _conn()
+    rows = con.execute(
+        f"SELECT {', '.join(_BT_DAILY_COLS)} FROM backtest_daily_history "
+        "WHERE run_id = ? ORDER BY date",
+        [run_id],
+    ).fetchall()
+    return [dict(zip(_BT_DAILY_COLS, r)) for r in rows]
+
+
+def get_backtest_run_tickers() -> list[str]:
+    """All distinct ticker values in backtest_runs, alphabetical."""
+    con = _conn()
+    rows = con.execute("SELECT DISTINCT ticker FROM backtest_runs ORDER BY ticker").fetchall()
+    return [r[0] for r in rows]
+
+
+def delete_backtest_run(run_id: str) -> None:
+    """Delete one run's header + transactions + daily history."""
+    con = _conn()
+    con.execute("DELETE FROM backtest_transactions WHERE run_id = ?", [run_id])
+    con.execute("DELETE FROM backtest_daily_history WHERE run_id = ?", [run_id])
+    con.execute("DELETE FROM backtest_runs WHERE run_id = ?", [run_id])
 
 
 def _pct(new_val, old_val) -> float | None:
