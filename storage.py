@@ -519,6 +519,20 @@ CREATE TABLE IF NOT EXISTS backtest_daily_history (
 """
 # ma_ref is reserved for later trigger types (MA-based); always NULL today.
 
+_DDL_INDEX_DASHBOARD = """
+CREATE TABLE IF NOT EXISTS index_dashboard (
+    ticker      TEXT PRIMARY KEY,
+    close       DOUBLE,
+    change_pct  DOUBLE,
+    rsi_14      DOUBLE,
+    updated_at  TIMESTAMP NOT NULL
+);
+"""
+# One row per dashboard ticker (SOXL/DRAM/QQQ/VOO), upserted on every refresh.
+# rsi_14 is NULL for tickers the dashboard doesn't compute RSI for (only SOXL
+# today). Refreshed by a background thread spawned from _launch_scan() on
+# every market scan (selected tickers or all tickers) -- see app.py.
+
 _DDL_TRIGGER_CACHE = """
 CREATE TABLE IF NOT EXISTS trigger_cache (
     cache_key        TEXT    NOT NULL,
@@ -604,6 +618,7 @@ def init_db() -> None:
     con.execute(_DDL_BACKTEST_RUNS)
     con.execute(_DDL_BACKTEST_TRANSACTIONS)
     con.execute(_DDL_BACKTEST_DAILY_HISTORY)
+    con.execute(_DDL_INDEX_DASHBOARD)
     con.execute(_DDL_TRIGGER_CACHE)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
@@ -2077,6 +2092,31 @@ def delete_backtest_run(run_id: str) -> None:
     con.execute("DELETE FROM backtest_transactions WHERE run_id = ?", [run_id])
     con.execute("DELETE FROM backtest_daily_history WHERE run_id = ?", [run_id])
     con.execute("DELETE FROM backtest_runs WHERE run_id = ?", [run_id])
+
+
+# ── Index dashboard ──────────────────────────────────────────────────────────
+
+def save_dashboard_snapshot(rows: list[dict]) -> None:
+    """Upsert index_dashboard rows. Each dict: ticker, close, change_pct,
+    rsi_14 (None allowed), updated_at (CST datetime)."""
+    if not rows:
+        return
+    con = _conn()
+    con.executemany(
+        "INSERT OR REPLACE INTO index_dashboard (ticker, close, change_pct, rsi_14, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(r["ticker"], r.get("close"), r.get("change_pct"), r.get("rsi_14"), r["updated_at"]) for r in rows],
+    )
+
+
+def get_dashboard_snapshot() -> dict[str, dict]:
+    """Return {ticker: {close, change_pct, rsi_14, updated_at}} for all
+    persisted dashboard tickers. Empty dict if never fetched."""
+    con = _conn()
+    rows = con.execute(
+        "SELECT ticker, close, change_pct, rsi_14, updated_at FROM index_dashboard"
+    ).fetchall()
+    return {r[0]: {"close": r[1], "change_pct": r[2], "rsi_14": r[3], "updated_at": r[4]} for r in rows}
 
 
 def _pct(new_val, old_val) -> float | None:

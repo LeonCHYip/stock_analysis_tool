@@ -124,6 +124,27 @@ def fetch_and_cache_swing_history(ticker: str, years: int = MAX_HISTORY_YEARS_DE
     if df.empty:
         raise ValueError(f"No usable price rows for {ticker!r} after cleaning")
 
+    # Sanity-check the download BEFORE trusting it enough to cache under
+    # today's date -- once cached as "fetched today", nothing re-validates
+    # it and every call for the rest of the ET day reuses it as-is (see the
+    # freshness check above). A silently bad/truncated download (observed
+    # once in practice: a normally-liquid ticker came back with only 2 rows
+    # months stale) would otherwise get "locked in" until the next calendar
+    # day. Better to raise here -- the caller's caching logic then simply
+    # doesn't advance fetched_on, so the very next call retries fresh
+    # instead of being stuck on garbage for the rest of the day.
+    if len(df) < 20:
+        raise ValueError(
+            f"Downloaded data for {ticker!r} has only {len(df)} usable row(s) -- "
+            "too few to trust; not caching. Possibly a transient yfinance issue."
+        )
+    days_stale = (pd.Timestamp.now() - df.index.max()).days
+    if days_stale > 10:
+        raise ValueError(
+            f"Downloaded data for {ticker!r} is stale -- most recent usable row is "
+            f"{df.index.max().date()}, {days_stale} days ago. Not caching."
+        )
+
     cutoff = df.index.max() - pd.DateOffset(years=years)
     df = df[df.index >= cutoff]
 

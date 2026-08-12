@@ -135,8 +135,9 @@ from trigger_engine import (
     get_trigger_date_field_values,
 )
 from column_catalog import render_column_reference_tab
-from swing_analysis import analyze_swings
+from swing_analysis import analyze_swings, fetch_and_cache_swing_history
 import backtester as bt
+import ta
 from storage import (
     init_db, save_results, update_field, save_comment_for_ticker, save_status_for_ticker,
     save_source_for_ticker, save_user_field_for_ticker,
@@ -3513,9 +3514,67 @@ def render_value_table(tickers: list[str], detail_map: dict,
 # Page layout
 # ─────────────────────────────────────────────────────────────────────────────
 
+DASHBOARD_TICKERS = ["SOXL", "DRAM", "QQQ", "VOO"]
+DASHBOARD_SOXL_RSI_BUY_THRESHOLD  = 35.0
+DASHBOARD_SOXL_RSI_SELL_THRESHOLD = 70.2
+
 st.set_page_config(page_title="Stock Analysis Tool", page_icon="📈", layout="wide")
 st.title("📈 Stock Analysis Tool")
 st.caption("Evaluates stocks across 10 technical & fundamental indicators · Times in CST")
+
+# ── Index dashboard ───────────────────────────────────────────────────────────
+# Refreshed by _refresh_index_dashboard() (background thread spawned from
+# _launch_scan on every market scan). Wrapped in a polling fragment -- this
+# code sits near the top of the script, well BEFORE the "Run" button's
+# click-handler further down, so on the very script run that starts a scan
+# it would otherwise render once with the OLD data (the background thread
+# hasn't finished yet) and then never update again, since nothing else
+# triggers a further rerun. Polling independently (same pattern as
+# _scan_progress_autorefresh) picks up the new DB values automatically a
+# few seconds later, without a full-page rerun.
+@st.fragment(run_every=3)
+def _render_index_dashboard():
+    _dash_snap = storage.get_dashboard_snapshot()
+    if _dash_snap:
+        # Scoped to this dashboard's own keyed container (st-key-index_dashboard)
+        # so it never touches st.metric elsewhere on the page (e.g. the
+        # backtester tab's headline metrics also use st.metric/labels).
+        st.markdown(
+            "<style>"
+            ".st-key-index_dashboard [data-testid='stMetricDelta'] { font-size: 1.8rem; } "
+            ".st-key-index_dashboard [data-testid='stMetricDelta'] svg { width: 1.4rem; height: 1.4rem; } "
+            ".st-key-index_dashboard [data-testid='stMetricLabel'] { font-size: 1.1rem; }"
+            "</style>",
+            unsafe_allow_html=True,
+        )
+        with st.container(key="index_dashboard"):
+            _dash_cols = st.columns(5)
+            _soxl = _dash_snap.get("SOXL", {})
+            with _dash_cols[0]:
+                _rsi = _soxl.get("rsi_14")
+                st.metric("SOXL RSI 14", f"{_rsi:.1f}" if _rsi is not None else "N/A")
+                if _rsi is not None:
+                    if _rsi <= DASHBOARD_SOXL_RSI_BUY_THRESHOLD:
+                        st.success(f"🟢 Buy (RSI ≤ {DASHBOARD_SOXL_RSI_BUY_THRESHOLD:.0f})")
+                    elif _rsi > DASHBOARD_SOXL_RSI_SELL_THRESHOLD:
+                        st.error(f"🔴 Sell (RSI > {DASHBOARD_SOXL_RSI_SELL_THRESHOLD:.1f})")
+            for _i, _tkr in enumerate(DASHBOARD_TICKERS, start=1):
+                with _dash_cols[_i]:
+                    _row = _dash_snap.get(_tkr, {})
+                    _close, _chg = _row.get("close"), _row.get("change_pct")
+                    st.metric(
+                        _tkr,
+                        value=f"${_close:.2f}" if _close is not None else "N/A",
+                        delta=f"{_chg:+.2f}%" if _chg is not None else None,
+                    )
+        _updates = [r["updated_at"] for r in _dash_snap.values() if r.get("updated_at")]
+        if _updates:
+            st.caption(f"Last updated: {min(_updates).strftime('%Y-%m-%d %H:%M:%S')} CST")
+    else:
+        st.caption("Index dashboard: run a market scan to populate SOXL / DRAM / QQQ / VOO metrics.")
+
+
+_render_index_dashboard()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -3621,12 +3680,68 @@ F6 P/B ≤ Peer Median
 
 # ── Handle Run buttons ────────────────────────────────────────────────────────
 
+# ── Index dashboard (shown below the page title; constants defined earlier,
+# near the top of the file, since the title/metrics render before this
+# point in the script) ───────────────────────────────────────────────────────
+
+
+def _refresh_index_dashboard() -> None:
+    """Fetch SOXL/DRAM/QQQ/VOO, compute RSI(14) for SOXL and 1-day change%
+    for all four, and persist to index_dashboard.
+
+    Runs in its own daemon thread spawned from _launch_scan() -- fully
+    isolated with try/except (per-ticker AND overall) so a fetch failure
+    here can never block or break the actual market scan. Independent of
+    whatever tickers the user chose to scan.
+    """
+    try:
+        now = datetime.now(CST)
+        rows = []
+        for ticker in DASHBOARD_TICKERS:
+            try:
+                data = fetch_and_cache_swing_history(ticker, years=1)
+                # Guard against a None/NaN close on the most recent cached day
+                # (a stale or partially-written row) -- an unguarded float()
+                # on that crashes THIS ticker's whole iteration before
+                # rows.append() runs, silently dropping price AND RSI both.
+                # dropna naturally falls back to the last genuinely valid
+                # close/prior-close instead of failing outright.
+                data = data.dropna(subset=["close"])
+                if data.empty or len(data) < 2:
+                    _slog(f"[dashboard] Skipped {ticker}: insufficient valid price history")
+                    continue
+                close = float(data["close"].iloc[-1])
+                prev_close = float(data["close"].iloc[-2])
+                change_pct = (close / prev_close - 1) * 100 if prev_close else None
+                rsi_14 = None
+                if ticker == "SOXL":
+                    rsi_val = ta.momentum.RSIIndicator(data["close"], window=14).rsi().iloc[-1]
+                    rsi_14 = float(rsi_val) if not pd.isna(rsi_val) else None
+                rows.append({"ticker": ticker, "close": close, "change_pct": change_pct,
+                             "rsi_14": rsi_14, "updated_at": now})
+            except Exception as e:
+                _slog(f"[dashboard] Failed to refresh {ticker}: {e}")
+        if rows:
+            storage.save_dashboard_snapshot(rows)
+            _slog(f"[dashboard] Refreshed {len(rows)}/{len(DASHBOARD_TICKERS)} tickers")
+    except Exception as e:
+        _slog(f"[dashboard] Refresh failed: {e}")
+
+
 def _launch_scan(ticker_list: list[str], label: str) -> None:
     """Start a scan thread for the given ticker list."""
     global _PROC_SCAN
     if not ticker_list:
         st.sidebar.error("No tickers to process. Enter tickers or check tickers.txt.")
         return
+
+    # Refresh the index dashboard at scan START (not completion) so it
+    # reflects current market conditions right away rather than waiting on
+    # a full "scan all tickers" run that can take many minutes. Independent
+    # daemon thread -- never blocks this function or the scan it launches.
+    threading.Thread(target=_refresh_index_dashboard, daemon=True,
+                     name="dashboard-refresh").start()
+
     daily_str   = str(daily_date_input)  if daily_date_input  else None
     weekly_str  = str(weekly_date_input) if weekly_date_input else None
     analysis_dt = _now_cst()
