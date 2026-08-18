@@ -1559,7 +1559,8 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
                         missing = []
                         if tech.get("error"):
                             missing.append(f"tech: {tech['error']}")
-                        for f_key, f_label in [("q_revenue","q_revenue"), ("q_eps","q_eps"),
+                        for f_key, f_label in [("market_cap","market_cap"),
+                                               ("q_revenue","q_revenue"), ("q_eps","q_eps"),
                                                ("a_revenue","a_revenue"), ("a_eps","a_eps"),
                                                ("q_rev_yoy","q_rev_yoy"), ("q_eps_yoy","q_eps_yoy"),
                                                ("a_rev_yoy","a_rev_yoy"), ("a_eps_yoy","a_eps_yoy"),
@@ -3569,7 +3570,7 @@ def _render_index_dashboard():
                     )
         _updates = [r["updated_at"] for r in _dash_snap.values() if r.get("updated_at")]
         if _updates:
-            st.caption(f"Last updated: {min(_updates).strftime('%Y-%m-%d %H:%M:%S')} CST")
+            st.caption(f"Last updated: {min(_updates).strftime('%d/%m/%Y %H:%M:%S')} CST")
     else:
         st.caption("Index dashboard: run a market scan to populate SOXL / DRAM / QQQ / VOO metrics.")
 
@@ -3584,8 +3585,8 @@ with st.sidebar:
     ticker_input = st.text_input("Tickers (comma-separated)", placeholder="AAPL, TSLA, MU")
 
     st.markdown("**Date Cutoffs** *(optional)*")
-    daily_date_input  = st.date_input("Latest Date for Daily",  value=None, key="daily_date")
-    weekly_date_input = st.date_input("Latest Date for Weekly", value=None, key="weekly_date")
+    daily_date_input  = st.date_input("Latest Date for Daily",  value=None, key="daily_date", format="DD/MM/YYYY")
+    weekly_date_input = st.date_input("Latest Date for Weekly", value=None, key="weekly_date", format="DD/MM/YYYY")
 
     fetch_peers_cb = st.checkbox(
         "Fetch peer valuations (F5 & F6)",
@@ -3699,7 +3700,7 @@ def _refresh_index_dashboard() -> None:
         rows = []
         for ticker in DASHBOARD_TICKERS:
             try:
-                data = fetch_and_cache_swing_history(ticker, years=1)
+                data = fetch_and_cache_swing_history(ticker, years=1, force_refresh=True)
                 # Guard against a None/NaN close on the most recent cached day
                 # (a stale or partially-written row) -- an unguarded float()
                 # on that crashes THIS ticker's whole iteration before
@@ -3928,8 +3929,10 @@ def render_scan_tab(tab_id: str) -> None:
     _f_sectors_pre   = st.session_state.get(tk["f_sector"], [])
     _mc_lo_pre       = st.session_state.get(tk["mc_lo"], 1.0)
     _mc_hi_pre       = st.session_state.get(tk["mc_hi"], None)
-    _cust_start_pre  = st.session_state.get(_tab_extra_ss(tab_id, "cust_start"), "").strip()
-    _cust_end_pre    = st.session_state.get(_tab_extra_ss(tab_id, "cust_end"), "").strip()
+    _cust_start_pre_raw = st.session_state.get(_tab_extra_ss(tab_id, "cust_start"), None)
+    _cust_end_pre_raw   = st.session_state.get(_tab_extra_ss(tab_id, "cust_end"), None)
+    _cust_start_pre  = _cust_start_pre_raw.isoformat() if _cust_start_pre_raw else ""
+    _cust_end_pre    = _cust_end_pre_raw.isoformat() if _cust_end_pre_raw else ""
     # Trigger config (pre-read before widget rendering)
     _trig_load_defaults(tab_id)
     _trig_start_conds_pre = st.session_state.get(f"{tab_id}_trig_start_conds", [])
@@ -3953,14 +3956,19 @@ def render_scan_tab(tab_id: str) -> None:
         filt_rows = [r for r in filt_rows
                      if r.get("analysis_datetime") == _seen.get(r["ticker"])]
 
+    # Rows with unknown (None) market cap are NEVER excluded by these filters --
+    # min/max cap should only screen out stocks confirmed to be outside the
+    # range, not stocks we simply failed to fetch a market cap for (e.g. a
+    # transient fundamentals-fetch gap). Excluding unknowns here made freshly
+    # scanned tickers silently vanish from the table with no visible cause.
     if _mc_lo_pre is not None:
         filt_rows = [r for r in filt_rows
-                     if _mkt_cap_b(r.get("market_cap")) is not None
-                     and _mkt_cap_b(r.get("market_cap")) >= _mc_lo_pre]
+                     if _mkt_cap_b(r.get("market_cap")) is None
+                     or _mkt_cap_b(r.get("market_cap")) >= _mc_lo_pre]
     if _mc_hi_pre is not None:
         filt_rows = [r for r in filt_rows
-                     if _mkt_cap_b(r.get("market_cap")) is not None
-                     and _mkt_cap_b(r.get("market_cap")) <= _mc_hi_pre]
+                     if _mkt_cap_b(r.get("market_cap")) is None
+                     or _mkt_cap_b(r.get("market_cap")) <= _mc_hi_pre]
 
     # ── Fetch fund/tech data ──────────────────────────────────────────────────
     _tickers_pre   = list({r["ticker"] for r in filt_rows})
@@ -4014,17 +4022,17 @@ def render_scan_tab(tab_id: str) -> None:
                                 placeholder="no max", key=tk["mc_hi"],
                                 format="%.2f", step=1.0)
     with cp1:
-        _cust_start_val = st.text_input(
-            "Custom Period Start (YYYY-MM-DD)", value="",
-            placeholder="e.g. 2024-01-01",
+        _cust_start_val = st.date_input(
+            "Custom Period Start (blank = Jan 1 this year)", value=None,
+            format="DD/MM/YYYY",
             key=_tab_extra_ss(tab_id, "cust_start"),
-        ).strip()
+        )
     with cp2:
-        _cust_end_val = st.text_input(
-            "Custom Period End (YYYY-MM-DD)", value="",
-            placeholder="e.g. 2024-12-31",
+        _cust_end_val = st.date_input(
+            "Custom Period End (blank = today)", value=None,
+            format="DD/MM/YYYY",
             key=_tab_extra_ss(tab_id, "cust_end"),
-        ).strip()
+        )
 
     # ── Trigger conditions UI ─────────────────────────────────────────────────
     _render_trigger_ui(tab_id)
@@ -4067,9 +4075,7 @@ def render_scan_tab(tab_id: str) -> None:
 
     from datetime import date as _date, timedelta as _td
     _today_str = _date.today().isoformat()
-    _cust_s = _cust_start_pre or storage.get_nth_trading_day_back(_ph_tickers_all, 22) or (
-        _date.today() - _td(days=31)
-    ).isoformat()
+    _cust_s = _cust_start_pre or _date(_date.today().year, 1, 1).isoformat()
     _cust_e = _cust_end_pre or _today_str
     _cust_returns = storage.get_custom_period_returns(_ph_tickers_all, _cust_s, _cust_e) if _ph_tickers_all else {}
     for _t, _cr in _cust_returns.items():
@@ -4818,9 +4824,9 @@ with tab_swing:
                 value=5, step=1, key="sw_min_duration",
             )
         with _sw_c5:
-            _sw_start_date = st.date_input("Start date (optional)", value=None, key="sw_start_date")
+            _sw_start_date = st.date_input("Start date (optional)", value=None, key="sw_start_date", format="DD/MM/YYYY")
         with _sw_c6:
-            _sw_end_date = st.date_input("End date (optional)", value=None, key="sw_end_date")
+            _sw_end_date = st.date_input("End date (optional)", value=None, key="sw_end_date", format="DD/MM/YYYY")
 
         _sw_run = st.form_submit_button("Run Swing Analysis", type="primary")
 
@@ -5061,9 +5067,9 @@ with tab_backtest:
         with _bt_c1:
             _bt_ticker = st.text_input("Ticker", value="", placeholder="blank = SOXL", key="bt_ticker").strip().upper()
         with _bt_c2:
-            _bt_start_date = st.date_input("Start date (blank = max history)", value=None, key="bt_start_date")
+            _bt_start_date = st.date_input("Start date (blank = max history)", value=None, key="bt_start_date", format="DD/MM/YYYY")
         with _bt_c3:
-            _bt_end_date = st.date_input("End date (blank = latest available)", value=None, key="bt_end_date")
+            _bt_end_date = st.date_input("End date (blank = latest available)", value=None, key="bt_end_date", format="DD/MM/YYYY")
 
         _bt_c4, _bt_c5, _bt_c6 = st.columns(3)
         with _bt_c4:

@@ -79,7 +79,9 @@ def _rows_to_df(rows: list[tuple]) -> pd.DataFrame:
     return df
 
 
-def fetch_and_cache_swing_history(ticker: str, years: int = MAX_HISTORY_YEARS_DEFAULT) -> pd.DataFrame:
+def fetch_and_cache_swing_history(
+    ticker: str, years: int = MAX_HISTORY_YEARS_DEFAULT, force_refresh: bool = False
+) -> pd.DataFrame:
     """Return fully split/dividend-adjusted OHLCV for `ticker`, up to `years`
     of history, via a per-ticker DuckDB cache (storage.swing_price_history).
 
@@ -90,13 +92,19 @@ def fetch_and_cache_swing_history(ticker: str, years: int = MAX_HISTORY_YEARS_DE
     permanently stale and re-download on every call, defeating the cache.
     So: reused freely for repeated analysis within the same ET day: refetched
     (and fully replaced) once a new day begins.
+
+    `force_refresh=True` bypasses that same-day reuse and always re-downloads.
+    Needed by callers that want the true latest close regardless of when the
+    cache was last populated today -- e.g. a pre-market fetch would otherwise
+    "lock in" yesterday's close as today's cache for the rest of the day, even
+    after the market closes and a genuinely new close is available.
     """
     ticker = ticker.upper().strip()
     if not ticker:
         raise ValueError("ticker must not be empty")
 
     today_str = et_today().isoformat()
-    if storage.get_swing_history_fetch_date(ticker) == today_str:
+    if not force_refresh and storage.get_swing_history_fetch_date(ticker) == today_str:
         return _rows_to_df(storage.get_swing_price_history(ticker))
 
     raw = yf.download(
