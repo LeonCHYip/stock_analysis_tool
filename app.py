@@ -1409,9 +1409,15 @@ def load_ticker_list() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Batch scan settings
-SCAN_BATCH_SIZE     = 100   # tickers per bulk technical download
-SCAN_FUND_WORKERS   = 3     # parallel threads for fundamental + peer fetches (keep low to avoid Yahoo rate limits)
-SCAN_BATCH_COOLDOWN = 30    # seconds to rest between batches (give Yahoo Finance time to recover)
+SCAN_BATCH_SIZE     = 150   # tickers per bulk technical download
+SCAN_FUND_WORKERS   = 4     # parallel threads for fundamental + peer fetches (keep low to avoid Yahoo rate limits)
+# Adaptive cooldown: a fixed 30s rest between EVERY batch was wasteful when
+# nothing went wrong. Now: short rest after a clean batch (no rate-limited
+# tickers and no reactive VPN switch), full rest after a batch that showed
+# any sign of Yahoo rate-limiting -- same protection when it's actually
+# needed, near-zero cost when it isn't.
+SCAN_BATCH_COOLDOWN_CLEAN = 10   # seconds to rest after a batch with zero rate-limit failures
+SCAN_BATCH_COOLDOWN_DIRTY = 30   # seconds to rest after a batch that hit rate limiting
 
 # Mullvad VPN rotation — countries cycled through between batches
 VPN_COUNTRIES = ["us", "nl", "de", "se", "ch", "gb", "ca", "fr"]
@@ -1616,9 +1622,12 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
 
         # ── Step 3: cooldown + optional proactive VPN switch ──────────────────
         if batch_start + SCAN_BATCH_SIZE < total and not stop_event.is_set():
-            _slog(f"[scan] COOLDOWN {SCAN_BATCH_COOLDOWN}s")
-            progress["current"] = f"Cooldown {SCAN_BATCH_COOLDOWN}s before next batch…"
-            for _ in range(SCAN_BATCH_COOLDOWN * 10):
+            _batch_had_failures = bool(rate_limited_tickers) or vpn_switched_this_batch
+            _cooldown = SCAN_BATCH_COOLDOWN_DIRTY if _batch_had_failures else SCAN_BATCH_COOLDOWN_CLEAN
+            _slog(f"[scan] COOLDOWN {_cooldown}s"
+                  + (" (rate-limit failures observed)" if _batch_had_failures else " (clean batch)"))
+            progress["current"] = f"Cooldown {_cooldown}s before next batch…"
+            for _ in range(_cooldown * 10):
                 if stop_event.is_set():
                     break
                 time.sleep(0.1)

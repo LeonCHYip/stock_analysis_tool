@@ -2470,6 +2470,45 @@ def get_price_history_max_date(tickers: list[str]) -> str | None:
     return row[0] if row else None
 
 
+def get_price_history_max_dates(tickers: list[str]) -> dict[str, str]:
+    """Return {ticker: max_date_str} for tickers that already have price_history
+    rows. Tickers with no rows yet are simply absent from the result -- callers
+    use this to decide whether a full-history upload is needed (first fetch)
+    or only the recent tail (subsequent scans). One batched query per caller
+    batch, not one per ticker."""
+    if not tickers:
+        return {}
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    rows = con.execute(
+        f"SELECT ticker, CAST(MAX(date) AS TEXT) FROM price_history "
+        f"WHERE ticker IN ({placeholders}) GROUP BY ticker",
+        tickers,
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def get_price_history_close_at(tickers_dates: list[tuple[str, str]]) -> dict[tuple[str, str], float]:
+    """Return {(ticker, date_str): close} for the given (ticker, date) pairs
+    that exist in price_history. Used to detect retroactive data revisions
+    (e.g. a stock split, which restates a ticker's ENTIRE historical OHLC
+    series, not just recent days) before trusting a fast recent-tail-only
+    price_history re-upload. One batched query per caller batch."""
+    if not tickers_dates:
+        return {}
+    tickers = list({t for t, _ in tickers_dates})
+    dates   = list({d for _, d in tickers_dates})
+    placeholders_t = ", ".join(["?" for _ in tickers])
+    placeholders_d = ", ".join(["?" for _ in dates])
+    con = _conn()
+    rows = con.execute(
+        f"SELECT ticker, CAST(date AS TEXT), close FROM price_history "
+        f"WHERE ticker IN ({placeholders_t}) AND date IN ({placeholders_d})",
+        tickers + dates,
+    ).fetchall()
+    return {(r[0], r[1]): r[2] for r in rows}
+
+
 def get_trigger_period_returns(
     ticker_date_pairs: dict[str, tuple[str, str]],
 ) -> dict[str, dict]:

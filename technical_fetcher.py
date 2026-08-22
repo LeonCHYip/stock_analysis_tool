@@ -62,9 +62,18 @@ _BATCH_SIZE = 100   # yf.download tickers per call
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _extract_price_rows(df: pd.DataFrame) -> list[tuple]:
-    """Extract (date_str, open, high, low, close, volume) tuples from an OHLCV DataFrame."""
+def _extract_price_rows(df: pd.DataFrame, since: str | None = None) -> list[tuple]:
+    """Extract (date_str, open, high, low, close, volume) tuples from an OHLCV DataFrame.
+
+    `since`: if given, only rows with date >= since are returned. Only pass
+    this when a revision check (see _price_history_needs_full_reupload) has
+    confirmed the ticker's older history hasn't been retroactively restated
+    (e.g. by a stock split) since it was last stored -- a split rewrites the
+    ENTIRE historical series, not just recent days, so trimming to a recent
+    tail is only safe once that's been verified, not by default."""
     sub = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+    if since is not None:
+        sub = sub[sub.index >= since]
     rows = []
     for idx, row in sub.iterrows():
         d = idx.date().isoformat() if hasattr(idx, "date") else str(idx)[:10]
@@ -76,6 +85,32 @@ def _extract_price_rows(df: pd.DataFrame) -> list[tuple]:
         if c is not None:
             rows.append((d, o, h, l, c, v))
     return rows
+
+
+def _price_history_needs_full_reupload(last_stored_date: str | None,
+                                        stored_close: float | None,
+                                        df: pd.DataFrame) -> bool:
+    """True if `df`'s freshly downloaded raw Close at `last_stored_date`
+    doesn't exactly match what's already stored there -- signals the
+    ticker's historical OHLC may have been retroactively revised (a stock
+    split restates the ENTIRE series, not just recent rows) since we last
+    saved it, so a full re-upload is required rather than just the recent
+    tail. Any inconclusive case (no prior date, no stored value, date not
+    present in the fresh download) also returns True -- default to the
+    slow-but-correct full upload whenever the fast path can't be verified.
+    Compares against raw "Close" (not adjusted), matching what
+    _extract_price_rows actually stores."""
+    if not last_stored_date or stored_close is None:
+        return True
+    try:
+        ts = pd.Timestamp(last_stored_date)
+        if ts not in df.index:
+            return True
+        fresh_close = _safe(df.loc[ts, "Close"], 4)
+    except Exception:
+        return True
+    return fresh_close is None or fresh_close != stored_close
+
 
 def _safe(v, ndigits=2):
     try:
@@ -886,6 +921,20 @@ def fetch_and_store_bulk(tickers: list[str],
 
         is_multi = isinstance(raw.columns, pd.MultiIndex)
 
+        # Per-ticker last-stored price_history date + the Close already saved
+        # for it, both via one batched query each rather than one per ticker.
+        # Used below to decide, per ticker, whether it's safe to upload only
+        # the recent tail of its OHLCV instead of re-upserting the full ~3y
+        # window on every scan -- re-upserting ~750 already-unchanged rows
+        # per ticker against a multi-million-row table (via INSERT OR
+        # REPLACE) measured at ~550ms/ticker, the dominant cost of a full
+        # scan by a wide margin (vs ~15ms/ticker for indicator computation).
+        # The fast path is only taken once _price_history_needs_full_reupload
+        # confirms nothing upstream (e.g. a stock split, which restates a
+        # ticker's ENTIRE historical series) has changed since we last saved.
+        _max_dates = storage.get_price_history_max_dates(batch)
+        _stored_closes = storage.get_price_history_close_at(list(_max_dates.items()))
+
         for ticker in batch:
             try:
                 if is_multi:
@@ -911,7 +960,14 @@ def fetch_and_store_bulk(tickers: list[str],
                 # will pick it up on the next session.
                 row_is_final = is_final_session and (as_of >= expected_date)
                 storage.save_tech_indicators(ticker, as_of, fields, row_is_final)
-                storage.save_price_history(ticker, _extract_price_rows(df))
+
+                _last_stored = _max_dates.get(ticker)
+                _since = None
+                if not _price_history_needs_full_reupload(
+                    _last_stored, _stored_closes.get((ticker, _last_stored)), df
+                ):
+                    _since = (pd.Timestamp(_last_stored) - pd.Timedelta(days=10)).date().isoformat()
+                storage.save_price_history(ticker, _extract_price_rows(df, since=_since))
 
                 # Convert flat fields dict → legacy nested dict for indicators.py
                 fields["_as_of_date"] = as_of  # restore for conversion
@@ -1031,6 +1087,8 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
             continue
 
         is_multi = isinstance(raw.columns, pd.MultiIndex)
+        _max_dates = storage.get_price_history_max_dates(batch)
+        _stored_closes = storage.get_price_history_close_at(list(_max_dates.items()))
         for ticker in batch:
             try:
                 if is_multi:
@@ -1049,7 +1107,14 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
                 as_of = fields.pop("_as_of_date", today_str)
                 row_is_final = is_final_session and (as_of >= expected_date)
                 storage.save_tech_indicators(ticker, as_of, fields, row_is_final)
-                storage.save_price_history(ticker, _extract_price_rows(df))
+
+                _last_stored = _max_dates.get(ticker)
+                _since = None
+                if not _price_history_needs_full_reupload(
+                    _last_stored, _stored_closes.get((ticker, _last_stored)), df
+                ):
+                    _since = (pd.Timestamp(_last_stored) - pd.Timedelta(days=10)).date().isoformat()
+                storage.save_price_history(ticker, _extract_price_rows(df, since=_since))
                 storage.mark_tech_finalized(ticker, as_of)
             except Exception as e:
                 log(f"  [tech] Re-fetch compute error for {ticker}: {e}")
