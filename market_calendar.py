@@ -29,6 +29,13 @@ def et_today() -> date:
     return datetime.now(_ET).date()
 
 
+def now_et() -> datetime:
+    """Return the current datetime (with time-of-day) in US/Eastern (NYSE)
+    timezone. Use for any check needing wall-clock time relative to NYSE
+    hours -- et_today() only gives the date, not the time-of-day."""
+    return datetime.now(_ET)
+
+
 def get_trading_days(start: str | date, end: str | date) -> list[str]:
     """
     Return list of NYSE trading day strings 'YYYY-MM-DD' in [start, end].

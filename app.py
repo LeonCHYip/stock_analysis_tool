@@ -15,6 +15,7 @@ import resource
 import threading
 import concurrent.futures
 import time
+import traceback
 from datetime import datetime, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -3611,6 +3612,20 @@ with st.sidebar:
         help="Rotates Mullvad server after each batch to avoid rate limiting. Requires Mullvad CLI.",
     )
 
+    def _on_auto_scan_toggle() -> None:
+        p = _load_prefs()
+        p["auto_scan_enabled"] = st.session_state["auto_scan_enabled_cb"]
+        _save_prefs(p)
+
+    st.checkbox(
+        "Auto-run market scan at 4:30pm ET",
+        value=_load_prefs().get("auto_scan_enabled", True),
+        key="auto_scan_enabled_cb",
+        help="Automatically scans all tickers.txt tickers ~30 min after NYSE close "
+             "on trading days, as long as this Streamlit process is running.",
+        on_change=_on_auto_scan_toggle,
+    )
+
     run_btn      = st.button("▶ Run Market Scan", type="primary", width="stretch")
     run_unseen_btn = st.button(
         "▶ Run Unseen Today",
@@ -3738,12 +3753,19 @@ def _refresh_index_dashboard() -> None:
         _slog(f"[dashboard] Refresh failed: {e}")
 
 
-def _launch_scan(ticker_list: list[str], label: str) -> None:
-    """Start a scan thread for the given ticker list."""
+def _start_scan_thread(ticker_list: list[str], daily_str: str | None, weekly_str: str | None,
+                       fetch_peers: bool, vpn_rotate: bool) -> dict | None:
+    """UI/session-state-free scan launcher. Stops any existing scan, registers
+    the new one in module-level _PROC_SCAN, and starts scan-thread. Safe to
+    call from a bare background thread (no Streamlit ScriptRunContext) as
+    well as from the main script -- never touches st.* or st.session_state.
+
+    Returns {"progress","pause_event","stop_event","analysis_dt","thread"},
+    or None if ticker_list was empty.
+    """
     global _PROC_SCAN
     if not ticker_list:
-        st.sidebar.error("No tickers to process. Enter tickers or check tickers.txt.")
-        return
+        return None
 
     # Refresh the index dashboard at scan START (not completion) so it
     # reflects current market conditions right away rather than waiting on
@@ -3752,19 +3774,14 @@ def _launch_scan(ticker_list: list[str], label: str) -> None:
     threading.Thread(target=_refresh_index_dashboard, daemon=True,
                      name="dashboard-refresh").start()
 
-    daily_str   = str(daily_date_input)  if daily_date_input  else None
-    weekly_str  = str(weekly_date_input) if weekly_date_input else None
     analysis_dt = _now_cst()
-    fetch_peers = st.session_state.get("fetch_peers", True)
-    vpn_rotate  = st.session_state.get("vpn_rotate",  False)
 
-    # Stop any running scan — both the session-level event and the module-level
-    # event (which may belong to a different session that has since disconnected).
+    # Stop any running scan — the module-level event (which may belong to a
+    # different session that has since disconnected, or a headless-launched
+    # scan with no session at all).
     with _PROC_SCAN_LOCK:
         if _PROC_SCAN is not None:
             _PROC_SCAN["stop_event"].set()
-    if st.session_state.scan_stop_event:
-        st.session_state.scan_stop_event.set()
     time.sleep(0.2)
 
     pause_event = threading.Event()
@@ -3781,27 +3798,131 @@ def _launch_scan(ticker_list: list[str], label: str) -> None:
             "analysis_dt": analysis_dt,
         }
 
-    st.session_state.scan_pause_event  = pause_event
-    st.session_state.scan_stop_event   = stop_event
-    st.session_state.scan_progress     = progress
-    st.session_state.last_analysis_dt  = analysis_dt
-    st.session_state.last_tickers      = []
-    st.session_state.last_detail_map   = {}
-    st.session_state["last_inds_live"] = {}
-
     def _scan_entry():
         try:
             scan_thread_func(ticker_list, analysis_dt, daily_str, weekly_str,
                              pause_event, stop_event, progress, fetch_peers, vpn_rotate)
+        except Exception:
+            _slog(f"[scan] scan-thread crashed: {traceback.format_exc()}")
         finally:
             # Always release this thread's curl handle, even if the scan
             # raised — a dead thread's handle aborts the process when GC'd.
             close_thread_curl()
+            # Safety net: scan_thread_func already clears _PROC_SCAN on its
+            # own happy-path completion (matching stop_event identity so it
+            # never clobbers a newer scan's registration). If it raised
+            # before reaching that point, this ensures _PROC_SCAN still gets
+            # cleared -- otherwise it would stay stuck non-None forever,
+            # silently blocking every future scan (manual or scheduled)
+            # behind the "already running" guard. No-op if already cleared.
+            global _PROC_SCAN
+            with _PROC_SCAN_LOCK:
+                if _PROC_SCAN is not None and _PROC_SCAN.get("stop_event") is stop_event:
+                    _PROC_SCAN = None
 
     t = threading.Thread(target=_scan_entry, daemon=True, name="scan-thread")
-    st.session_state.scan_thread = t
     t.start()
+    return {"progress": progress, "pause_event": pause_event, "stop_event": stop_event,
+            "analysis_dt": analysis_dt, "thread": t}
+
+
+def _launch_scan(ticker_list: list[str], label: str) -> None:
+    """Sidebar-button entry point: reads widget/session state, starts the
+    scan via _start_scan_thread, mirrors the result into st.session_state,
+    and renders the sidebar confirmation/error."""
+    daily_str   = str(daily_date_input)  if daily_date_input  else None
+    weekly_str  = str(weekly_date_input) if weekly_date_input else None
+    fetch_peers = st.session_state.get("fetch_peers", True)
+    vpn_rotate  = st.session_state.get("vpn_rotate",  False)
+
+    # Also stop this session's own previously-tracked scan (covers the case
+    # where st.session_state's copy has drifted from module-level _PROC_SCAN,
+    # e.g. after a reconnect) -- _start_scan_thread only stops via _PROC_SCAN.
+    if st.session_state.scan_stop_event:
+        st.session_state.scan_stop_event.set()
+
+    rec = _start_scan_thread(ticker_list, daily_str, weekly_str, fetch_peers, vpn_rotate)
+    if rec is None:
+        st.sidebar.error("No tickers to process. Enter tickers or check tickers.txt.")
+        return
+
+    st.session_state.scan_pause_event  = rec["pause_event"]
+    st.session_state.scan_stop_event   = rec["stop_event"]
+    st.session_state.scan_progress     = rec["progress"]
+    st.session_state.last_analysis_dt  = rec["analysis_dt"]
+    st.session_state.last_tickers      = []
+    st.session_state.last_detail_map   = {}
+    st.session_state["last_inds_live"] = {}
+    st.session_state.scan_thread       = rec["thread"]
     st.sidebar.success(label)
+
+
+def _launch_scan_headless(ticker_list: list[str], label: str,
+                          fetch_peers: bool = True, vpn_rotate: bool = True) -> bool:
+    """Scheduler entry point -- no Streamlit context available, so logs via
+    _slog instead of st.sidebar.*. fetch_peers/vpn_rotate default True since
+    an unattended run has no one watching to react to errors."""
+    rec = _start_scan_thread(ticker_list, None, None, fetch_peers, vpn_rotate)
+    if rec is None:
+        _slog(f"[auto-scan] launch skipped: empty ticker list ({label})")
+        return False
+    _slog(f"[auto-scan] LAUNCHED  {label}  analysis_dt={rec['analysis_dt']}")
+    return True
+
+
+_AUTO_SCAN_POLL_SECS = 300  # 5 min -- trigger is a single afternoon instant, no need for tight polling
+
+
+def _auto_scan_poll() -> None:
+    """Checked every _AUTO_SCAN_POLL_SECS by the auto-scan-scheduler thread.
+    Launches a full scan of any tickers not yet scanned since 4:30pm ET on a
+    trading day, once. Idempotent via storage.get_tickers_run_since (the
+    same mechanism "Run Unseen Today" uses) rather than a separate in-memory
+    "did I fire today" flag -- naturally a no-op once today's scan (whether
+    scheduled or manually started) has completed, and naturally resumes just
+    the remainder if this process restarts mid-afternoon."""
+    prefs = _load_prefs()
+    if not prefs.get("auto_scan_enabled", True):
+        return                                   # toggle off
+
+    with _PROC_SCAN_LOCK:
+        if _PROC_SCAN is not None:
+            return                                # a scan (scheduled or manual) is already running -- never overlap
+
+    from market_calendar import now_et, get_trading_days
+    _now = now_et()
+    if not get_trading_days(_now.date(), _now.date()):
+        return                                    # weekend/holiday
+    if (_now.hour, _now.minute) < (16, 30):
+        return                                    # not yet 4:30pm ET
+
+    _cutoff = datetime.now(CST).replace(hour=15, minute=30, second=0, microsecond=0)
+    cutoff_str = _cutoff.strftime("%Y-%m-%d %H:%M:%S CST")   # 15:30 CST == 16:30 ET
+    already_done = storage.get_tickers_run_since(cutoff_str)
+    all_tickers  = load_ticker_list()
+    ticker_list  = [t for t in all_tickers if t not in already_done]
+
+    if not ticker_list:
+        _slog(f"[auto-scan] SKIP  already done  {len(already_done)}/{len(all_tickers)} "
+              f"tickers scanned since {cutoff_str}")
+        return
+
+    label = f"Auto scan 4:30pm ET — {len(ticker_list)} tickers ({len(already_done)} already run)"
+    _launch_scan_headless(ticker_list, label, fetch_peers=True, vpn_rotate=True)
+
+
+def _auto_scan_loop() -> None:
+    while True:
+        time.sleep(_AUTO_SCAN_POLL_SECS)
+        try:
+            _auto_scan_poll()
+        except Exception:
+            _slog(f"[auto-scan] poll failed: {traceback.format_exc()}")
+
+
+if not any(t.name == "auto-scan-scheduler" for t in threading.enumerate()):
+    _slog("[auto-scan] SCHEDULER START")
+    threading.Thread(target=_auto_scan_loop, daemon=True, name="auto-scan-scheduler").start()
 
 
 if run_btn:
