@@ -46,7 +46,7 @@ import pandas as pd
 import ta
 import yfinance as yf
 
-from yf_session import YF_SESSION
+from yf_session import YF_SESSION, YF_DL_LOCK
 
 from market_calendar import (
     get_missing_trading_days, nyse_close_passed_today,
@@ -59,11 +59,28 @@ CST = ZoneInfo("America/Chicago")
 
 _BATCH_SIZE = 100   # yf.download tickers per call
 
+# Two-tier incremental download (fetch_and_store_bulk): tickers with
+# confirmed full-depth history (see ticker_history_depth) only need a small
+# recent window downloaded each scan, not the whole 10y window every time.
+_CHECK_WINDOW_DAYS = 60      # small check-window download size
+# NOTE: the fast path's DB-history read (get_price_history_before) is
+# deliberately NOT capped to _compute_all_indicators' bounded-window fields
+# (756 trading days / "3Y" fields etc.) -- OBV and the A/D line are
+# UNBOUNDED cumulative sums over whatever series is passed in, so truncating
+# the read would silently change their value versus what a full download
+# would have produced (verified empirically: capping to ~3y produced OBV/
+# ad_line off by orders of magnitude between two consecutive scans of the
+# same ticker with no new trading activity). The read is local DuckDB I/O,
+# not a network call, so reading everything stored is cheap regardless.
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_price_rows(df: pd.DataFrame, since: str | None = None) -> list[tuple]:
-    """Extract (date_str, open, high, low, close, volume) tuples from an OHLCV DataFrame.
+    """Extract (date_str, open, high, low, close, adj_close, volume) tuples
+    from an OHLCV DataFrame. adj_close is None if the DataFrame has no
+    "Adj Close" column (defensive -- yf.download with auto_adjust=False
+    always includes it in practice).
 
     `since`: if given, only rows with date >= since are returned. Only pass
     this when a revision check (see _price_history_needs_full_reupload) has
@@ -71,7 +88,11 @@ def _extract_price_rows(df: pd.DataFrame, since: str | None = None) -> list[tupl
     (e.g. by a stock split) since it was last stored -- a split rewrites the
     ENTIRE historical series, not just recent days, so trimming to a recent
     tail is only safe once that's been verified, not by default."""
-    sub = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    has_adj = "Adj Close" in df.columns
+    if has_adj:
+        cols.append("Adj Close")
+    sub = df[cols].dropna(subset=["Close"])
     if since is not None:
         sub = sub[sub.index >= since]
     rows = []
@@ -81,9 +102,10 @@ def _extract_price_rows(df: pd.DataFrame, since: str | None = None) -> list[tupl
         h = _safe(row["High"], 4)
         l = _safe(row["Low"], 4)
         c = _safe(row["Close"], 4)
+        ac = _safe(row["Adj Close"], 4) if has_adj else None
         v = _safe_int(row["Volume"])
         if c is not None:
-            rows.append((d, o, h, l, c, v))
+            rows.append((d, o, h, l, c, ac, v))
     return rows
 
 
@@ -110,6 +132,43 @@ def _price_history_needs_full_reupload(last_stored_date: str | None,
     except Exception:
         return True
     return fresh_close is None or fresh_close != stored_close
+
+
+def _assemble_price_df(older_rows: list[tuple], fresh_df: pd.DataFrame) -> pd.DataFrame:
+    """Concatenate DB-stored history (`older_rows`, strictly before
+    fresh_df's start -- see storage.get_price_history_before) with a
+    freshly downloaded small check-window DataFrame into one continuous
+    DataFrame matching _compute_all_indicators' expected input shape
+    (DatetimeIndex; Open/High/Low/Close/Volume/Adj Close columns).
+
+    older_rows: (date_str, open, high, low, close, adj_close, volume)
+    tuples. Older rows generally lack adj_close (added to price_history
+    after this feature shipped) -- left NaN, which
+    _compute_all_indicators' existing per-row fallback already handles by
+    using raw Close for just those rows."""
+    if older_rows:
+        older = pd.DataFrame(
+            older_rows,
+            columns=["date", "Open", "High", "Low", "Close", "Adj Close", "Volume"],
+        )
+        older["date"] = pd.to_datetime(older["date"])
+        older = older.set_index("date")
+    else:
+        older = pd.DataFrame(
+            columns=["Open", "High", "Low", "Close", "Adj Close", "Volume"],
+            index=pd.DatetimeIndex([], name="date"),
+        )
+
+    fresh = fresh_df.copy()
+    if isinstance(fresh.columns, pd.MultiIndex):
+        fresh.columns = fresh.columns.get_level_values(0)
+    if "Adj Close" not in fresh.columns:
+        fresh["Adj Close"] = pd.NA
+    fresh = fresh[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+
+    combined = pd.concat([older, fresh])
+    combined = combined[~combined.index.duplicated(keep="last")]
+    return combined.sort_index()
 
 
 def _safe(v, ndigits=2):
@@ -415,8 +474,17 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         close_52w = close.tail(252)
         high_close_52w = _safe(close_52w.max())
         low_close_52w  = _safe(close_52w.min())
-        high_close_3y  = _safe(close.max())
-        low_close_3y   = _safe(close.min())
+        # "3Y" fields are explicitly capped to the trailing 756 trading days
+        # (252*3) -- NOT close.max()/close.min() over the whole fetched
+        # series. With a 3y fetch window those were equivalent, which is
+        # exactly why this was previously written as the unbounded form; now
+        # that the fetch window is 10y, close.max() would silently become an
+        # ALL-TIME high/low while the column stays labeled "3Y". .tail(756)
+        # degrades gracefully to "all available" for tickers with under 3
+        # years of history, same as before.
+        close_3y = close.tail(756)
+        high_close_3y  = _safe(close_3y.max())
+        low_close_3y   = _safe(close_3y.min())
 
         pct_from_high_close_52w = _pct_from_ma(latest_close, high_close_52w)
         pct_from_low_close_52w  = _pct_from_ma(latest_close, low_close_52w)
@@ -439,7 +507,9 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         made_high_22d  = bool(h_today >= float(high.tail(22).max()))  if n >= 22  else None
         made_high_252d = bool(h_today >= float(high.tail(252).max())) if n >= 252 else None
         made_high_3m   = bool(h_today >= float(high.tail(63).max()))  if n >= 63  else None
-        made_high_3y   = bool(h_today >= float(high.max()))           if n >= 1   else None
+        # Capped to trailing 756 trading days, not high.max() over the whole
+        # fetch window -- see the close_3y comment above for why.
+        made_high_3y   = bool(h_today >= float(high.tail(756).max())) if n >= 1   else None
         made_low_5d    = bool(l_today <= float(low.tail(5).min()))    if n >= 5   else None
         made_low_22d   = bool(l_today <= float(low.tail(22).min()))   if n >= 22  else None
         made_low_252d  = bool(l_today <= float(low.tail(252).min()))  if n >= 252 else None
@@ -454,7 +524,8 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         days_since_5d_high  = _days_since_intraday_high(high.tail(5))   if n >= 5   else None
         days_since_22d_high = _days_since_intraday_high(high.tail(22))  if n >= 22  else None
         days_since_3m_high  = _days_since_intraday_high(high.tail(63))  if n >= 63  else None
-        days_since_3y_high  = _days_since_intraday_high(high)           if n >= 1   else None
+        # Capped to trailing 756 trading days -- see the close_3y comment above.
+        days_since_3y_high  = _days_since_intraday_high(high.tail(756)) if n >= 1   else None
 
         # Days since the prior-window high, EXCLUDING today (0 = yesterday was the high).
         # Useful for measuring how long a consolidation lasted before a breakout.
@@ -469,12 +540,16 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         days_since_prior_high_22d  = _days_since_prior_high(high, 22)
         days_since_prior_high_63d  = _days_since_prior_high(high, 63)
         days_since_prior_high_252d = _days_since_prior_high(high, 252)
-        # 3Y: use all available history before today (mirrors made_high_3y semantics)
-        if n > 1:
-            prior_all = high.iloc[:n - 1]
-            days_since_prior_high_3y = int(len(prior_all) - 1 - prior_all.values.argmax())
-        else:
-            days_since_prior_high_3y = None
+        # 3Y: same helper as the other windows now that it's a real bounded
+        # window (756 trading days) rather than "whatever we happened to
+        # fetch". Previously this was special-cased to use ALL history
+        # before today because, at the old 3y fetch window, "all history"
+        # and "756 trading days" were roughly the same thing -- with a 10y
+        # window they are not. This also changes behavior for tickers with
+        # under 756+1 days of history: None (insufficient data), matching
+        # every sibling *_prior_high_Nd field's convention, rather than the
+        # old silent fallback to whatever partial history existed.
+        days_since_prior_high_3y = _days_since_prior_high(high, 756)
 
         # Close-based pct from high for short windows
         high_close_5d  = _safe(close.tail(5).max())   if n >= 5  else None
@@ -871,8 +946,20 @@ def fetch_and_store_bulk(tickers: list[str],
                          weekly_latest_date: str | None = None,
                          log=print) -> dict[str, dict]:
     """
-    Download 3y OHLCV for `tickers` in batches of 100, compute all indicators,
-    store in tech_indicators table.
+    Compute all indicators for `tickers` in batches of 100 and store in
+    tech_indicators table.
+
+    Two-tier download per batch: tickers with confirmed full-depth history
+    (ticker_history_depth) only need a small recent window downloaded
+    (_CHECK_WINDOW_DAYS) -- the older portion of their indicator-compute
+    DataFrame is read back from price_history instead of re-downloaded.
+    Everything else (new tickers, not-yet-depth-confirmed tickers, and
+    tickers where the small window's revision check fails or is
+    inconclusive) gets the full 10y download, same as every ticker used to
+    get on every single scan. See _price_history_needs_full_reupload for
+    the revision-check mechanics and the ticker_history_depth DDL comment
+    in storage.py for why depth-confirmation uses a completion flag rather
+    than an absolute calendar-age threshold.
 
     Returns {ticker: legacy_tech_dict | {"error": ...}}.
     The legacy_tech_dict format is what indicators.py / evaluate_all() expects
@@ -890,91 +977,201 @@ def fetch_and_store_bulk(tickers: list[str],
     expected_date = today_str if is_final_session else (
         get_last_trading_day_before_today() or today_str
     )
-    # Explicit date range so yfinance always tries to include today's close
-    _start = (today_et - timedelta(days=3 * 365 + 10)).isoformat()
+    # Explicit date range so yfinance always tries to include today's close.
+    # 10y+10d: the +10 buffer just guards against weekday/holiday edge cases
+    # at the boundary, same as the previous 3y+10 convention. NOTE: the
+    # "3Y"-labeled indicator fields below (high_close_3y etc.) are
+    # deliberately capped to an explicit trailing-756-trading-day slice
+    # rather than "whatever this fetch window is" -- see the comments at
+    # each of those fields. If this window is ever extended further, those
+    # fields do NOT need to change; only truly *unbounded* computations
+    # would need re-auditing.
+    _start = (today_et - timedelta(days=10 * 365 + 10)).isoformat()
     _end   = (today_et + timedelta(days=1)).isoformat()
+    _check_start = (today_et - timedelta(days=_CHECK_WINDOW_DAYS)).isoformat()
 
     for i in range(0, len(tickers), _BATCH_SIZE):
         batch = tickers[i: i + _BATCH_SIZE]
-        _t0 = time.time()
-        log(f"  [tech] yf.download START  batch={i//100 + 1}  tickers={len(batch)}"
-            f"  thread={threading.current_thread().name}  {_diag_res()}")
-        try:
-            raw = yf.download(
-                tickers=batch,
-                start=_start,
-                end=_end,
-                group_by="ticker",
-                auto_adjust=False,
-                threads=False,
-                progress=False,
-                session=YF_SESSION,
-            )
-            log(f"  [tech] yf.download DONE   batch={i//100 + 1}  elapsed={time.time()-_t0:.1f}s"
-                f"  shape={raw.shape}  {_diag_res()}")
-        except Exception as e:
-            log(f"  [tech] yf.download ERROR  batch={i//100 + 1}  elapsed={time.time()-_t0:.1f}s"
-                f"  err={type(e).__name__}: {e}  {_diag_res()}")
-            for t in batch:
-                results[t] = {"error": f"Batch download failed: {e}"}
-            continue
+        batch_no = i // _BATCH_SIZE + 1
 
-        is_multi = isinstance(raw.columns, pd.MultiIndex)
-
-        # Per-ticker last-stored price_history date + the Close already saved
-        # for it, both via one batched query each rather than one per ticker.
-        # Used below to decide, per ticker, whether it's safe to upload only
-        # the recent tail of its OHLCV instead of re-upserting the full ~3y
-        # window on every scan -- re-upserting ~750 already-unchanged rows
-        # per ticker against a multi-million-row table (via INSERT OR
-        # REPLACE) measured at ~550ms/ticker, the dominant cost of a full
-        # scan by a wide margin (vs ~15ms/ticker for indicator computation).
-        # The fast path is only taken once _price_history_needs_full_reupload
-        # confirms nothing upstream (e.g. a stock split, which restates a
-        # ticker's ENTIRE historical series) has changed since we last saved.
+        # Per-ticker last-stored price_history date + full-depth confirmation,
+        # both via one batched query each. A ticker only qualifies for the
+        # small check-window download once it's both been stored before AND
+        # already had a full-window download complete at some point.
         _max_dates = storage.get_price_history_max_dates(batch)
-        _stored_closes = storage.get_price_history_close_at(list(_max_dates.items()))
+        _depth = storage.get_ticker_history_depth(batch)
 
+        needs_full: list[str] = []
+        check_candidates: list[str] = []
         for ticker in batch:
+            if ticker in _max_dates and ticker in _depth:
+                check_candidates.append(ticker)
+            else:
+                needs_full.append(ticker)
+
+        fast_path_dfs: dict[str, pd.DataFrame] = {}
+
+        # ── Tier 1: small check-window download + revision check ──────────
+        if check_candidates:
+            _t0 = time.time()
+            log(f"  [tech] CHECK yf.download START  batch={batch_no}  tickers={len(check_candidates)}"
+                f"  thread={threading.current_thread().name}  {_diag_res()}")
             try:
-                if is_multi:
-                    if ticker not in raw.columns.get_level_values(0):
-                        results[ticker] = {"error": f"No bulk data for {ticker}"}
-                        continue
-                    df = raw[ticker].copy()
-                else:
-                    df = raw.copy()
-
-                if df.empty or df["Close"].isna().all():
-                    results[ticker] = {"error": f"No price data for {ticker}"}
-                    continue
-
-                fields = _compute_all_indicators(ticker, df, weekly_latest_date)
-                if "error" in fields:
-                    results[ticker] = {"error": fields["error"]}
-                    continue
-
-                as_of = fields.pop("_as_of_date", today_str)
-                # Only finalize if yfinance actually returned the expected trading day's data.
-                # If it returned stale data, keep is_finalized=FALSE so refetch_unfinalized
-                # will pick it up on the next session.
-                row_is_final = is_final_session and (as_of >= expected_date)
-                storage.save_tech_indicators(ticker, as_of, fields, row_is_final)
-
-                _last_stored = _max_dates.get(ticker)
-                _since = None
-                if not _price_history_needs_full_reupload(
-                    _last_stored, _stored_closes.get((ticker, _last_stored)), df
-                ):
-                    _since = (pd.Timestamp(_last_stored) - pd.Timedelta(days=10)).date().isoformat()
-                storage.save_price_history(ticker, _extract_price_rows(df, since=_since))
-
-                # Convert flat fields dict → legacy nested dict for indicators.py
-                fields["_as_of_date"] = as_of  # restore for conversion
-                results[ticker] = tech_dict_to_legacy(fields)
-
+                with YF_DL_LOCK:  # see yf_session.py -- concurrent downloads cross-contaminate
+                    check_raw = yf.download(
+                        tickers=check_candidates,
+                        start=_check_start,
+                        end=_end,
+                        group_by="ticker",
+                        auto_adjust=False,
+                        threads=False,
+                        progress=False,
+                        session=YF_SESSION,
+                    )
+                log(f"  [tech] CHECK yf.download DONE   batch={batch_no}  elapsed={time.time()-_t0:.1f}s"
+                    f"  shape={check_raw.shape}  {_diag_res()}")
             except Exception as e:
-                results[ticker] = {"error": f"Technical compute failed for {ticker}: {e}"}
+                log(f"  [tech] CHECK yf.download ERROR  batch={batch_no}  elapsed={time.time()-_t0:.1f}s"
+                    f"  err={type(e).__name__}: {e}  {_diag_res()}")
+                # Check download failed outright -- fall back to full for all of them.
+                needs_full.extend(check_candidates)
+                check_candidates = []
+
+            if check_candidates:
+                is_check_multi = isinstance(check_raw.columns, pd.MultiIndex)
+                _stored_closes = storage.get_price_history_close_at(
+                    [(t, _max_dates[t]) for t in check_candidates]
+                )
+                for ticker in check_candidates:
+                    try:
+                        if is_check_multi:
+                            if ticker not in check_raw.columns.get_level_values(0):
+                                needs_full.append(ticker)
+                                continue
+                            small_df = check_raw[ticker].copy()
+                        else:
+                            small_df = check_raw.copy()
+
+                        if small_df.empty or small_df["Close"].isna().all():
+                            needs_full.append(ticker)
+                            continue
+
+                        _last_stored = _max_dates[ticker]
+                        if _price_history_needs_full_reupload(
+                            _last_stored, _stored_closes.get((ticker, _last_stored)), small_df
+                        ):
+                            needs_full.append(ticker)
+                            continue
+
+                        fast_path_dfs[ticker] = small_df
+                    except Exception:
+                        needs_full.append(ticker)
+
+        # ── Fast path: assemble DB history + fresh tail, compute, write tail ──
+        if fast_path_dfs:
+            # No min_date: read everything stored so unbounded cumulative
+            # indicators (OBV, A/D line) match what a full download would
+            # have produced (see _CHECK_WINDOW_DAYS comment above).
+            _older = storage.get_price_history_before(
+                list(fast_path_dfs.keys()), _check_start
+            )
+            for ticker, small_df in fast_path_dfs.items():
+                try:
+                    assembled = _assemble_price_df(_older.get(ticker, []), small_df)
+
+                    fields = _compute_all_indicators(ticker, assembled, weekly_latest_date)
+                    if "error" in fields:
+                        results[ticker] = {"error": fields["error"]}
+                        continue
+
+                    as_of = fields.pop("_as_of_date", today_str)
+                    row_is_final = is_final_session and (as_of >= expected_date)
+                    storage.save_tech_indicators(ticker, as_of, fields, row_is_final)
+
+                    # Revision check already confirmed the ticker's older
+                    # history is unchanged -- only the fresh tail needs writing.
+                    _since = (pd.Timestamp(_max_dates[ticker]) - pd.Timedelta(days=10)).date().isoformat()
+                    storage.save_price_history(ticker, _extract_price_rows(small_df, since=_since))
+
+                    fields["_as_of_date"] = as_of
+                    results[ticker] = tech_dict_to_legacy(fields)
+                except Exception as e:
+                    results[ticker] = {"error": f"Technical compute failed for {ticker}: {e}"}
+
+        # ── Tier 2: full 10y download for new/unconfirmed/revised tickers ──
+        if needs_full:
+            _t0 = time.time()
+            log(f"  [tech] FULL yf.download START  batch={batch_no}  tickers={len(needs_full)}"
+                f"  thread={threading.current_thread().name}  {_diag_res()}")
+            try:
+                with YF_DL_LOCK:
+                    raw = yf.download(
+                        tickers=needs_full,
+                        start=_start,
+                        end=_end,
+                        group_by="ticker",
+                        auto_adjust=False,
+                        threads=False,
+                        progress=False,
+                        session=YF_SESSION,
+                    )
+                log(f"  [tech] FULL yf.download DONE   batch={batch_no}  elapsed={time.time()-_t0:.1f}s"
+                    f"  shape={raw.shape}  {_diag_res()}")
+            except Exception as e:
+                log(f"  [tech] FULL yf.download ERROR  batch={batch_no}  elapsed={time.time()-_t0:.1f}s"
+                    f"  err={type(e).__name__}: {e}  {_diag_res()}")
+                for t in needs_full:
+                    results[t] = {"error": f"Batch download failed: {e}"}
+                continue
+
+            is_multi = isinstance(raw.columns, pd.MultiIndex)
+            _depth_updates: dict[str, str] = {}
+
+            for ticker in needs_full:
+                try:
+                    if is_multi:
+                        if ticker not in raw.columns.get_level_values(0):
+                            results[ticker] = {"error": f"No bulk data for {ticker}"}
+                            continue
+                        df = raw[ticker].copy()
+                    else:
+                        df = raw.copy()
+
+                    if df.empty or df["Close"].isna().all():
+                        results[ticker] = {"error": f"No price data for {ticker}"}
+                        continue
+
+                    fields = _compute_all_indicators(ticker, df, weekly_latest_date)
+                    if "error" in fields:
+                        results[ticker] = {"error": fields["error"]}
+                        continue
+
+                    as_of = fields.pop("_as_of_date", today_str)
+                    # Only finalize if yfinance actually returned the expected trading day's data.
+                    # If it returned stale data, keep is_finalized=FALSE so refetch_unfinalized
+                    # will pick it up on the next session.
+                    row_is_final = is_final_session and (as_of >= expected_date)
+                    storage.save_tech_indicators(ticker, as_of, fields, row_is_final)
+
+                    # Always write everything returned, not just the tail: the
+                    # whole point of a full download here is to (re)establish
+                    # full historical depth (new ticker, deeper-than-before
+                    # backfill, or a detected revision) -- a tail-only write
+                    # would silently defeat that.
+                    storage.save_price_history(ticker, _extract_price_rows(df, since=None))
+
+                    _valid_dates = df.dropna(subset=["Close"]).index
+                    if len(_valid_dates):
+                        _depth_updates[ticker] = _valid_dates.min().date().isoformat()
+
+                    # Convert flat fields dict → legacy nested dict for indicators.py
+                    fields["_as_of_date"] = as_of  # restore for conversion
+                    results[ticker] = tech_dict_to_legacy(fields)
+
+                except Exception as e:
+                    results[ticker] = {"error": f"Technical compute failed for {ticker}: {e}"}
+
+            storage.save_ticker_history_depth(_depth_updates)
 
     return results
 
@@ -1066,22 +1263,27 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
     expected_date = today_str if is_final_session else (
         get_last_trading_day_before_today() or today_str
     )
-    _start = (today_et - timedelta(days=3 * 365 + 10)).isoformat()
+    # Must match fetch_and_store_bulk's window -- this function re-fetches
+    # individual tickers (unfinalized/stale/missing-days) and writes to the
+    # SAME price_history/tech_indicators rows; a shorter window here would
+    # silently truncate a ticker's history back down on its next refetch.
+    _start = (today_et - timedelta(days=10 * 365 + 10)).isoformat()
     _end   = (today_et + timedelta(days=1)).isoformat()
 
     for i in range(0, len(tickers), _BATCH_SIZE):
         batch = tickers[i: i + _BATCH_SIZE]
         try:
-            raw = yf.download(
-                tickers=batch,
-                start=_start,
-                end=_end,
-                group_by="ticker",
-                auto_adjust=False,
-                threads=False,
-                progress=False,
-                session=YF_SESSION,
-            )
+            with YF_DL_LOCK:  # see yf_session.py -- concurrent downloads cross-contaminate
+                raw = yf.download(
+                    tickers=batch,
+                    start=_start,
+                    end=_end,
+                    group_by="ticker",
+                    auto_adjust=False,
+                    threads=False,
+                    progress=False,
+                    session=YF_SESSION,
+                )
         except Exception as e:
             log(f"  [tech] Re-fetch batch failed: {e}")
             continue
@@ -1089,6 +1291,7 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
         is_multi = isinstance(raw.columns, pd.MultiIndex)
         _max_dates = storage.get_price_history_max_dates(batch)
         _stored_closes = storage.get_price_history_close_at(list(_max_dates.items()))
+        _depth_updates: dict[str, str] = {}
         for ticker in batch:
             try:
                 if is_multi:
@@ -1116,5 +1319,17 @@ def _refetch_single_batch(tickers: list[str], log=print) -> None:
                     _since = (pd.Timestamp(_last_stored) - pd.Timedelta(days=10)).date().isoformat()
                 storage.save_price_history(ticker, _extract_price_rows(df, since=_since))
                 storage.mark_tech_finalized(ticker, as_of)
+
+                # Only record depth-confirmation when the FULL returned range
+                # was actually written (_since is None) -- a tail-only write
+                # doesn't establish full depth for a ticker that didn't
+                # already have it, and this always downloads the full 10y
+                # window regardless of which write path was taken.
+                if _since is None:
+                    _valid_dates = df.dropna(subset=["Close"]).index
+                    if len(_valid_dates):
+                        _depth_updates[ticker] = _valid_dates.min().date().isoformat()
             except Exception as e:
                 log(f"  [tech] Re-fetch compute error for {ticker}: {e}")
+
+        storage.save_ticker_history_depth(_depth_updates)

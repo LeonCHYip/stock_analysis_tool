@@ -18,7 +18,7 @@ import numpy as np
 import ta
 from zoneinfo import ZoneInfo
 
-from yf_session import YF_SESSION
+from yf_session import YF_SESSION, YF_DL_LOCK
 
 CST = ZoneInfo("America/Chicago")
 
@@ -33,8 +33,9 @@ def normalize_ticker(ticker: str) -> str:
         return ticker
     for suffix in ["", ".NS", ".BO"]:
         try:
-            if not yf.Ticker(ticker + suffix, session=YF_SESSION).history(period="1d").empty:
-                return ticker + suffix
+            with YF_DL_LOCK:  # see yf_session.py -- concurrent downloads cross-contaminate
+                if not yf.Ticker(ticker + suffix, session=YF_SESSION).history(period="1d").empty:
+                    return ticker + suffix
         except Exception:
             pass
     return ticker
@@ -242,7 +243,8 @@ def fetch_technical(ticker: str,
     try:
         sym   = normalize_ticker(ticker)
         stock = yf.Ticker(sym, session=YF_SESSION)
-        data  = stock.history(period="3y", interval="1d", auto_adjust=False)
+        with YF_DL_LOCK:  # see yf_session.py -- concurrent downloads cross-contaminate
+            data = stock.history(period="3y", interval="1d", auto_adjust=False)
 
         if data.empty:
             return {"error": f"No price data for {ticker}"}
@@ -271,15 +273,20 @@ def fetch_technical_bulk(tickers: list[str],
     Skips normalize_ticker — intended for scan mode (US tickers only).
     """
     try:
-        raw = yf.download(
-            tickers=tickers,
-            period="3y",
-            group_by="ticker",
-            auto_adjust=False,
-            threads=True,
-            progress=False,
-            session=YF_SESSION,
-        )
+        # threads=False + YF_DL_LOCK: concurrent price-history downloads over
+        # the shared session cross-contaminate responses (see yf_session.py).
+        # threads=True was doubly unsafe -- yfinance's own internal thread
+        # pool racing itself on the shared session.
+        with YF_DL_LOCK:
+            raw = yf.download(
+                tickers=tickers,
+                period="3y",
+                group_by="ticker",
+                auto_adjust=False,
+                threads=False,
+                progress=False,
+                session=YF_SESSION,
+            )
     except Exception as e:
         print(f"  [bulk_tech] Download failed: {e}")
         return {t: {"error": f"Bulk download failed: {e}"} for t in tickers}

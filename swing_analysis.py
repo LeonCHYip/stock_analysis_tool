@@ -33,7 +33,7 @@ import yfinance as yf
 
 import storage
 from market_calendar import et_today
-from yf_session import YF_SESSION
+from yf_session import YF_SESSION, YF_DL_LOCK
 
 MAX_HISTORY_YEARS_DEFAULT = 30
 MIN_TRADING_DAYS_REQUIRED = 30
@@ -107,14 +107,15 @@ def fetch_and_cache_swing_history(
     if not force_refresh and storage.get_swing_history_fetch_date(ticker) == today_str:
         return _rows_to_df(storage.get_swing_price_history(ticker))
 
-    raw = yf.download(
-        tickers=ticker,
-        period="max",
-        auto_adjust=True,
-        threads=False,
-        progress=False,
-        session=YF_SESSION,
-    )
+    with YF_DL_LOCK:  # see yf_session.py -- concurrent downloads cross-contaminate
+        raw = yf.download(
+            tickers=ticker,
+            period="max",
+            auto_adjust=True,
+            threads=False,
+            progress=False,
+            session=YF_SESSION,
+        )
     if raw is None or raw.empty:
         raise ValueError(f"No price data returned for {ticker!r}")
 

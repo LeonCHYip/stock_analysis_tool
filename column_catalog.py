@@ -133,6 +133,7 @@ COLUMNS = [
     # ── Fundamentals ──────────────────────────────────────────────────────────
     _c("Company Description","Fundamentals", _QS, _SC, "raw", "longBusinessSummary", "str",   "Long business description"),
     _c("Company Name",       "Fundamentals", _QS, _SC, "raw", "longName",            "str",   "Full company name"),
+    _c("Financial Currency", "Fundamentals", _QS, _SC, "raw", "financialData.financialCurrency", "str", "Currency the company's financial statements are reported in (e.g. USD, CNY, EUR). All $B/$ income-statement, cash-flow, and balance-sheet columns are converted to USD from this currency using the current FX rate (see fx_rates.py) if not already USD"),
     _c("Industry",           "Fundamentals", _QS, _SC, "raw", "industry",            "str",   "Industry classification"),
     _c("Mkt Cap ($B)",       "Fundamentals", _QS, _SC, "raw", "marketCap",           "float", "Market capitalisation in billions USD"),
     _c("Sector",             "Fundamentals", _QS, _SC, "raw", "sector",              "str",   "Sector classification"),

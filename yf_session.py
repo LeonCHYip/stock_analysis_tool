@@ -61,6 +61,22 @@ YF_SESSION = _curl_requests.Session(
     curl_options={_CurlOpt.FORBID_REUSE: 1},
 )
 
+# ── Bulk-download serialization lock ──────────────────────────────────────────
+# yfinance price-history downloads (yf.download / Ticker.history) are NOT safe
+# to run concurrently from multiple threads over this shared session:
+# responses get crossed between threads. Reproduced deterministically (3/3
+# trials): a concurrent scan download + dashboard download lost 3-4 tickers
+# per run ("No bulk data"), and in one trial DRAM (a ~98-row recent listing)
+# received a 759-row response belonging to another ticker's request.
+# Serializing the same workload with this lock: 0 failures (3/3 clean).
+#
+# Every yf.download()/history() call site for PRICE HISTORY must hold this
+# lock (technical_fetcher, swing_analysis, fx_rates, data_fetcher). The
+# quoteSummary/timeseries JSON fetches used by the fundamentals workers are
+# left unlocked -- they have always run 3-4 threads concurrently in
+# production; serializing them would multiply scan time.
+YF_DL_LOCK = threading.Lock()
+
 # ── Persistent worker pool ────────────────────────────────────────────────────
 # The session keeps one native curl handle per thread (use_thread_local_curl).
 # When a thread that used the session dies, its handle becomes garbage and is

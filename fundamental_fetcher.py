@@ -33,7 +33,7 @@ import numpy as np
 import yfinance as yf
 
 import storage
-from yf_session import YF_SESSION
+from yf_session import YF_SESSION, YF_DL_LOCK
 
 CST = ZoneInfo("America/Chicago")
 _RETRY_DELAYS = [5, 10, 20]
@@ -261,8 +261,12 @@ def _normalize(ticker: str) -> str:
         return ticker
     for suffix in ["", ".NS", ".BO"]:
         try:
-            if not yf.Ticker(ticker + suffix, session=YF_SESSION).history(period="1d").empty:
-                return ticker + suffix
+            # YF_DL_LOCK: this history() call runs inside the CONCURRENT fund
+            # worker pool -- unlocked, it can cross-contaminate with any other
+            # in-flight price-history download (see yf_session.py).
+            with YF_DL_LOCK:
+                if not yf.Ticker(ticker + suffix, session=YF_SESSION).history(period="1d").empty:
+                    return ticker + suffix
         except Exception:
             pass
     return ticker
@@ -565,6 +569,13 @@ def fetch_fundamental(ticker: str,
         total_cash           = _safe(_raw(fin_m, "totalCash"), 0)
         total_debt_spot      = _safe(_raw(fin_m, "totalDebt"), 0)
         fcf_spot             = _safe(_raw(fin_m, "freeCashflow"), 0)
+        # Currency the company's financial statements are reported in --
+        # e.g. "USD", "CNY", "EUR". Every quarterly/annual $ figure fetched
+        # via the v8 timeseries API (revenue, EPS, net income, etc. below)
+        # and the "spot" fields above (total_cash, total_debt_spot, fcf_spot,
+        # revenue_per_share) is in THIS currency, not necessarily USD --
+        # app.py converts using this at display time.
+        financial_currency   = _raw(fin_m, "financialCurrency")
 
         # ── Finviz override: use newer earnings data if available ──────────────
         fviz = storage.get_latest_earnings(ticker)
@@ -572,13 +583,21 @@ def fetch_fundamental(ticker: str,
             fviz_date    = fviz["earnings_date"]
             yahoo_q_date = q_end_date or ""
             if fviz_date > yahoo_q_date:
-                # Finviz has a more recent quarter — override q_eps and q_revenue
-                if fviz.get("eps_gaap_act") is not None:
+                # Finviz has a more recent quarter — override q_eps and q_revenue.
+                # NOTE: Finviz figures are in USD (per ADR/listed share for
+                # EPS), while the Yahoo values they replace are in the
+                # company's reporting currency. The q_*_source strings below
+                # (persisted to the DB) start with "Finviz" -- app.py's
+                # display conversion uses that prefix to know these values
+                # are ALREADY USD and must not be FX-converted again.
+                _eps_overridden = fviz.get("eps_gaap_act") is not None
+                _rev_overridden = fviz.get("rev_act_m") is not None
+                if _eps_overridden:
                     q_eps        = _safe(fviz["eps_gaap_act"])
                     q_eps_source = (
                         f"Finviz EPS GAAP Act ({fviz_date}) + computed vs Yahoo prior-year timeseries"
                     )
-                if fviz.get("rev_act_m") is not None:
+                if _rev_overridden:
                     q_revenue    = _safe(fviz["rev_act_m"]) * 1_000_000
                     q_rev_source = (
                         f"Finviz Revenue Act $M ({fviz_date}) + computed vs Yahoo prior-year timeseries"
@@ -603,18 +622,44 @@ def fetch_fundamental(ticker: str,
                             pass
                     return _safe(best)
 
+                # Currency guard: Finviz figures are USD; the Yahoo timeseries
+                # denominator is in the company's reporting currency. For a
+                # non-USD reporter, comparing them raw produces nonsense YoY
+                # (observed: TSM ~-95% "decline" = $39B USD vs NT$889B TWD).
+                _is_foreign = bool(financial_currency) and financial_currency != "USD"
+                _fx_rate = storage.get_fx_rates().get(financial_currency) if _is_foreign else None
+
                 prior_rev = _closest_ts_value(q_rev_ts, target_prior)
+                if _is_foreign and _rev_overridden and prior_rev is not None:
+                    # Numerator (q_revenue) is Finviz USD; convert the
+                    # local-currency prior-year denominator to USD too.
+                    # Revenue is company-wide (no per-share basis), so FX
+                    # alone fully reconciles it. Only when the override
+                    # actually fired -- otherwise q_revenue is still Yahoo
+                    # local-currency and converting the denominator would
+                    # corrupt the YoY in the opposite direction.
+                    prior_rev = prior_rev * _fx_rate if _fx_rate is not None else None
                 if q_revenue and prior_rev and prior_rev != 0:
                     q_rev_yoy    = round((q_revenue - prior_rev) / abs(prior_rev) * 100, 2)
                 else:
+                    q_rev_yoy    = None
                     q_rev_source = q_rev_source.replace(
                         "+ computed vs Yahoo prior-year timeseries", "— YoY unavailable"
                     )
 
                 prior_eps = _closest_ts_value(q_eps_ts, target_prior)
+                if _is_foreign and _eps_overridden:
+                    # EPS is per-share: Finviz reports USD per ADR/listed
+                    # share, Yahoo timeseries reports local currency per
+                    # ORDINARY share. Without the ADR conversion ratio
+                    # (e.g. 1 TSM ADR = 5 ordinary shares) these cannot be
+                    # reconciled by FX alone -- mark unavailable instead of
+                    # computing a structurally wrong number.
+                    prior_eps = None
                 if q_eps is not None and prior_eps and prior_eps != 0:
                     q_eps_yoy    = round((q_eps - prior_eps) / abs(prior_eps) * 100, 2)
                 else:
+                    q_eps_yoy    = None
                     q_eps_source = q_eps_source.replace(
                         "+ computed vs Yahoo prior-year timeseries", "— YoY unavailable"
                     )
@@ -722,6 +767,7 @@ def fetch_fundamental(ticker: str,
             "total_cash":            total_cash,
             "total_debt_spot":       total_debt_spot,
             "fcf_spot":              fcf_spot,
+            "financial_currency":    financial_currency,
             # Income statement Q+A
             "q_gross_profit":        q_gross_profit,
             "a_gross_profit":        a_gross_profit,
@@ -820,6 +866,7 @@ def fetch_fundamental(ticker: str,
             "total_cash":            total_cash,
             "total_debt_spot":       total_debt_spot,
             "fcf_spot":              fcf_spot,
+            "financial_currency":    financial_currency,
             # Income statement
             "q_gross_profit":        q_gross_profit,
             "a_gross_profit":        a_gross_profit,

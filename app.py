@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import resource
+import subprocess
 import threading
 import concurrent.futures
 import time
@@ -130,6 +131,8 @@ import vpn_switcher
 from yf_session import get_fund_pool, close_thread_curl
 from indicators    import evaluate_all, score_indicators
 import storage
+import fx_rates
+import fx_display
 import trigger_engine
 from trigger_engine import (
     TRIG_FIELD_OPTIONS, TRIG_FIELD_DISPLAY, TRIG_OP_OPTIONS,
@@ -227,6 +230,7 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     ],
     "Fundamentals": [
         "Mkt Cap ($B)", "Sector", "Industry", "Company Name", "Company Description",
+        "Financial Currency",
     ],
     "Earnings Detail": [
         "Next Earnings Date", "Next Earnings Time",
@@ -569,7 +573,7 @@ _COL_FILTER_TEXT_CAT: dict[str, list[str]] = {
     ],
 }
 # Free-text contains-match columns (case-insensitive substring)
-_COL_FILTER_TEXT_SEARCH: set[str] = {"Industry", "Company Name"}
+_COL_FILTER_TEXT_SEARCH: set[str] = {"Industry", "Company Name", "Financial Currency"}
 _COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnings Date", "Short Interest Date", "Next Earnings Date", "Swing High Date", "Swing Low Date"}
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
 # All user-filterable value columns (ordered, deduplicated)
@@ -609,92 +613,109 @@ except Exception as _init_err:
 # ─────────────────────────────────────────────────────────────────────────────
 # Process-level startup tasks
 #
-# Previously guarded by st.session_state, which resets on every browser
-# reconnect.  Each reconnect spawned duplicate daemon threads AND ran
-# mark_old_tech_finalized() in the main Streamlit thread — which blocked on
-# _db_lock held by those daemon threads, preventing WebSocket heartbeats and
-# causing cascading "connection error" → reconnect → repeat cycles.
+# Previously guarded by a module-level dict + Lock intended to make each task
+# run "exactly once per Python process" -- but that guard didn't actually
+# work: the dict literal re-executes on every Streamlit rerun (each rerun
+# gets a fresh module namespace), so the "already ran" flags reset every
+# time. Confirmed via scan_debug.log: these threads were firing on ~every
+# rerun (990+ times), not once per process.
 #
-# Fix: guard with a module-level dict + Lock so each task runs exactly once
-# per Python process regardless of how many sessions connect or reconnect.
-# All DuckDB work moves into daemon threads so the main thread never blocks.
+# Fix: real persistent loop threads (while True: do_work(); sleep(interval)),
+# started once via a threading.enumerate() name-check -- the same guard the
+# heartbeat thread already uses successfully (process-level, unaffected by
+# module namespace resets). A guard swap alone isn't enough since these were
+# one-shot functions that exit after running; only converting them into
+# actual loops stops a fresh one from spawning on the very next rerun.
 # ─────────────────────────────────────────────────────────────────────────────
-_PROC_STARTUP_LOCK = threading.Lock()
-_PROC_STARTUP: dict = {
-    "finalized":  False,
-    "earnings":   False,
-    "post_earns": False,
-    "stale":      {"count": 0, "target": ""},
-}
+_STARTUP_TASK_POLL_SECS = 3600  # 1 hour -- shared re-check interval
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Process-level scan state — survives browser reconnects / session resets.
-# When a session disconnects and reconnects, the new session syncs from here
-# instead of seeing an empty state, which would leave the old scan running
-# headless alongside any newly launched scan.
-# ─────────────────────────────────────────────────────────────────────────────
-_PROC_SCAN_LOCK = threading.Lock()
-_PROC_SCAN: dict | None = None   # None = no scan running
+# Cross-rerun shared state (running-scan registry + stale-banner counts)
+# lives in scan_state.py -- a module defined THERE precisely because
+# imported modules survive Streamlit's per-rerun namespace recreation,
+# while anything defined here resets on every rerun. See scan_state.py's
+# docstring for the full history (progress bar invisible for auto-scans,
+# stop/overlap guards silently ineffective across executions).
+import scan_state as _scan_state
 
-with _PROC_STARTUP_LOCK:
-    if not _PROC_STARTUP["finalized"]:
-        _PROC_STARTUP["finalized"] = True
-        def _finalize_bg():
-            try:
-                storage.mark_old_tech_finalized()
-            except Exception as _e:
-                print(f"[startup] mark_old_tech_finalized failed: {_e}")
-        threading.Thread(target=_finalize_bg, daemon=True, name="startup-finalize").start()
 
-    if not _PROC_STARTUP["stale"]["target"]:
-        def _stale_check_bg():
-            try:
-                from market_calendar import get_last_trading_day_before_today, nyse_close_passed_today as _nyse_closed, et_today as _et_today
-                _target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
-                if _target:
-                    _count = len(storage.get_tickers_with_stale_tech(_target))
-                    with _PROC_STARTUP_LOCK:
-                        _PROC_STARTUP["stale"]["count"] = _count
-                        _PROC_STARTUP["stale"]["target"] = _target
-            except Exception as _e:
-                print(f"[startup] stale check failed: {_e}")
-        threading.Thread(target=_stale_check_bg, daemon=True, name="startup-stale-check").start()
+def _finalize_loop() -> None:
+    while True:
+        try:
+            storage.mark_old_tech_finalized()
+        except Exception as _e:
+            print(f"[startup] mark_old_tech_finalized failed: {_e}")
+        time.sleep(_STARTUP_TASK_POLL_SECS)
 
-    if not _PROC_STARTUP["earnings"]:
-        _PROC_STARTUP["earnings"] = True
-        def _earnings_bg():
-            try:
-                _slog(f"[earnings] THREAD START  name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
-                from earnings_fetcher import run_daily_fetch as _earnings_daily
-                from storage import get_latest_earnings_date as _get_latest_earnings_date
-                _since = _get_latest_earnings_date()
-                if _since:
-                    print(f"[earnings] Latest earnings date in DB: {_since} — fetching from there")
-                    _earnings_daily(since_date=_since)
-                else:
-                    _earnings_daily(lookback_days=7)
-                _slog(f"[earnings] THREAD DONE   name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
-            except Exception as _e:
-                print(f"[earnings] Daily fetch failed: {_e}")
-        threading.Thread(target=_earnings_bg, daemon=True, name="earnings-daily").start()
 
-    if not _PROC_STARTUP["post_earns"]:
-        _PROC_STARTUP["post_earns"] = True
-        def _post_earns_bg():
-            try:
-                _slog(f"[post-earns] THREAD START  name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
-                from earnings_fetcher import update_post_earns_columns as _update_post_earns, backfill_extended_columns as _backfill_earns
-                _update_post_earns()
-                _backfill_earns()
-                _slog(f"[post-earns] THREAD DONE   name={threading.current_thread().name}  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
-            except Exception as _e:
-                print(f"[post-earns] Update failed: {_e}")
-        threading.Thread(target=_post_earns_bg, daemon=True, name="post-earns-update").start()
+def _refresh_stale_count() -> None:
+    """Recompute the stale-ticker banner count/target. Called by the hourly
+    loop below AND directly after any scan completes (_start_scan_thread's
+    _scan_entry), so the banner reflects reality promptly instead of
+    potentially showing a stale count for up to an hour after a scan fixes
+    it."""
+    try:
+        from market_calendar import get_last_trading_day_before_today, nyse_close_passed_today as _nyse_closed, et_today as _et_today
+        _target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
+        if _target:
+            _count = len(storage.get_tickers_with_stale_tech(_target))
+            with _scan_state.PROC_SCAN_LOCK:
+                _scan_state.STARTUP["stale"]["count"] = _count
+                _scan_state.STARTUP["stale"]["target"] = _target
+    except Exception as _e:
+        print(f"[startup] stale check failed: {_e}")
+
+
+def _stale_check_loop() -> None:
+    while True:
+        _refresh_stale_count()
+        time.sleep(_STARTUP_TASK_POLL_SECS)
+
+
+def _earnings_loop() -> None:
+    while True:
+        try:
+            _slog(f"[earnings] CHECK START  {_res_str()}")
+            from earnings_fetcher import run_daily_fetch as _earnings_daily
+            from storage import get_latest_earnings_date as _get_latest_earnings_date
+            _since = _get_latest_earnings_date()
+            if _since:
+                print(f"[earnings] Latest earnings date in DB: {_since} — fetching from there")
+                _earnings_daily(since_date=_since)
+            else:
+                _earnings_daily(lookback_days=7)
+            _slog(f"[earnings] CHECK DONE  {_res_str()}")
+        except Exception as _e:
+            print(f"[earnings] Daily fetch failed: {_e}")
+        time.sleep(_STARTUP_TASK_POLL_SECS)
+
+
+def _post_earns_loop() -> None:
+    while True:
+        try:
+            _slog(f"[post-earns] CHECK START  {_res_str()}")
+            from earnings_fetcher import update_post_earns_columns as _update_post_earns, backfill_extended_columns as _backfill_earns
+            _update_post_earns()
+            _backfill_earns()
+            _slog(f"[post-earns] CHECK DONE  {_res_str()}")
+        except Exception as _e:
+            print(f"[post-earns] Update failed: {_e}")
+        time.sleep(_STARTUP_TASK_POLL_SECS)
+
+
+for _name, _target_fn in [
+    ("startup-finalize",    _finalize_loop),
+    ("startup-stale-check", _stale_check_loop),
+    ("earnings-daily",      _earnings_loop),
+    ("post-earns-update",   _post_earns_loop),
+]:
+    if not any(t.name == _name for t in threading.enumerate()):
+        _slog(f"[startup] LOOP START  name={_name}")
+        threading.Thread(target=_target_fn, daemon=True, name=_name).start()
 
 # Sync stale count into session_state on every rerun so the banner updates
 # once the background stale-check thread finishes.
-st.session_state["_stale_count"]       = _PROC_STARTUP["stale"]["count"]
-st.session_state["_stale_target_date"] = _PROC_STARTUP["stale"]["target"]
+st.session_state["_stale_count"]       = _scan_state.STARTUP["stale"]["count"]
+st.session_state["_stale_target_date"] = _scan_state.STARTUP["stale"]["target"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state init
@@ -714,8 +735,8 @@ _ss("scan_progress",          {})
 
 # Adopt any scan running from a prior session so a browser reconnect does not
 # orphan the background thread (and so a new "Run Scan" properly stops it).
-with _PROC_SCAN_LOCK:
-    _active_scan = _PROC_SCAN
+with _scan_state.PROC_SCAN_LOCK:
+    _active_scan = _scan_state.PROC_SCAN
 if _active_scan is not None:
     _prog = _active_scan.get("progress", {})
     if not _prog.get("finished"):
@@ -960,6 +981,45 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         v = info.get("earningsDate") or info.get("earningsTimestamp")
         return _earnings_ts_to_date_time(v)
 
+    # ── Currency conversion helpers ───────────────────────────────────────────
+    # Yahoo reports financial-statement figures (quarterly/annual revenue,
+    # EPS, net income, etc. plus the "spot" balance-sheet fields) in the
+    # COMPANY'S reporting currency (financial_currency), not necessarily USD.
+    # EXCEPTION: when the Finviz override fired at fetch time (a fresher
+    # quarter than Yahoo's), q_revenue/q_eps hold Finviz figures which are
+    # ALREADY USD -- the persisted q_rev_source/q_eps_source strings start
+    # with "Finviz" exactly when that happened, so conversion must be
+    # skipped for those two fields in that case (converting again produced
+    # e.g. TSM Q Revenue $39.4B -> "1.24" by applying the TWD rate to an
+    # already-USD number).
+    # The actual conversion + source-data sanity logic lives in fx_display.py
+    # so it is directly unit-testable -- these are thin closures over this
+    # row's currency/market-cap context.
+    _fin_currency = f_db.get("financial_currency")
+    _fx_cache = storage.get_fx_rates()
+    _q_rev_is_usd = str(f_db.get("q_rev_source") or "").startswith("Finviz")
+    _q_eps_is_usd = str(f_db.get("q_eps_source") or "").startswith("Finviz")
+    _mkt_cap_usd = _f(row.get("market_cap") or f_db.get("market_cap"))
+
+    def _to_usd(v):  # local-currency raw value -> USD raw value
+        return fx_display.to_usd(v, _fin_currency, _fx_cache)
+
+    def _flow_pair(q_raw, a_raw, q_already_usd=False):
+        """USD-convert a quarterly/annual flow pair with the unit-corruption
+        guard (see fx_display.flow_pair_usd). Returns (q_usd, a_usd,
+        q_blanked, a_blanked)."""
+        return fx_display.flow_pair_usd(q_raw, a_raw, _fin_currency, _fx_cache,
+                                        _mkt_cap_usd, q_already_usd=q_already_usd)
+
+    # Revenue pair computed once here because it feeds BOTH the raw
+    # "Q Rev"/"A Rev" columns (in the dict below) and the "($B)" columns
+    # (further down) -- one source of truth, identically guarded.
+    _rev_q_usd, _rev_a_usd, _rev_q_bad, _rev_a_bad = _flow_pair(
+        f_db.get("q_revenue") if f_db.get("q_revenue") is not None else f1.get("Q Revenue"),
+        f_db.get("a_revenue") if f_db.get("a_revenue") is not None else f2.get("Annual Revenue"),
+        q_already_usd=_q_rev_is_usd,
+    )
+
     rec = {
         "Ticker":              ticker,
         "Datetime":            row.get("analysis_datetime") or "",
@@ -1001,17 +1061,23 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "# Dn≥5%":        tc.get("big_dn_5p_count_90d"),
         "# Up≥10%":       t4.get("Big Up Days Count"),
         "# Dn≥10%":       t4.get("Big Down Days Count"),
-        # F1/F3 — quarterly (float)
-        "Q Rev":          _f(f1.get("Q Revenue") or f_db.get("q_revenue")),
-        "Q EPS":          _f(f1.get("Q EPS") or f_db.get("q_eps")),
+        # F1/F3 — quarterly (float). Displayed in USD via the guarded
+        # revenue pair computed above (currency-converted unless Finviz
+        # already supplied USD; unit-corrupted values blanked).
+        "Q Rev":          _rev_q_usd,
+        "Q EPS":          _f(f1.get("Q EPS") or f_db.get("q_eps")) if _q_eps_is_usd
+                          else _to_usd(f1.get("Q EPS") or f_db.get("q_eps")),
         "Q End Date":     f_db.get("q_end_date") or "N/A",
-        "Q Rev YoY%":     _f(f3.get("Q Revenue YoY %") or f_db.get("q_rev_yoy")),
+        # YoY blanked when the underlying quarterly/annual value was
+        # unit-corrupted -- the YoY was computed from the same bad series.
+        "Q Rev YoY%":     None if _rev_q_bad else _f(f3.get("Q Revenue YoY %") or f_db.get("q_rev_yoy")),
         "Q EPS YoY%":     _f(f3.get("Q EPS YoY %") or f_db.get("q_eps_yoy")),
-        # F2/F4 — annual (float)
-        "A Rev":          _f(f2.get("Annual Revenue") or f_db.get("a_revenue")),
-        "A EPS":          _f(f2.get("Annual EPS") or f_db.get("a_eps")),
+        # F2/F4 — annual (float). Annual figures never get the Finviz
+        # override, so they are always local currency -> always converted.
+        "A Rev":          _rev_a_usd,
+        "A EPS":          _to_usd(f2.get("Annual EPS") or f_db.get("a_eps")),
         "A End Date":     f_db.get("a_end_date") or "N/A",
-        "A Rev YoY%":     _f(f4.get("Annual Revenue YoY %") or f_db.get("a_rev_yoy")),
+        "A Rev YoY%":     None if _rev_a_bad else _f(f4.get("Annual Revenue YoY %") or f_db.get("a_rev_yoy")),
         "A EPS YoY%":     _f(f4.get("Annual EPS YoY %") or f_db.get("a_eps_yoy")),
         # F5/F6 — valuation vs peers (float)
         "Fwd PE":         _f(f5.get("Ticker Fwd PE") or f_db.get("forward_pe")),
@@ -1292,6 +1358,20 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         f = _f(v)
         return round(f / 1e9, 2) if f is not None else None
 
+    # _fin_currency / _fx_cache / _to_usd are defined near the top of this
+    # function (before the main rec dict, which also needs them for the raw
+    # Q Rev / A Rev / Q EPS / A EPS columns). A spot conversion using the
+    # current rate, not a historical period-specific rate -- adequate for
+    # screening, not accounting-grade precision. market_cap is NOT
+    # converted: it's (USD share price) x shares for any US-exchange-listed
+    # ticker, already USD regardless of financial_currency.
+    def _b_fx(v):  # local-currency raw value -> USD $B
+        return _b(_to_usd(v))
+
+    def _f_fx(v):  # local-currency raw per-share/EPS value -> USD $
+        return _to_usd(v)
+
+    rec["Financial Currency"]     = _fin_currency or "N/A"
     rec["Beta"]                   = _f(f_db.get("beta"))
     rec["Trailing PE"]            = _f(f_db.get("trailing_pe"))
     rec["Trailing EPS"]           = _f(f_db.get("trailing_eps"))
@@ -1303,19 +1383,31 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     rec["Div Rate"]               = _f(f_db.get("dividend_rate"))
     rec["Payout Ratio%"]          = round(_f(f_db.get("payout_ratio")) * 100, 4) \
                                     if f_db.get("payout_ratio") else None
-    rec["Enterprise Value ($B)"]  = _b(f_db.get("enterprise_value"))
+    # Enterprise Value is recomputed from already-USD-converted components
+    # rather than converting Yahoo's raw enterpriseValue: Yahoo's own figure
+    # is itself already a mixed-currency number for foreign tickers (USD
+    # market cap + local-currency debt - local-currency cash), so applying a
+    # single FX rate to the whole thing would incorrectly also rescale the
+    # already-USD market-cap portion.
+    _mkt_cap_for_ev = _f(row.get("market_cap") or f_db.get("market_cap"))
+    _debt_usd = _to_usd(f_db.get("total_debt_spot"))
+    _cash_usd = _to_usd(f_db.get("total_cash"))
+    if _mkt_cap_for_ev is not None and _debt_usd is not None and _cash_usd is not None:
+        rec["Enterprise Value ($B)"] = round((_mkt_cap_for_ev + _debt_usd - _cash_usd) / 1e9, 2)
+    else:
+        rec["Enterprise Value ($B)"] = None
     rec["EV/EBITDA"]              = _f(f_db.get("ev_to_ebitda"))
     rec["EV/Revenue"]             = _f(f_db.get("ev_to_revenue"))
-    rec["Revenue/Share"]          = _f(f_db.get("revenue_per_share"))
-    rec["Cash/Share"]             = _f(f_db.get("total_cash_per_share"))
-    rec["Book Value/Share"]       = _f(f_db.get("book_value_per_share"))
+    rec["Revenue/Share"]          = _f_fx(f_db.get("revenue_per_share"))
+    rec["Cash/Share"]             = _f_fx(f_db.get("total_cash_per_share"))
+    rec["Book Value/Share"]       = _f_fx(f_db.get("book_value_per_share"))
     rec["Insiders%"]              = round(_f(f_db.get("held_pct_insiders")) * 100, 4) \
                                     if f_db.get("held_pct_insiders") else None
     rec["Institutions%"]          = round(_f(f_db.get("held_pct_institutions")) * 100, 4) \
                                     if f_db.get("held_pct_institutions") else None
-    rec["Total Cash ($B)"]        = _b(f_db.get("total_cash"))
-    rec["Total Debt ($B)"]        = _b(f_db.get("total_debt_spot"))
-    rec["FCF Spot ($B)"]          = _b(f_db.get("fcf_spot"))
+    rec["Total Cash ($B)"]        = _b_fx(f_db.get("total_cash"))
+    rec["Total Debt ($B)"]        = _b_fx(f_db.get("total_debt_spot"))
+    rec["FCF Spot ($B)"]          = _b_fx(f_db.get("fcf_spot"))
 
     # ── Avg $Vol / Mkt Cap% ────────────────────────────────────────────────────
     mkt_cap_raw = _f(row.get("market_cap") or f_db.get("market_cap"))
@@ -1326,69 +1418,57 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     rec["Avg $Vol 50D / Mkt Cap%"] = round(avg_dvol_50 / mkt_cap_raw * 100, 4) \
                                       if avg_dvol_50 and mkt_cap_raw else None
 
-    # ── Income statement Q+A ──────────────────────────────────────────────────
-    rec["Q Revenue ($B)"]         = _b(f_db.get("q_revenue"))
-    rec["A Revenue ($B)"]         = _b(f_db.get("a_revenue"))
-    rec["Q Revenue YoY%"]         = _f(f_db.get("q_rev_yoy"))
-    rec["A Revenue YoY%"]         = _f(f_db.get("a_rev_yoy"))
-    rec["Q EPS ($)"]              = _f(f_db.get("q_eps"))
-    rec["A EPS ($)"]              = _f(f_db.get("a_eps"))
+    # ── Income statement + cash flow Q+A (flow metrics) ───────────────────────
+    # All USD-converted via the guarded pair helper: quarterly revenue/EPS
+    # skip conversion when the Finviz override already supplied USD (see
+    # _q_rev_is_usd/_q_eps_is_usd -- double-converting corrupted TSM), and
+    # unit-corrupted source values are blanked along with their YoY (Yahoo
+    # shipped CIG/CIG-C's latest quarter at exactly 1000x reality; a
+    # plausible-looking wrong number is worse than a blank).
+    rec["Q Revenue ($B)"]         = _b(_rev_q_usd)
+    rec["A Revenue ($B)"]         = _b(_rev_a_usd)
+    rec["Q Revenue YoY%"]         = None if _rev_q_bad else _f(f_db.get("q_rev_yoy"))
+    rec["A Revenue YoY%"]         = None if _rev_a_bad else _f(f_db.get("a_rev_yoy"))
+    rec["Q EPS ($)"]              = _f(f_db.get("q_eps")) if _q_eps_is_usd \
+                                    else _f_fx(f_db.get("q_eps"))
+    rec["A EPS ($)"]              = _f_fx(f_db.get("a_eps"))
     rec["Q EPS YoY%"]             = _f(f_db.get("q_eps_yoy"))
     rec["A EPS YoY%"]             = _f(f_db.get("a_eps_yoy"))
-    rec["Q Gross Profit ($B)"]    = _b(f_db.get("q_gross_profit"))
-    rec["A Gross Profit ($B)"]    = _b(f_db.get("a_gross_profit"))
-    rec["Q Gross Profit YoY%"]    = _f(f_db.get("q_gross_profit_yoy"))
-    rec["A Gross Profit YoY%"]    = _f(f_db.get("a_gross_profit_yoy"))
-    rec["Q Op Income ($B)"]       = _b(f_db.get("q_op_income"))
-    rec["A Op Income ($B)"]       = _b(f_db.get("a_op_income"))
-    rec["Q Op Income YoY%"]       = _f(f_db.get("q_op_income_yoy"))
-    rec["A Op Income YoY%"]       = _f(f_db.get("a_op_income_yoy"))
-    rec["Q Net Income ($B)"]      = _b(f_db.get("q_net_income"))
-    rec["A Net Income ($B)"]      = _b(f_db.get("a_net_income"))
-    rec["Q Net Income YoY%"]      = _f(f_db.get("q_net_income_yoy"))
-    rec["A Net Income YoY%"]      = _f(f_db.get("a_net_income_yoy"))
-    rec["Q EBITDA ($B)"]          = _b(f_db.get("q_ebitda"))
-    rec["A EBITDA ($B)"]          = _b(f_db.get("a_ebitda"))
-    rec["Q EBITDA YoY%"]          = _f(f_db.get("q_ebitda_yoy"))
-    rec["A EBITDA YoY%"]          = _f(f_db.get("a_ebitda_yoy"))
-    rec["Q R&D ($B)"]             = _b(f_db.get("q_rd"))
-    rec["A R&D ($B)"]             = _b(f_db.get("a_rd"))
-    rec["Q R&D YoY%"]             = _f(f_db.get("q_rd_yoy"))
-    rec["A R&D YoY%"]             = _f(f_db.get("a_rd_yoy"))
-
-    # ── Cash flow Q+A ─────────────────────────────────────────────────────────
-    rec["Q OCF ($B)"]             = _b(f_db.get("q_ocf"))
-    rec["A OCF ($B)"]             = _b(f_db.get("a_ocf"))
-    rec["Q OCF YoY%"]             = _f(f_db.get("q_ocf_yoy"))
-    rec["A OCF YoY%"]             = _f(f_db.get("a_ocf_yoy"))
-    rec["Q FCF ($B)"]             = _b(f_db.get("q_fcf"))
-    rec["A FCF ($B)"]             = _b(f_db.get("a_fcf"))
-    rec["Q FCF YoY%"]             = _f(f_db.get("q_fcf_yoy"))
-    rec["A FCF YoY%"]             = _f(f_db.get("a_fcf_yoy"))
-    rec["Q CapEx ($B)"]           = _b(f_db.get("q_capex"))
-    rec["A CapEx ($B)"]           = _b(f_db.get("a_capex"))
-    rec["Q CapEx YoY%"]           = _f(f_db.get("q_capex_yoy"))
-    rec["A CapEx YoY%"]           = _f(f_db.get("a_capex_yoy"))
+    for _qk, _ak, _yqk, _yak, _label in [
+        ("q_gross_profit", "a_gross_profit", "q_gross_profit_yoy", "a_gross_profit_yoy", "Gross Profit"),
+        ("q_op_income",    "a_op_income",    "q_op_income_yoy",    "a_op_income_yoy",    "Op Income"),
+        ("q_net_income",   "a_net_income",   "q_net_income_yoy",   "a_net_income_yoy",   "Net Income"),
+        ("q_ebitda",       "a_ebitda",       "q_ebitda_yoy",       "a_ebitda_yoy",       "EBITDA"),
+        ("q_rd",           "a_rd",           "q_rd_yoy",           "a_rd_yoy",           "R&D"),
+        ("q_ocf",          "a_ocf",          "q_ocf_yoy",          "a_ocf_yoy",          "OCF"),
+        ("q_fcf",          "a_fcf",          "q_fcf_yoy",          "a_fcf_yoy",          "FCF"),
+        ("q_capex",        "a_capex",        "q_capex_yoy",        "a_capex_yoy",        "CapEx"),
+    ]:
+        _qv, _av, _qbad, _abad = _flow_pair(f_db.get(_qk), f_db.get(_ak))
+        rec[f"Q {_label} ($B)"] = _b(_qv)
+        rec[f"A {_label} ($B)"] = _b(_av)
+        rec[f"Q {_label} YoY%"] = None if _qbad else _f(f_db.get(_yqk))
+        rec[f"A {_label} YoY%"] = None if _abad else _f(f_db.get(_yak))
 
     # ── Balance sheet Q+A ─────────────────────────────────────────────────────
-    rec["Q Total Debt ($B)"]      = _b(f_db.get("q_total_debt"))
-    rec["A Total Debt ($B)"]      = _b(f_db.get("a_total_debt"))
+    rec["Q Total Debt ($B)"]      = _b_fx(f_db.get("q_total_debt"))
+    rec["A Total Debt ($B)"]      = _b_fx(f_db.get("a_total_debt"))
     rec["Q Total Debt YoY%"]      = _f(f_db.get("q_total_debt_yoy"))
     rec["A Total Debt YoY%"]      = _f(f_db.get("a_total_debt_yoy"))
-    rec["Q Net Debt ($B)"]        = _b(f_db.get("q_net_debt"))
-    rec["A Net Debt ($B)"]        = _b(f_db.get("a_net_debt"))
+    rec["Q Net Debt ($B)"]        = _b_fx(f_db.get("q_net_debt"))
+    rec["A Net Debt ($B)"]        = _b_fx(f_db.get("a_net_debt"))
     rec["Q Net Debt YoY%"]        = _f(f_db.get("q_net_debt_yoy"))
     rec["A Net Debt YoY%"]        = _f(f_db.get("a_net_debt_yoy"))
-    rec["Q Cash ($B)"]            = _b(f_db.get("q_cash"))
-    rec["A Cash ($B)"]            = _b(f_db.get("a_cash"))
+    rec["Q Cash ($B)"]            = _b_fx(f_db.get("q_cash"))
+    rec["A Cash ($B)"]            = _b_fx(f_db.get("a_cash"))
     rec["Q Cash YoY%"]            = _f(f_db.get("q_cash_yoy"))
     rec["A Cash YoY%"]            = _f(f_db.get("a_cash_yoy"))
-    rec["Q Working Cap ($B)"]     = _b(f_db.get("q_working_cap"))
-    rec["A Working Cap ($B)"]     = _b(f_db.get("a_working_cap"))
+    rec["Q Working Cap ($B)"]     = _b_fx(f_db.get("q_working_cap"))
+    rec["A Working Cap ($B)"]     = _b_fx(f_db.get("a_working_cap"))
     rec["Q Working Cap YoY%"]     = _f(f_db.get("q_working_cap_yoy"))
     rec["A Working Cap YoY%"]     = _f(f_db.get("a_working_cap_yoy"))
-    rec["Q Total Assets ($B)"]    = _b(f_db.get("q_total_assets"))
-    rec["A Total Assets ($B)"]    = _b(f_db.get("a_total_assets"))
+    rec["Q Total Assets ($B)"]    = _b_fx(f_db.get("q_total_assets"))
+    rec["A Total Assets ($B)"]    = _b_fx(f_db.get("a_total_assets"))
     rec["Q Total Assets YoY%"]    = _f(f_db.get("q_total_assets_yoy"))
     rec["A Total Assets YoY%"]    = _f(f_db.get("a_total_assets_yoy"))
 
@@ -1710,12 +1790,11 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
     progress["current"]  = ""
     _slog(f"[scan] DONE  {done}/{total} tickers processed")
 
-    # Clear the module-level scan record so a reconnecting session doesn't
+    # Clear the process-level scan record so a reconnecting session doesn't
     # re-adopt a finished scan and block launching a fresh one.
-    global _PROC_SCAN
-    with _PROC_SCAN_LOCK:
-        if _PROC_SCAN is not None and _PROC_SCAN.get("stop_event") is stop_event:
-            _PROC_SCAN = None
+    with _scan_state.PROC_SCAN_LOCK:
+        if _scan_state.PROC_SCAN is not None and _scan_state.PROC_SCAN.get("stop_event") is stop_event:
+            _scan_state.PROC_SCAN = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3751,19 +3830,41 @@ def _refresh_index_dashboard() -> None:
             _slog(f"[dashboard] Refreshed {len(rows)}/{len(DASHBOARD_TICKERS)} tickers")
     except Exception as e:
         _slog(f"[dashboard] Refresh failed: {e}")
+    finally:
+        # This is a short-lived thread that touches YF_SESSION (via
+        # fetch_and_cache_swing_history's yf.download) -- without this, its
+        # thread-local curl handle leaks every time a scan is launched (see
+        # yf_session.py's module docstring). Not a crash risk on its own
+        # (Curl.__del__ is neutralized there), but an unbounded number of
+        # scans over a long-running process means an unbounded number of
+        # leaked native handles.
+        close_thread_curl()
+
+
+def _refresh_fx_rates_bg() -> None:
+    """Refresh USD conversion rates for every non-USD financial_currency
+    currently in use. Runs in its own daemon thread spawned alongside the
+    index dashboard refresh -- isolated so a failure here can never block or
+    break the actual market scan."""
+    try:
+        fx_rates.refresh_fx_rates(log=_slog)
+    except Exception as e:
+        _slog(f"[fx] Refresh failed: {e}")
+    finally:
+        close_thread_curl()  # see the matching note in _refresh_index_dashboard above
 
 
 def _start_scan_thread(ticker_list: list[str], daily_str: str | None, weekly_str: str | None,
                        fetch_peers: bool, vpn_rotate: bool) -> dict | None:
     """UI/session-state-free scan launcher. Stops any existing scan, registers
-    the new one in module-level _PROC_SCAN, and starts scan-thread. Safe to
-    call from a bare background thread (no Streamlit ScriptRunContext) as
-    well as from the main script -- never touches st.* or st.session_state.
+    the new one in scan_state.PROC_SCAN (process-level, survives reruns), and
+    starts scan-thread. Safe to call from a bare background thread (no
+    Streamlit ScriptRunContext) as well as from the main script -- never
+    touches st.* or st.session_state.
 
     Returns {"progress","pause_event","stop_event","analysis_dt","thread"},
     or None if ticker_list was empty.
     """
-    global _PROC_SCAN
     if not ticker_list:
         return None
 
@@ -3774,53 +3875,158 @@ def _start_scan_thread(ticker_list: list[str], daily_str: str | None, weekly_str
     threading.Thread(target=_refresh_index_dashboard, daemon=True,
                      name="dashboard-refresh").start()
 
+    # NOTE: FX rates are deliberately NOT refreshed here at scan start.
+    # An earlier version fired a concurrent fx-rates yf.download() thread
+    # right here, and it directly coincided with FX pairs failing
+    # (TypeError NoneType) AND the same-currency tickers' quoteSummary/
+    # timeseries fundamentals coming back empty through all retries --
+    # three yfinance request streams (tech bulk, dashboard, fx) hammering
+    # one shared session at the same instant. The post-scan refresh inside
+    # _scan_entry's finally block is the sole FX refresh point now: it runs
+    # when nothing else is in flight, and it already covers the
+    # new-currency bootstrapping case by definition (it runs after the scan
+    # that discovered the currency).
+
     analysis_dt = _now_cst()
 
     # Stop any running scan — the module-level event (which may belong to a
     # different session that has since disconnected, or a headless-launched
-    # scan with no session at all).
-    with _PROC_SCAN_LOCK:
-        if _PROC_SCAN is not None:
-            _PROC_SCAN["stop_event"].set()
-    time.sleep(0.2)
+    # scan with no session at all). Just capturing the reference here is
+    # cheap and synchronous; the actual WAIT for it to exit happens inside
+    # the new scan's own thread below (_scan_entry), not here -- this
+    # function runs inline on whatever thread called it, which for the
+    # sidebar button is the MAIN STREAMLIT SCRIPT THREAD. Blocking here
+    # would freeze the entire page (no rendering at all) until the old scan
+    # finishes; deferring the wait into the new background thread keeps this
+    # function fast while still preventing the two scans from running
+    # concurrently -- see the comment in _scan_entry for why that matters.
+    _old_scan = None
+    with _scan_state.PROC_SCAN_LOCK:
+        if _scan_state.PROC_SCAN is not None:
+            _scan_state.PROC_SCAN["stop_event"].set()
+            _old_scan = _scan_state.PROC_SCAN
 
     pause_event = threading.Event()
     stop_event  = threading.Event()
     progress    = {}
 
-    # Register at module level BEFORE starting the thread so a reconnect
+    # Register at process level BEFORE starting the thread so a reconnect
     # during the first batch can already adopt this scan.
-    with _PROC_SCAN_LOCK:
-        _PROC_SCAN = {
+    with _scan_state.PROC_SCAN_LOCK:
+        _scan_state.PROC_SCAN = {
             "progress":    progress,
             "pause_event": pause_event,
             "stop_event":  stop_event,
             "analysis_dt": analysis_dt,
+            "thread":      None,  # filled in below once the thread object exists
         }
 
     def _scan_entry():
+        # Wait for the previous scan's thread to actually exit before doing
+        # any work, so two overlapping launches run strictly sequentially
+        # instead of concurrently. This runs on the NEW scan's own
+        # background thread (not the caller's thread), so it never freezes
+        # the page even if the old scan takes a while to wind down.
+        #
+        # Why this matters: stop_event (set on _old_scan just above) is only
+        # checked once per outer BATCH iteration in scan_thread_func --
+        # fetch_and_store_bulk itself (the bulk yf.download() + per-ticker
+        # processing within a single batch) has no stop awareness at all.
+        # For a single-batch scan (the common case for a small manual
+        # re-run), setting stop_event does NOT interrupt an in-flight
+        # download. Without this join, two overlapping launches (e.g.
+        # Streamlit double-executing a script for one click -- confirmed via
+        # duplicate exec_ids in scan_debug.log for the same click) run two
+        # FULLY INDEPENDENT concurrent yf.download() calls for the same
+        # tickers, each writing to the same DB rows -- wasteful, and the
+        # suspected direct cause of tickers intermittently coming back with
+        # no tech data.
+        if _old_scan is not None:
+            _old_thread = _old_scan.get("thread")
+            if _old_thread is not None and _old_thread.is_alive():
+                _slog("[scan] Waiting for previous scan-thread to exit before starting…")
+                _old_thread.join(timeout=180)
+                if _old_thread.is_alive():
+                    _slog("[scan] Previous scan-thread still alive after 180s wait — proceeding anyway")
+        # Prevent macOS idle sleep for the duration of this scan. Suspected
+        # cause of a scan "starting but pausing" (2026-08-24): while the Mac
+        # is actually asleep, NO Python code runs at all -- not just network
+        # I/O, everything freezes, including the heartbeat and every timer
+        # in this process -- so no in-process timeout can detect or recover
+        # from it. `caffeinate -i` blocks idle sleep (not display sleep) for
+        # exactly as long as this subprocess lives; explicitly terminated in
+        # the finally block below so the Mac is free to sleep again the
+        # instant the scan ends. Silently skipped on non-Mac (caffeinate
+        # missing) or if spawning it fails for any reason -- never blocks
+        # the scan itself.
+        #
+        # Known limitation this does NOT cover: macOS "clamshell sleep"
+        # (lid closed while unplugged, or lid closed with no external
+        # display even on AC power) is enforced by the hardware/firmware
+        # and cannot be blocked by ANY software assertion, caffeinate
+        # included. Keep the lid open (or an external display connected)
+        # for the 4:30pm ET auto-scan window if this recurs.
+        _caffeinate = None
+        try:
+            _caffeinate = subprocess.Popen(
+                ["caffeinate", "-i"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            _slog(f"[scan] caffeinate unavailable, sleep not blocked: {e}")
+
         try:
             scan_thread_func(ticker_list, analysis_dt, daily_str, weekly_str,
                              pause_event, stop_event, progress, fetch_peers, vpn_rotate)
         except Exception:
             _slog(f"[scan] scan-thread crashed: {traceback.format_exc()}")
         finally:
+            if _caffeinate is not None:
+                try:
+                    _caffeinate.terminate()
+                except Exception:
+                    pass
             # Always release this thread's curl handle, even if the scan
             # raised — a dead thread's handle aborts the process when GC'd.
             close_thread_curl()
-            # Safety net: scan_thread_func already clears _PROC_SCAN on its
-            # own happy-path completion (matching stop_event identity so it
-            # never clobbers a newer scan's registration). If it raised
-            # before reaching that point, this ensures _PROC_SCAN still gets
+            # Refresh the stale-ticker banner right after any scan (manual or
+            # scheduled) finishes, instead of waiting for the next hourly
+            # background check -- avoids the banner showing a stale count for
+            # up to an hour right after a scan that actually fixed it.
+            _refresh_stale_count()
+            # Refresh FX rates AGAIN after the scan completes, not just at
+            # scan start (see the call in _start_scan_thread above). The
+            # scan-start refresh only knows about currencies already in the
+            # DB *before* this scan ran -- if this scan is the first time a
+            # ticker in a brand-new currency gets scanned, that currency's
+            # rate wouldn't exist yet, and every $ column for that ticker
+            # would show None instead of a converted value until some LATER
+            # scan happened to refresh rates again. Re-running here closes
+            # that gap: by the time results are actually viewed, any
+            # currency this scan just discovered already has a rate cached.
+            try:
+                fx_rates.refresh_fx_rates(log=_slog)
+            except Exception as e:
+                _slog(f"[fx] Post-scan refresh failed: {e}")
+            # Safety net: scan_thread_func already clears scan_state.PROC_SCAN
+            # on its own happy-path completion (matching stop_event identity
+            # so it never clobbers a newer scan's registration). If it raised
+            # before reaching that point, this ensures PROC_SCAN still gets
             # cleared -- otherwise it would stay stuck non-None forever,
             # silently blocking every future scan (manual or scheduled)
             # behind the "already running" guard. No-op if already cleared.
-            global _PROC_SCAN
-            with _PROC_SCAN_LOCK:
-                if _PROC_SCAN is not None and _PROC_SCAN.get("stop_event") is stop_event:
-                    _PROC_SCAN = None
+            with _scan_state.PROC_SCAN_LOCK:
+                if _scan_state.PROC_SCAN is not None and _scan_state.PROC_SCAN.get("stop_event") is stop_event:
+                    _scan_state.PROC_SCAN = None
 
     t = threading.Thread(target=_scan_entry, daemon=True, name="scan-thread")
+    # Store the thread object in scan_state.PROC_SCAN (matched by stop_event
+    # identity, same guard used elsewhere) so a LATER overlapping
+    # _start_scan_thread call can join() this one before starting its own
+    # scan, instead of running concurrently with it.
+    with _scan_state.PROC_SCAN_LOCK:
+        if _scan_state.PROC_SCAN is not None and _scan_state.PROC_SCAN.get("stop_event") is stop_event:
+            _scan_state.PROC_SCAN["thread"] = t
     t.start()
     return {"progress": progress, "pause_event": pause_event, "stop_event": stop_event,
             "analysis_dt": analysis_dt, "thread": t}
@@ -3836,8 +4042,8 @@ def _launch_scan(ticker_list: list[str], label: str) -> None:
     vpn_rotate  = st.session_state.get("vpn_rotate",  False)
 
     # Also stop this session's own previously-tracked scan (covers the case
-    # where st.session_state's copy has drifted from module-level _PROC_SCAN,
-    # e.g. after a reconnect) -- _start_scan_thread only stops via _PROC_SCAN.
+    # where st.session_state's copy has drifted from scan_state.PROC_SCAN,
+    # e.g. after a reconnect) -- _start_scan_thread only stops via PROC_SCAN.
     if st.session_state.scan_stop_event:
         st.session_state.scan_stop_event.set()
 
@@ -3885,8 +4091,8 @@ def _auto_scan_poll() -> None:
     if not prefs.get("auto_scan_enabled", True):
         return                                   # toggle off
 
-    with _PROC_SCAN_LOCK:
-        if _PROC_SCAN is not None:
+    with _scan_state.PROC_SCAN_LOCK:
+        if _scan_state.PROC_SCAN is not None:
             return                                # a scan (scheduled or manual) is already running -- never overlap
 
     from market_calendar import now_et, get_trading_days

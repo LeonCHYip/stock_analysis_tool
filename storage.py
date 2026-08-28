@@ -399,14 +399,32 @@ CREATE TABLE IF NOT EXISTS earnings_fetch_log (
 
 _DDL_PRICE_HISTORY = """
 CREATE TABLE IF NOT EXISTS price_history (
-    ticker  TEXT   NOT NULL,
-    date    DATE   NOT NULL,
-    open    DOUBLE,
-    high    DOUBLE,
-    low     DOUBLE,
-    close   DOUBLE,
-    volume  BIGINT,
+    ticker     TEXT   NOT NULL,
+    date       DATE   NOT NULL,
+    open       DOUBLE,
+    high       DOUBLE,
+    low        DOUBLE,
+    close      DOUBLE,
+    adj_close  DOUBLE,
+    volume     BIGINT,
     PRIMARY KEY (ticker, date)
+);
+"""
+
+# One row per ticker once a full-window (10y) technical download has
+# completed successfully. Presence in this table -- not an absolute date
+# threshold -- is what fetch_and_store_bulk's fast (incremental-download)
+# path checks before trusting a ticker's stored price_history depth; a
+# threshold like "history spans >= 9y" would permanently trap recently
+# listed tickers that will never have that much data. earliest_date is the
+# oldest date Yahoo actually returned for that ticker (may be far short of
+# the requested 10y window for young tickers -- that's fine, it just means
+# "this is everything Yahoo has").
+_DDL_TICKER_HISTORY_DEPTH = """
+CREATE TABLE IF NOT EXISTS ticker_history_depth (
+    ticker         TEXT PRIMARY KEY,
+    earliest_date  DATE,
+    updated_at     TIMESTAMP
 );
 """
 
@@ -533,6 +551,20 @@ CREATE TABLE IF NOT EXISTS index_dashboard (
 # today). Refreshed by a background thread spawned from _launch_scan() on
 # every market scan (selected tickers or all tickers) -- see app.py.
 
+_DDL_FX_RATES = """
+CREATE TABLE IF NOT EXISTS fx_rates (
+    currency     TEXT PRIMARY KEY,
+    rate_to_usd  DOUBLE,
+    updated_at   TIMESTAMP NOT NULL
+);
+"""
+# rate_to_usd is always normalized so "local amount * rate_to_usd = USD
+# amount" regardless of how Yahoo's own "{CUR}=X" quote happens to be
+# oriented for that currency -- see fx_rates.py. One row per currency
+# actually in use across fundamentals.financial_currency, full-refreshed
+# (not per-row staleness-checked) by a background thread spawned alongside
+# the index dashboard refresh -- see app.py's _start_scan_thread.
+
 _DDL_TRIGGER_CACHE = """
 CREATE TABLE IF NOT EXISTS trigger_cache (
     cache_key        TEXT    NOT NULL,
@@ -613,12 +645,14 @@ def init_db() -> None:
     con.execute(_DDL_EARNINGS)
     con.execute(_DDL_EARNINGS_LOG)
     con.execute(_DDL_PRICE_HISTORY)
+    con.execute(_DDL_TICKER_HISTORY_DEPTH)
     con.execute(_DDL_SWING_PRICE_HISTORY)
     con.execute(_DDL_SWING_PRICE_HISTORY_META)
     con.execute(_DDL_BACKTEST_RUNS)
     con.execute(_DDL_BACKTEST_TRANSACTIONS)
     con.execute(_DDL_BACKTEST_DAILY_HISTORY)
     con.execute(_DDL_INDEX_DASHBOARD)
+    con.execute(_DDL_FX_RATES)
     con.execute(_DDL_TRIGGER_CACHE)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
@@ -767,6 +801,12 @@ def _migrate_add_columns(con) -> None:
         ("total_cash",          "DOUBLE"),
         ("total_debt_spot",     "DOUBLE"),
         ("fcf_spot",            "DOUBLE"),
+        # Currency the company's financial statements are reported in (e.g.
+        # "USD", "CNY", "EUR") -- every $ figure fetched via the v8 timeseries
+        # API plus the "spot" fields above is in THIS currency, not
+        # necessarily USD. See app.py's _to_usd/_b_fx for the display-time
+        # conversion using this + the fx_rates table below.
+        ("financial_currency",  "TEXT"),
         # Income statement Q+A values and YoY (Call 2 timeseries, no extra HTTP calls)
         ("q_gross_profit",      "DOUBLE"), ("a_gross_profit",      "DOUBLE"),
         ("q_gross_profit_yoy",  "DOUBLE"), ("a_gross_profit_yoy",  "DOUBLE"),
@@ -823,8 +863,9 @@ def _migrate_add_columns(con) -> None:
         if col not in existing_earn:
             con.execute(f"ALTER TABLE earnings_history ADD COLUMN {col} {dtype}")
 
-    # Add OHLC columns to price_history
-    new_ph_cols = [("open", "DOUBLE"), ("high", "DOUBLE"), ("low", "DOUBLE")]
+    # Add OHLC(+adj_close) columns to price_history
+    new_ph_cols = [("open", "DOUBLE"), ("high", "DOUBLE"), ("low", "DOUBLE"),
+                   ("adj_close", "DOUBLE")]
     existing_ph = {row[0] for row in con.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'price_history'"
     ).fetchall()}
@@ -1868,13 +1909,23 @@ def save_price_history(ticker: str, rows: list[tuple]) -> None:
 
     Args:
         ticker: ticker symbol
-        rows: list of (date_str, open, high, low, close, volume) or (date_str, close, volume) tuples
+        rows: list of (date_str, open, high, low, close, adj_close, volume),
+            (date_str, open, high, low, close, volume) [adj_close defaults
+            NULL], or legacy (date_str, close, volume) tuples
     """
     if not rows:
         return
     con = _conn()
-    if len(rows[0]) >= 6:
-        # Full OHLCV: (date, open, high, low, close, volume)
+    if len(rows[0]) >= 7:
+        # Full OHLCV + adj_close: (date, open, high, low, close, adj_close, volume)
+        con.executemany(
+            "INSERT OR REPLACE INTO price_history "
+            "(ticker, date, open, high, low, close, adj_close, volume) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(ticker, r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in rows],
+        )
+    elif len(rows[0]) >= 6:
+        # Full OHLCV, no adj_close: (date, open, high, low, close, volume)
         con.executemany(
             "INSERT OR REPLACE INTO price_history (ticker, date, open, high, low, close, volume) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2119,6 +2170,40 @@ def get_dashboard_snapshot() -> dict[str, dict]:
     return {r[0]: {"close": r[1], "change_pct": r[2], "rsi_14": r[3], "updated_at": r[4]} for r in rows}
 
 
+def save_fx_rates(rows: list[dict]) -> None:
+    """Upsert fx_rates rows. Each dict: currency, rate_to_usd, updated_at
+    (CST datetime). rate_to_usd must already be normalized so
+    local_amount * rate_to_usd = usd_amount."""
+    if not rows:
+        return
+    con = _conn()
+    con.executemany(
+        "INSERT OR REPLACE INTO fx_rates (currency, rate_to_usd, updated_at) VALUES (?, ?, ?)",
+        [(r["currency"], r.get("rate_to_usd"), r["updated_at"]) for r in rows],
+    )
+
+
+def get_fx_rates() -> dict[str, float]:
+    """Return {currency: rate_to_usd} for all persisted currencies. Empty
+    dict if never fetched. Multiply a local-currency amount by the returned
+    rate to get USD."""
+    con = _conn()
+    rows = con.execute("SELECT currency, rate_to_usd FROM fx_rates").fetchall()
+    return {r[0]: r[1] for r in rows if r[1] is not None}
+
+
+def get_distinct_financial_currencies() -> list[str]:
+    """Return distinct non-USD, non-NULL financial_currency values currently
+    in the fundamentals table -- used by fx_rates.py to fetch exactly the
+    currencies actually in use rather than a hardcoded list."""
+    con = _conn()
+    rows = con.execute(
+        "SELECT DISTINCT financial_currency FROM fundamentals "
+        "WHERE financial_currency IS NOT NULL AND financial_currency != 'USD'"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def _pct(new_val, old_val) -> float | None:
     """Return percentage change from old_val to new_val, or None if either is missing."""
     if new_val is None or old_val is None or old_val == 0:
@@ -2164,8 +2249,7 @@ def compute_returns_for_tickers(tickers: list[str]) -> dict[str, dict]:
                 PARTITION BY ticker ORDER BY date
                 ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
             ) AS vol_5d_avg,
-            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn_desc,
-            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date ASC)  AS rn_asc
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) AS rn_desc
         FROM price_history
         WHERE ticker IN ({placeholders})
     )
@@ -2196,10 +2280,18 @@ def compute_returns_for_tickers(tickers: list[str]) -> dict[str, dict]:
         MAX(CASE WHEN rn_desc = 505 THEN volume       END) AS v_2y,
         MAX(CASE WHEN rn_desc = 505 THEN close_5d_avg END) AS c5a_2y,
         MAX(CASE WHEN rn_desc = 505 THEN vol_5d_avg   END) AS v5a_2y,
-        MAX(CASE WHEN rn_asc  = 1   THEN close        END) AS c_3y,
-        MAX(CASE WHEN rn_asc  = 1   THEN volume       END) AS v_3y,
-        MAX(CASE WHEN rn_asc  = 5   THEN close_5d_avg END) AS c5a_3y,
-        MAX(CASE WHEN rn_asc  = 5   THEN vol_5d_avg   END) AS v5a_3y
+        -- 756 trading days back (252*3), following the exact same "N+1"
+        -- convention as every other window above (e.g. 2Y = 504+1 = 505).
+        -- PREVIOUSLY this was rn_asc = 1 (the OLDEST row for the ticker in
+        -- price_history) / rn_asc = 5 -- i.e. "whatever we happen to have
+        -- the least of", not "3 years ago". That only produced a correct
+        -- "3Y" reading because price_history's fetch window used to BE
+        -- ~3 years; now that the window is 10y, rn_asc=1 would silently
+        -- become a ~10Y reading while staying labeled "3Y".
+        MAX(CASE WHEN rn_desc = 757 THEN close        END) AS c_3y,
+        MAX(CASE WHEN rn_desc = 757 THEN volume       END) AS v_3y,
+        MAX(CASE WHEN rn_desc = 757 THEN close_5d_avg END) AS c5a_3y,
+        MAX(CASE WHEN rn_desc = 757 THEN vol_5d_avg   END) AS v5a_3y
     FROM daily
     GROUP BY ticker
     """
@@ -2225,8 +2317,7 @@ def compute_returns_for_tickers(tickers: list[str]) -> dict[str, dict]:
                 PARTITION BY ticker ORDER BY week_start
                 ROWS BETWEEN 3 PRECEDING AND CURRENT ROW
             ) AS vol_4w_avg,
-            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY week_start DESC) AS wn_desc,
-            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY week_start ASC)  AS wn_asc
+            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY week_start DESC) AS wn_desc
         FROM last_of_week
     )
     SELECT ticker,
@@ -2242,8 +2333,11 @@ def compute_returns_for_tickers(tickers: list[str]) -> dict[str, dict]:
         MAX(CASE WHEN wn_desc = 52 THEN vol_4w_avg   END) AS wv4a_12m,
         MAX(CASE WHEN wn_desc = 105 THEN close_4w_avg END) AS wc4a_2y,
         MAX(CASE WHEN wn_desc = 105 THEN vol_4w_avg   END) AS wv4a_2y,
-        MAX(CASE WHEN wn_asc  = 4  THEN close_4w_avg END) AS wc4a_3y,
-        MAX(CASE WHEN wn_asc  = 4  THEN vol_4w_avg   END) AS wv4a_3y
+        -- 156 weeks back (52*3) + 1, same convention as 2Y = 104+1 = 105.
+        -- Previously wn_asc = 4 ("4th oldest week") -- same bug class as
+        -- the daily rn_asc case above, see that comment.
+        MAX(CASE WHEN wn_desc = 157 THEN close_4w_avg END) AS wc4a_3y,
+        MAX(CASE WHEN wn_desc = 157 THEN vol_4w_avg   END) AS wv4a_3y
     FROM weekly
     GROUP BY ticker
     """
@@ -2507,6 +2601,70 @@ def get_price_history_close_at(tickers_dates: list[tuple[str, str]]) -> dict[tup
         tickers + dates,
     ).fetchall()
     return {(r[0], r[1]): r[2] for r in rows}
+
+
+def get_price_history_before(tickers: list[str], before_date: str,
+                              min_date: str | None = None) -> dict[str, list[tuple]]:
+    """Return {ticker: [(date_str, open, high, low, close, adj_close, volume), ...]}
+    for price_history rows with date < before_date (and, if given,
+    date >= min_date), ordered by date ascending. Used to assemble the
+    older portion of a fast-path ticker's indicator-computation DataFrame
+    (see fetch_and_store_bulk) -- the strict '<' boundary is deliberate so
+    concatenating with a check-window download starting at before_date
+    produces no duplicate/overlapping row. One batched query per caller
+    batch, not one per ticker."""
+    if not tickers:
+        return {}
+    placeholders = ", ".join(["?" for _ in tickers])
+    params: list = list(tickers) + [before_date]
+    date_cond = "date < ?"
+    if min_date is not None:
+        date_cond += " AND date >= ?"
+        params.append(min_date)
+    con = _conn()
+    rows = con.execute(
+        f"SELECT ticker, CAST(date AS TEXT), open, high, low, close, adj_close, volume "
+        f"FROM price_history WHERE ticker IN ({placeholders}) AND {date_cond} "
+        f"ORDER BY ticker, date",
+        params,
+    ).fetchall()
+    result: dict[str, list[tuple]] = {}
+    for ticker, date_str, o, h, l, c, ac, v in rows:
+        result.setdefault(ticker, []).append((date_str, o, h, l, c, ac, v))
+    return result
+
+
+def get_ticker_history_depth(tickers: list[str]) -> dict[str, str]:
+    """Return {ticker: earliest_date_str} for tickers that have already
+    completed a full-window technical download (see ticker_history_depth
+    DDL comment). Tickers absent from the result have never completed one
+    and must take the full-download path. One batched query per caller
+    batch, not one per ticker."""
+    if not tickers:
+        return {}
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    rows = con.execute(
+        f"SELECT ticker, CAST(earliest_date AS TEXT) FROM ticker_history_depth "
+        f"WHERE ticker IN ({placeholders})",
+        tickers,
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def save_ticker_history_depth(depth_map: dict[str, str]) -> None:
+    """Batched upsert of {ticker: earliest_date_str} after a successful
+    full-window download, marking those tickers eligible for the fast
+    (incremental-download) path on subsequent scans."""
+    if not depth_map:
+        return
+    con = _conn()
+    now = datetime.now(CST).isoformat()
+    con.executemany(
+        "INSERT OR REPLACE INTO ticker_history_depth (ticker, earliest_date, updated_at) "
+        "VALUES (?, ?, ?)",
+        [(ticker, earliest, now) for ticker, earliest in depth_map.items()],
+    )
 
 
 def get_trigger_period_returns(
