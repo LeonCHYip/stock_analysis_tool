@@ -112,10 +112,10 @@ COLUMNS = [
 
     # ── Quarterly (F1/F3) ─────────────────────────────────────────────────────
     _c("Q EPS",      "Quarterly (F1/F3)", _TS, _SC, "raw",      "quarterlyBasicEPS",              "float",  "Latest quarterly GAAP EPS per share (F1.2)"),
-    _c("Q EPS YoY%", "Quarterly (F1/F3)", _TS, _SC, "computed", "quarterlyBasicEPS",              "float%", "Q EPS YoY % vs same quarter prior year (F3.2)"),
+    _c("Q EPS YoY%", "Quarterly (F1/F3)", _QS, _SC, "computed", "financialData.earningsGrowth", "float%", "Latest-quarter EPS YoY % from Yahoo financialData.earningsGrowth (F3.2); Finviz-actual-vs-prior-year-timeseries fallback only when Yahoo lacks the latest quarter"),
     _c("Q End Date", "Quarterly (F1/F3)", _QS, _SC, "raw",      "incomeStatementHistoryQuarterly","date",   "End date of the latest reported quarter"),
     _c("Q Rev",      "Quarterly (F1/F3)", _TS, _SC, "raw",      "quarterlyTotalRevenue",          "float",  "Latest quarterly total revenue $ (F1.1)"),
-    _c("Q Rev YoY%", "Quarterly (F1/F3)", _TS, _SC, "computed", "quarterlyTotalRevenue",          "float%", "Q revenue YoY % vs same quarter prior year (F3.1)"),
+    _c("Q Rev YoY%", "Quarterly (F1/F3)", _QS, _SC, "computed", "financialData.revenueGrowth", "float%", "Latest-quarter revenue YoY % from Yahoo financialData.revenueGrowth (F3.1); Finviz-actual-vs-prior-year-timeseries fallback only when Yahoo lacks the latest quarter"),
 
     # ── Annual (F2/F4) ────────────────────────────────────────────────────────
     _c("A EPS",      "Annual (F2/F4)", _TS, _SC, "raw",      "annualBasicEPS",     "float",  "Latest annual GAAP EPS per share (F2.2)"),
@@ -199,11 +199,11 @@ COLUMNS = [
     # ── Income Statement ──────────────────────────────────────────────────────
     _c("Q Revenue ($B)",      "Income Statement", _TS, _SC, "raw",      "q_revenue",                   "float",  "Latest quarterly revenue in billions (from fundamentals DB)"),
     _c("A Revenue ($B)",      "Income Statement", _TS, _SC, "raw",      "a_revenue",                   "float",  "Latest annual revenue in billions (from fundamentals DB)"),
-    _c("Q Revenue YoY%",      "Income Statement", _TS, _SC, "computed", "q_rev_yoy",                   "float%", "Quarterly revenue YoY % change"),
+    _c("Q Revenue YoY%",      "Income Statement", _QS, _SC, "computed", "financialData.revenueGrowth", "float%", "Latest-quarter revenue YoY % from Yahoo financialData.revenueGrowth (F3.1); Finviz-actual-vs-prior-year-timeseries fallback only when Yahoo lacks the latest quarter"),
     _c("A Revenue YoY%",      "Income Statement", _TS, _SC, "computed", "a_rev_yoy",                   "float%", "Annual revenue YoY % change"),
     _c("Q EPS ($)",           "Income Statement", _TS, _SC, "raw",      "q_eps",                       "float",  "Latest quarterly EPS in dollars"),
     _c("A EPS ($)",           "Income Statement", _TS, _SC, "raw",      "a_eps",                       "float",  "Latest annual EPS in dollars"),
-    _c("Q EPS YoY%",          "Income Statement", _TS, _SC, "computed", "q_eps_yoy",                   "float%", "Quarterly EPS YoY % change"),
+    _c("Q EPS YoY%",          "Income Statement", _QS, _SC, "computed", "financialData.earningsGrowth", "float%", "Latest-quarter EPS YoY % from Yahoo financialData.earningsGrowth (F3.2); Finviz-actual-vs-prior-year-timeseries fallback only when Yahoo lacks the latest quarter"),
     _c("A EPS YoY%",          "Income Statement", _TS, _SC, "computed", "a_eps_yoy",                   "float%", "Annual EPS YoY % change"),
     _c("A EBITDA ($B)",       "Income Statement", _TS, _SC, "raw",      "annualEBITDA",                "float",  "Latest annual EBITDA in billions"),
     _c("A EBITDA YoY%",       "Income Statement", _TS, _SC, "computed", "annualEBITDA",                "float%", "Annual EBITDA YoY % change"),

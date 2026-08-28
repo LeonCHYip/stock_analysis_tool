@@ -1068,10 +1068,13 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "Q EPS":          _f(f1.get("Q EPS") or f_db.get("q_eps")) if _q_eps_is_usd
                           else _to_usd(f1.get("Q EPS") or f_db.get("q_eps")),
         "Q End Date":     f_db.get("q_end_date") or "N/A",
-        # YoY blanked when the underlying quarterly/annual value was
-        # unit-corrupted -- the YoY was computed from the same bad series.
-        "Q Rev YoY%":     None if _rev_q_bad else _f(f3.get("Q Revenue YoY %") or f_db.get("q_rev_yoy")),
-        "Q EPS YoY%":     _f(f3.get("Q EPS YoY %") or f_db.get("q_eps_yoy")),
+        # YoY blanked when the underlying quarterly value was unit-corrupted --
+        # the YoY was computed from the same bad series. Both this "Q Rev YoY%"
+        # and the "Q Revenue YoY%" column (set below) resolve to the SAME DB
+        # value (q_rev_yoy) so the two group views can never disagree. "Q EPS
+        # YoY%" is intentionally NOT set here -- it is set once, canonically,
+        # below (was previously set here too and silently overwritten).
+        "Q Rev YoY%":     None if _rev_q_bad else _f(f_db.get("q_rev_yoy")),
         # F2/F4 — annual (float). Annual figures never get the Finviz
         # override, so they are always local currency -> always converted.
         "A Rev":          _rev_a_usd,
@@ -1616,10 +1619,21 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
         valid_batch   = [t for t in batch if not _is_delisted(t)]
         skipped_count = len(batch) - len(valid_batch)
         if skipped_count:
+            _skips: dict[str, str] = {}
             for t in batch:
                 if _is_delisted(t):
                     err = bulk_tech.get(t, {}).get("error", "no price data")
                     progress["failures"][t] = {"reason": err, "missing": ["all tech data"]}
+                    _skips[t] = err
+            # Record the skip so the auto-scan poll treats these as attempted
+            # today -- otherwise a batch whose bulk download returned empty
+            # (delisted OR transient throttling) has no analysis_runs row and
+            # the 5-min poll relaunches the same batch all day. See storage
+            # scan_skip_log + _auto_scan_poll.
+            try:
+                storage.save_scan_skips(_skips, datetime.now(CST).date().isoformat())
+            except Exception as _e:
+                _slog(f"[scan] save_scan_skips failed: {_e}")
             done += skipped_count
             progress["done"] = done
 
@@ -4104,13 +4118,19 @@ def _auto_scan_poll() -> None:
 
     _cutoff = datetime.now(CST).replace(hour=15, minute=30, second=0, microsecond=0)
     cutoff_str = _cutoff.strftime("%Y-%m-%d %H:%M:%S CST")   # 15:30 CST == 16:30 ET
+    # "Done" = scanned since cutoff OR skipped today (bulk download returned no
+    # data -- delisted or a transient empty batch). Without the skip union, a
+    # ticker that never gets an analysis_runs row would be relaunched every
+    # poll all day, re-hitting Yahoo. Scoped to the auto poll only; manual
+    # Run Unseen/Stale intentionally ignore scan_skip_log.
     already_done = storage.get_tickers_run_since(cutoff_str)
+    already_done |= storage.get_scan_skip_tickers(datetime.now(CST).date().isoformat())
     all_tickers  = load_ticker_list()
     ticker_list  = [t for t in all_tickers if t not in already_done]
 
     if not ticker_list:
         _slog(f"[auto-scan] SKIP  already done  {len(already_done)}/{len(all_tickers)} "
-              f"tickers scanned since {cutoff_str}")
+              f"tickers scanned/skipped since {cutoff_str}")
         return
 
     label = f"Auto scan 4:30pm ET — {len(ticker_list)} tickers ({len(already_done)} already run)"

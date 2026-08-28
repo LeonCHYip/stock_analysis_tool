@@ -578,11 +578,31 @@ def fetch_fundamental(ticker: str,
         financial_currency   = _raw(fin_m, "financialCurrency")
 
         # ── Finviz override: use newer earnings data if available ──────────────
+        # Only when Yahoo is GENUINELY a quarter behind Finviz. Freshness is
+        # judged by defaultKeyStatistics.mostRecentQuarter (mrq) -- the quarter
+        # Yahoo actually has -- NOT the v8 timeseries q_end_date, which lags mrq
+        # by up to a full quarter. Using q_end_date here made the override fire
+        # even when Yahoo already had the quarter (mrq current), whereupon its
+        # manual YoY recompute paired mismatched quarters and produced garbage
+        # (e.g. MNDY Q EPS YoY 1833.33% = (0.58-0.03)/0.03). Finviz announces
+        # ~<=90d after a quarter-end, so a >100d gap between Finviz's date and
+        # Yahoo's mrq means Finviz is a real quarter ahead; otherwise Yahoo has
+        # it and we use Yahoo's own figures/growth.
         fviz = storage.get_latest_earnings(ticker)
+        _mrq_raw  = _raw(stats_m, "mostRecentQuarter")
+        _mrq_date = None
+        if _mrq_raw is not None:
+            try:
+                _mrq_date = datetime.fromtimestamp(_mrq_raw, tz=timezone.utc).date()
+            except (TypeError, ValueError, OSError):
+                _mrq_date = None
         if fviz and fviz.get("earnings_date"):
-            fviz_date    = fviz["earnings_date"]
-            yahoo_q_date = q_end_date or ""
-            if fviz_date > yahoo_q_date:
+            fviz_date = fviz["earnings_date"]
+            _yahoo_behind = (
+                _mrq_date is None
+                or date.fromisoformat(fviz_date) > _mrq_date + timedelta(days=100)
+            )
+            if _yahoo_behind:
                 # Finviz has a more recent quarter — override q_eps and q_revenue.
                 # NOTE: Finviz figures are in USD (per ADR/listed share for
                 # EPS), while the Yahoo values they replace are in the

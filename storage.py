@@ -428,6 +428,22 @@ CREATE TABLE IF NOT EXISTS ticker_history_depth (
 );
 """
 
+# One row per (ticker, day) when a scan skipped a ticker because its bulk
+# download returned no data (delisted OR transient empty batch). The
+# auto-scan poll treats "attempted today" the same as "scanned today" for
+# idempotency, so a batch that legitimately/spuriously returns empty stops
+# re-triggering a fresh full scan every 5 minutes for the same tickers (which
+# both wasted work and re-hit Yahoo, perpetuating throttling). Not consulted
+# by manual Run Unseen/Stale buttons -- a user-initiated retry is deliberate.
+_DDL_SCAN_SKIP_LOG = """
+CREATE TABLE IF NOT EXISTS scan_skip_log (
+    ticker     TEXT NOT NULL,
+    skip_date  DATE NOT NULL,
+    reason     TEXT,
+    PRIMARY KEY (ticker, skip_date)
+);
+"""
+
 _DDL_SWING_PRICE_HISTORY = """
 CREATE TABLE IF NOT EXISTS swing_price_history (
     ticker  TEXT   NOT NULL,
@@ -646,6 +662,7 @@ def init_db() -> None:
     con.execute(_DDL_EARNINGS_LOG)
     con.execute(_DDL_PRICE_HISTORY)
     con.execute(_DDL_TICKER_HISTORY_DEPTH)
+    con.execute(_DDL_SCAN_SKIP_LOG)
     con.execute(_DDL_SWING_PRICE_HISTORY)
     con.execute(_DDL_SWING_PRICE_HISTORY_META)
     con.execute(_DDL_BACKTEST_RUNS)
@@ -2665,6 +2682,32 @@ def save_ticker_history_depth(depth_map: dict[str, str]) -> None:
         "VALUES (?, ?, ?)",
         [(ticker, earliest, now) for ticker, earliest in depth_map.items()],
     )
+
+
+def save_scan_skips(ticker_reasons: dict[str, str], skip_date: str) -> None:
+    """Batched upsert of tickers skipped during a scan (bulk download returned
+    no data) for skip_date. Lets the auto-scan poll treat them as 'attempted
+    today' so it stops relaunching a fresh scan for the same empty batch every
+    poll interval. See _DDL_SCAN_SKIP_LOG."""
+    if not ticker_reasons:
+        return
+    con = _conn()
+    con.executemany(
+        "INSERT OR REPLACE INTO scan_skip_log (ticker, skip_date, reason) VALUES (?, ?, ?)",
+        [(ticker, skip_date, reason) for ticker, reason in ticker_reasons.items()],
+    )
+
+
+def get_scan_skip_tickers(since_date: str) -> set[str]:
+    """Return tickers skipped on/after since_date. Used only by the auto-scan
+    poll's idempotency check (unioned with get_tickers_run_since) -- manual
+    Run Unseen/Stale buttons deliberately ignore this."""
+    con = _conn()
+    rows = con.execute(
+        "SELECT DISTINCT ticker FROM scan_skip_log WHERE skip_date >= ?",
+        [since_date],
+    ).fetchall()
+    return {r[0] for r in rows}
 
 
 def get_trigger_period_returns(
