@@ -806,7 +806,9 @@ def _migrate_add_columns(con) -> None:
         ("trailing_eps",        "DOUBLE"),
         ("forward_eps",         "DOUBLE"),
         ("peg_ratio",           "DOUBLE"),
-        ("trailing_peg",        "DOUBLE"),
+        # trailing_peg removed -- Yahoo has no trailingPegRatio field; pegRatio
+        # (peg_ratio, shown as "PEG Ratio") is the only PEG. Any existing DB
+        # column is left in place (harmless, unused) since ALTER can't drop it.
         ("dividend_yield",      "DOUBLE"),   # fraction (0.005 = 0.5%)
         ("dividend_rate",       "DOUBLE"),
         ("payout_ratio",        "DOUBLE"),   # fraction

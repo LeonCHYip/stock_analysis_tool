@@ -280,7 +280,7 @@ VALUE_COL_GROUPS: dict[str, list[str]] = {
     ],
     "Score": ["T Score", "F Score", "Score"],
     "Extended Valuation": [
-        "Beta", "Trailing PE", "Trailing EPS", "Forward EPS", "PEG Ratio", "Trailing PEG",
+        "Beta", "Trailing PE", "Trailing EPS", "Forward EPS", "PEG Ratio",
         "Div Yield%", "Div Rate", "Payout Ratio%",
         "Enterprise Value ($B)", "EV/EBITDA", "EV/Revenue",
         "Revenue/Share", "Cash/Share", "Book Value/Share",
@@ -688,8 +688,8 @@ def _refresh_stale_count() -> None:
     potentially showing a stale count for up to an hour after a scan fixes
     it."""
     try:
-        from market_calendar import get_last_trading_day_before_today, nyse_close_passed_today as _nyse_closed, et_today as _et_today
-        _target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
+        from market_calendar import last_completed_trading_day
+        _target = last_completed_trading_day()
         if _target:
             _count = len(storage.get_tickers_with_stale_tech(_target))
             with _scan_state.PROC_SCAN_LOCK:
@@ -1158,8 +1158,8 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "ADX14":           _f(tc.get("adx14")),
         "+DI":             _f(tc.get("plus_di")),
         "-DI":             _f(tc.get("minus_di")),
-        "RVol 20D%":       _f(tc.get("realized_vol_20d")),
-        "RVol 60D%":       _f(tc.get("realized_vol_60d")),
+        "Real Vol 20D%":   _f(tc.get("realized_vol_20d")),
+        "Real Vol 60D%":   _f(tc.get("realized_vol_60d")),
         "Max DD 63D%":     _f(tc.get("max_drawdown_63d")),
         "Max DD 252D%":    _f(tc.get("max_drawdown_252d")),
         "OBV":             _f(tc.get("obv")),
@@ -1414,7 +1414,6 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
     rec["Trailing EPS"]           = _f(f_db.get("trailing_eps"))
     rec["Forward EPS"]            = _f(f_db.get("forward_eps"))
     rec["PEG Ratio"]              = _f(f_db.get("peg_ratio"))
-    rec["Trailing PEG"]           = _f(f_db.get("trailing_peg"))
     rec["Div Yield%"]             = round(_f(f_db.get("dividend_yield")) * 100, 4) \
                                     if f_db.get("dividend_yield") else None
     rec["Div Rate"]               = _f(f_db.get("dividend_rate"))
@@ -3889,14 +3888,14 @@ def _refresh_index_dashboard() -> None:
     """
     try:
         now = datetime.now(CST)
-        # Expected most-recent completed trading day -- used to detect when the
-        # settled series is behind (Yahoo's newest daily bar still has a null
-        # close and was dropped) so we can fall back to the live quote.
-        from market_calendar import (et_today as _et_today,
-                                      nyse_close_passed_today as _nyse_closed,
-                                      get_last_trading_day_before_today)
-        _expected_latest = (_et_today().isoformat() if _nyse_closed()
-                            else (get_last_trading_day_before_today() or _et_today().isoformat()))
+        # Most-recent COMPLETED trading day -- used to detect when the settled
+        # series is behind (Yahoo's newest daily bar still has a null close and
+        # was dropped) so we can fall back to the live quote. Must be a real
+        # completed session, not just "today after 4pm" -- see
+        # last_completed_trading_day (a weekend date would spuriously fire the
+        # fallback and yield a 0% change).
+        from market_calendar import last_completed_trading_day, et_today as _et_today
+        _expected_latest = last_completed_trading_day() or _et_today().isoformat()
         rows = []
         for ticker in DASHBOARD_TICKERS:
             try:
@@ -4297,8 +4296,8 @@ if run_unseen_btn:
         _launch_scan(ticker_list, label)
 
 if run_stale_btn:
-    from market_calendar import nyse_close_passed_today as _nyse_closed, get_last_trading_day_before_today, et_today as _et_today
-    _stale_target = _et_today().isoformat() if _nyse_closed() else get_last_trading_day_before_today()
+    from market_calendar import last_completed_trading_day
+    _stale_target = last_completed_trading_day()
     if _stale_target:
         _stale_tickers = storage.get_tickers_with_stale_tech(_stale_target)
         if not _stale_tickers:
@@ -4713,9 +4712,9 @@ def render_scan_tab(tab_id: str) -> None:
         .stDataEditor [col-id="fundamental -ve"] .ag-group-value {
             white-space: pre-wrap !important;
         }
-        .stDataEditor [col-id="Sector"] { min-width: 80px; max-width: 80px; }
-        .stDataEditor [col-id="Industry"] { min-width: 36px; max-width: 36px; }
-        .stDataEditor [col-id="Mkt Cap ($B)"] { min-width: 36px; max-width: 36px; }
+        .stDataEditor [col-id="Sector"] { min-width: 48px; max-width: 48px; }
+        .stDataEditor [col-id="Industry"] { min-width: 18px; max-width: 18px; }
+        .stDataEditor [col-id="Mkt Cap ($B)"] { min-width: 25px; max-width: 25px; }
         </style>""",
         unsafe_allow_html=True,
     )

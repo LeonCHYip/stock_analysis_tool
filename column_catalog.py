@@ -189,8 +189,7 @@ COLUMNS = [
     _c("Total Cash ($B)",     "Extended Valuation", _QS, _SC, "raw", "total_cash",              "float",  "Total cash and equivalents in billions USD"),
     _c("Total Debt ($B)",     "Extended Valuation", _QS, _SC, "raw", "total_debt_spot",         "float",  "Total debt in billions USD (spot from quoteSummary)"),
     _c("Trailing EPS",        "Extended Valuation", _QS, _SC, "raw", "trailing_eps",            "float",  "Trailing 12M EPS"),
-    _c("Trailing PE",         "Extended Valuation", _QS, _SC, "raw", "trailing_pe",             "float",  "Trailing 12M P/E ratio"),
-    _c("Trailing PEG",        "Extended Valuation", _QS, _SC, "raw", "trailing_peg",            "float",  "Trailing PEG ratio"),
+    _c("Trailing PE",         "Extended Valuation", _QS, _SC, "raw", "summaryDetail.trailingPE", "float",  "Trailing 12M P/E ratio"),
 
     # ── Avg $Vol / Mkt Cap ────────────────────────────────────────────────────
     _c("Avg $Vol 20D / Mkt Cap%", "Avg $Vol / Mkt Cap", _YFD, _SC, "computed", "avg_dollar_vol_20d / market_cap", "float%", "20D avg dollar volume as % of mkt cap (liquidity proxy)"),

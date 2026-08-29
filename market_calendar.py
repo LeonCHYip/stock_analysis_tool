@@ -111,8 +111,31 @@ def nyse_close_passed_today() -> bool:
     """
     True if NYSE regular session has closed for today ET (after 4pm ET).
     Used to decide whether to set is_finalized=True for today's tech data.
+
+    NOTE: time-only -- returns True after 4pm ET even on a NON-trading day
+    (weekend/holiday). Callers that want "the latest trading day that has
+    actually closed" should use last_completed_trading_day() instead.
     """
     return datetime.now(_ET).hour >= 16
+
+
+def last_completed_trading_day() -> str | None:
+    """
+    Return the most recent NYSE trading day whose regular session has already
+    closed, as an ISO string (or None if none found in the lookback window).
+
+    Today if it is a trading day AND its 4pm ET close has passed; otherwise
+    (weekend, holiday, or intraday before close) the last trading day before
+    today. Prefer this over the
+    `et_today() if nyse_close_passed_today() else get_last_trading_day_before_today()`
+    idiom -- nyse_close_passed_today() is time-only, so that idiom overshoots
+    to a weekend/holiday date (e.g. Saturday), which mislabels the latest
+    completed session and breaks stale/freshness comparisons.
+    """
+    today = et_today()
+    if get_trading_days(today.isoformat(), today.isoformat()) and nyse_close_passed_today():
+        return today.isoformat()
+    return get_last_trading_day_before_today()
 
 
 def next_trading_day_on_or_after(d: str | date) -> str | None:

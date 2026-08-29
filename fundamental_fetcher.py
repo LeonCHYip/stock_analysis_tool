@@ -332,6 +332,13 @@ def fetch_fundamental(ticker: str,
 
         # Live fields (price-driven, always fresh)
         market_cap = _safe(_raw(price_m, "marketCap"), 0)
+        if market_cap is None:
+            # Fallback: summaryDetail.nonDilutedMarketCap when price.marketCap is
+            # absent. Verified across a broad sample the two track within ~2% for
+            # most tickers (worst observed ~10% for ADRs like TSM, where diluted
+            # vs basic share counts differ) -- a close-enough estimate is far
+            # better than no market cap at all (drives cap bucketing/filtering).
+            market_cap = _safe(_raw(qs.get("summaryDetail", {}), "nonDilutedMarketCap"), 0)
         forward_pe = _safe(_raw(stats_m, "forwardPE"),   2)
         pb_ratio   = _safe(_raw(stats_m, "priceToBook"), 2)
         sector     = profile.get("sector")   or "N/A"
@@ -547,11 +554,15 @@ def fetch_fundamental(ticker: str,
 
         # ── Extended valuation (all from existing Call 1 modules) ─────────────
         beta                 = _safe(_raw(stats_m, "beta"), 3)
-        trailing_pe          = _safe(_raw(stats_m, "trailingPE"), 2)
+        # trailingPE is in summaryDetail, NOT defaultKeyStatistics (reading it
+        # from stats_m returned None for every ticker). trailingPegRatio no
+        # longer exists in any module -- pegRatio (below, shown as "PEG Ratio")
+        # is the only PEG Yahoo provides -- so the redundant "Trailing PEG" was
+        # removed.
+        trailing_pe          = _safe(_raw(qs.get("summaryDetail", {}), "trailingPE"), 2)
         trailing_eps         = _safe(_raw(stats_m, "trailingEps"), 4)
         forward_eps_v        = _safe(_raw(stats_m, "forwardEps"), 4)
         peg_ratio            = _safe(_raw(stats_m, "pegRatio"), 3)
-        trailing_peg         = _safe(_raw(stats_m, "trailingPegRatio"), 3)
         enterprise_value     = _safe(_raw(stats_m, "enterpriseValue"), 0)
         ev_to_ebitda         = _safe(_raw(stats_m, "enterpriseToEbitda"), 3)
         ev_to_revenue        = _safe(_raw(stats_m, "enterpriseToRevenue"), 3)
@@ -758,7 +769,6 @@ def fetch_fundamental(ticker: str,
             "trailing_eps":          trailing_eps,
             "forward_eps":           forward_eps_v,
             "peg_ratio":             peg_ratio,
-            "trailing_peg":          trailing_peg,
             "dividend_yield":        dividend_yield,
             "dividend_rate":         dividend_rate,
             "payout_ratio":          payout_ratio,
@@ -857,7 +867,6 @@ def fetch_fundamental(ticker: str,
             "trailing_eps":          trailing_eps,
             "forward_eps":           forward_eps_v,
             "peg_ratio":             peg_ratio,
-            "trailing_peg":          trailing_peg,
             "dividend_yield":        dividend_yield,
             "dividend_rate":         dividend_rate,
             "payout_ratio":          payout_ratio,
