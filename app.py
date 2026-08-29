@@ -2366,10 +2366,21 @@ def render_scan_progress():
 
 @st.fragment(run_every=2)
 def _scan_progress_autorefresh():
-    """Auto-refreshes progress every 2 s without triggering a full-page rerun."""
-    prog = st.session_state.scan_progress
-    if prog:
-        render_scan_progress()
+    """Auto-refreshes progress every 2 s without triggering a full-page rerun.
+
+    Adopts the live progress dict from scan_state.PROC_SCAN each tick, so a
+    scan started ANYWHERE -- this session's sidebar button, another session,
+    or the headless auto-scan scheduler -- surfaces within 2 s in every open
+    tab, without needing a full-page rerun to run the top-of-script mirror.
+    Renders inside a stable container so run_every keeps firing while idle.
+    """
+    with _scan_state.PROC_SCAN_LOCK:
+        _active = _scan_state.PROC_SCAN
+    if _active is not None:
+        st.session_state.scan_progress = _active.get("progress", {})
+    with st.container():
+        if st.session_state.scan_progress:
+            render_scan_progress()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3922,7 +3933,15 @@ def _start_scan_thread(ticker_list: list[str], daily_str: str | None, weekly_str
 
     pause_event = threading.Event()
     stop_event  = threading.Event()
-    progress    = {}
+    # Initialize synchronously with real values so the progress bar renders at
+    # 0% on the very first paint -- the background thread (scan_thread_func)
+    # only populates total/done AFTER waiting for any prior scan to exit, so an
+    # empty {} here left a window (whole duration of a fast few-ticker scan)
+    # where the renderer/fragment saw nothing and drew no bar. Same dict object
+    # is registered in PROC_SCAN and returned as rec["progress"], so the thread
+    # keeps refining it in place.
+    progress    = {"total": len(ticker_list), "done": 0, "current": "Starting…",
+                   "finished": False, "failures": {}}
 
     # Register at process level BEFORE starting the thread so a reconnect
     # during the first batch can already adopt this scan.
@@ -4588,9 +4607,9 @@ def render_scan_tab(tab_id: str) -> None:
         .stDataEditor [col-id="fundamental -ve"] .ag-group-value {
             white-space: pre-wrap !important;
         }
-        .stDataEditor [col-id="Sector"] { min-width: 160px; max-width: 160px; }
-        .stDataEditor [col-id="Industry"] { min-width: 72px; max-width: 72px; }
-        .stDataEditor [col-id="Mkt Cap ($B)"] { min-width: 72px; max-width: 72px; }
+        .stDataEditor [col-id="Sector"] { min-width: 80px; max-width: 80px; }
+        .stDataEditor [col-id="Industry"] { min-width: 36px; max-width: 36px; }
+        .stDataEditor [col-id="Mkt Cap ($B)"] { min-width: 36px; max-width: 36px; }
         </style>""",
         unsafe_allow_html=True,
     )
@@ -4666,6 +4685,18 @@ def render_scan_tab(tab_id: str) -> None:
         if _nc in all_df_disp.columns:
             all_col_cfg[_nc] = st.column_config.NumberColumn(
                 _nc, format=_nfmt, width="small", disabled=True
+            )
+
+    # Active column-filter cols default to the narrow ("small") preset --
+    # roughly half the default column width -- so the injected filter columns
+    # stay compact. Only cols without an existing typed config are touched, so
+    # indicators / Source / Status / Mkt Cap keep their own width & behavior;
+    # bare value cols (e.g. RSI, returns) that otherwise render auto-wide get
+    # narrowed and marked read-only (they are computed values, not editable).
+    for _fc in _active_filt_cols:
+        if _fc in all_df_disp.columns and _fc not in all_col_cfg:
+            all_col_cfg[_fc] = st.column_config.Column(
+                _fc, width="small", disabled=True
             )
 
     _emoji_fixed_right = [

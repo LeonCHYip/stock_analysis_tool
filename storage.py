@@ -755,6 +755,7 @@ def _migrate_add_columns(con) -> None:
     if not _backfills_done:
         _backfill_high_low_flags(con)
         _backfill_prior_high_days(con)
+        _fix_3y_window_fields(con)
         _backfills_done = True
 
     # Add status column to analysis_runs if missing
@@ -915,7 +916,7 @@ def _backfill_high_low_flags(con) -> None:
                 made_high_22d  = CASE WHEN w.rn >= 22  THEN w.h >= w.max_h_22d  ELSE NULL END,
                 made_high_252d = CASE WHEN w.rn >= 252 THEN w.h >= w.max_h_252d ELSE NULL END,
                 made_high_3m   = CASE WHEN w.rn >= 63  THEN w.h >= w.max_h_3m   ELSE NULL END,
-                made_high_3y   = w.h >= w.max_h_all,
+                made_high_3y   = w.h >= w.max_h_3y,
                 made_low_5d    = CASE WHEN w.rn >= 5   THEN w.l <= w.min_l_5d   ELSE NULL END,
                 made_low_22d   = CASE WHEN w.rn >= 22  THEN w.l <= w.min_l_22d  ELSE NULL END,
                 made_low_252d  = CASE WHEN w.rn >= 252 THEN w.l <= w.min_l_252d ELSE NULL END
@@ -937,9 +938,13 @@ def _backfill_high_low_flags(con) -> None:
                     MAX(COALESCE(high, close)) OVER (
                         PARTITION BY ticker ORDER BY date
                         ROWS BETWEEN 251 PRECEDING AND CURRENT ROW) AS max_h_252d,
+                    -- 756 trading days incl. today (252*3), matching the
+                    -- fetcher's high.tail(756).max(). Was UNBOUNDED PRECEDING,
+                    -- which equalled "3y" only while price_history held ~3y;
+                    -- with the 10y window it became an all-time high.
                     MAX(COALESCE(high, close)) OVER (
                         PARTITION BY ticker ORDER BY date
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS max_h_all,
+                        ROWS BETWEEN 755 PRECEDING AND CURRENT ROW) AS max_h_3y,
                     MIN(COALESCE(low,  close)) OVER (
                         PARTITION BY ticker ORDER BY date
                         ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS min_l_5d,
@@ -984,7 +989,7 @@ def _backfill_prior_high_days(con) -> None:
                 days_since_prior_high_22d  = CASE WHEN w.rn > 22  THEN w.rn - 1 - w.am_22d  ELSE NULL END,
                 days_since_prior_high_63d  = CASE WHEN w.rn > 63  THEN w.rn - 1 - w.am_63d  ELSE NULL END,
                 days_since_prior_high_252d = CASE WHEN w.rn > 252 THEN w.rn - 1 - w.am_252d ELSE NULL END,
-                days_since_prior_high_3y   = CASE WHEN w.rn > 1   THEN w.rn - 1 - w.am_3y   ELSE NULL END
+                days_since_prior_high_3y   = CASE WHEN w.rn > 756 THEN w.rn - 1 - w.am_3y   ELSE NULL END
             FROM (
                 WITH base AS (
                     SELECT ticker, date,
@@ -997,7 +1002,12 @@ def _backfill_prior_high_days(con) -> None:
                     ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 22  PRECEDING AND 1 PRECEDING) AS am_22d,
                     ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 63  PRECEDING AND 1 PRECEDING) AS am_63d,
                     ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING) AS am_252d,
-                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS am_3y
+                    -- 756 trading days immediately before today (252*3),
+                    -- matching the fetcher's _days_since_prior_high(high, 756).
+                    -- Was UNBOUNDED PRECEDING (+ guard rn>1), which equalled
+                    -- "3y" only while price_history held ~3y; with the 10y
+                    -- window it scanned all history and returned values >756.
+                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn ROWS BETWEEN 756 PRECEDING AND 1 PRECEDING) AS am_3y
                 FROM base
             ) w
             WHERE ti.ticker = w.ticker AND ti.as_of_date = w.date
@@ -1005,6 +1015,52 @@ def _backfill_prior_high_days(con) -> None:
         print(f"[storage] Backfilled days_since_prior_high_* for {needs} rows")
     except Exception as e:
         print(f"[storage] backfill_prior_high_days failed: {e}")
+
+
+def _fix_3y_window_fields(con) -> None:
+    """One-time correction of days_since_prior_high_3y / made_high_3y rows that
+    were written by the OLD unbounded-window backfills (correct at the 3y fetch
+    window, wrong once price_history grew to 10y). Self-detecting + idempotent:
+    only the buggy unbounded query can produce days_since_prior_high_3y > 755
+    (the corrected 756-bar window maxes out at 755), so once corrected this is
+    a no-op. Recomputes BOTH fields with the SAME 756-bar frames as the fixed
+    _backfill_* helpers above -- see those for the window rationale. The
+    ordinary backfills only re-run on NULL guard columns, so they would NOT
+    otherwise repair these already-populated rows."""
+    try:
+        bad = con.execute(
+            "SELECT 1 FROM tech_indicators WHERE days_since_prior_high_3y > 755 LIMIT 1"
+        ).fetchone()
+    except Exception:
+        return
+    if not bad:
+        return
+
+    try:
+        con.execute("""
+            UPDATE tech_indicators AS ti
+            SET days_since_prior_high_3y = CASE WHEN w.rn > 756 THEN w.rn - 1 - w.am_3y ELSE NULL END,
+                made_high_3y             = w.h >= w.max_h_3y
+            FROM (
+                WITH base AS (
+                    SELECT ticker, date,
+                           COALESCE(high, close) AS h,
+                           ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date) AS rn,
+                           MAX(COALESCE(high, close)) OVER (
+                               PARTITION BY ticker ORDER BY date
+                               ROWS BETWEEN 755 PRECEDING AND CURRENT ROW) AS max_h_3y
+                    FROM price_history
+                )
+                SELECT ticker, date, rn, h, max_h_3y,
+                    ARG_MAX(rn, h) OVER (PARTITION BY ticker ORDER BY rn
+                        ROWS BETWEEN 756 PRECEDING AND 1 PRECEDING) AS am_3y
+                FROM base
+            ) w
+            WHERE ti.ticker = w.ticker AND ti.as_of_date = w.date
+        """)
+        print("[storage] Corrected 3Y-window fields (days_since_prior_high_3y / made_high_3y)")
+    except Exception as e:
+        print(f"[storage] fix_3y_window_fields failed: {e}")
 
 
 def _migrate_earnings_surprise_to_double(con) -> None:

@@ -577,53 +577,37 @@ def fetch_fundamental(ticker: str,
         # app.py converts using this at display time.
         financial_currency   = _raw(fin_m, "financialCurrency")
 
-        # ── Finviz override: use newer earnings data if available ──────────────
-        # Only when Yahoo is GENUINELY a quarter behind Finviz. Freshness is
-        # judged by defaultKeyStatistics.mostRecentQuarter (mrq) -- the quarter
-        # Yahoo actually has -- NOT the v8 timeseries q_end_date, which lags mrq
-        # by up to a full quarter. Using q_end_date here made the override fire
-        # even when Yahoo already had the quarter (mrq current), whereupon its
-        # manual YoY recompute paired mismatched quarters and produced garbage
-        # (e.g. MNDY Q EPS YoY 1833.33% = (0.58-0.03)/0.03). Finviz announces
-        # ~<=90d after a quarter-end, so a >100d gap between Finviz's date and
-        # Yahoo's mrq means Finviz is a real quarter ahead; otherwise Yahoo has
-        # it and we use Yahoo's own figures/growth.
+        # ── Finviz override: use newer earnings data when Yahoo's own
+        # quarterly TIMESERIES is genuinely a quarter behind Finviz. ───────────
+        # Freshness is judged by q_end_date (the timeseries' latest quarter-end,
+        # set above from quarterlyBasicEPS) -- NOT mostRecentQuarter (mrq).
+        # mrq can advance a quarter before the EPS timeseries AND earningsGrowth
+        # do: e.g. ESTC had mrq=2026-07-31 but its EPS timeseries still ended
+        # 2026-04-30 and financialData.earningsGrowth was absent, so an
+        # mrq-based gate wrongly skipped the override and left Q EPS YoY on the
+        # stale (anomalous 4.18) quarter. Finviz announces <=~90d after a
+        # quarter-end, so a >100d gap between Finviz's date and the timeseries
+        # quarter-end means Finviz is a real quarter ahead.
+        #
+        # Per-metric rule: Yahoo's own financialData.revenueGrowth/earningsGrowth
+        # (already applied in the default path above) is ALWAYS kept when
+        # present -- the Finviz recompute only fills a YoY that Yahoo did not
+        # provide (raw_q_* is None). This keeps MNDY/KARO on Yahoo's growth
+        # fields while fixing ESTC-style tickers whose EPS growth Yahoo lacks.
+        # A metric is thus either fully Yahoo or fully Finviz -- never a mix --
+        # so the q_*_source "Finviz" prefix (which tells app.py the value is
+        # already USD, skip FX) stays consistent with the stored figure.
         fviz = storage.get_latest_earnings(ticker)
-        _mrq_raw  = _raw(stats_m, "mostRecentQuarter")
-        _mrq_date = None
-        if _mrq_raw is not None:
-            try:
-                _mrq_date = datetime.fromtimestamp(_mrq_raw, tz=timezone.utc).date()
-            except (TypeError, ValueError, OSError):
-                _mrq_date = None
         if fviz and fviz.get("earnings_date"):
             fviz_date = fviz["earnings_date"]
-            _yahoo_behind = (
-                _mrq_date is None
-                or date.fromisoformat(fviz_date) > _mrq_date + timedelta(days=100)
+            _ts_qend  = date.fromisoformat(q_end_date) if q_end_date else None
+            _finviz_ahead = (
+                _ts_qend is None
+                or date.fromisoformat(fviz_date) > _ts_qend + timedelta(days=100)
             )
-            if _yahoo_behind:
-                # Finviz has a more recent quarter — override q_eps and q_revenue.
-                # NOTE: Finviz figures are in USD (per ADR/listed share for
-                # EPS), while the Yahoo values they replace are in the
-                # company's reporting currency. The q_*_source strings below
-                # (persisted to the DB) start with "Finviz" -- app.py's
-                # display conversion uses that prefix to know these values
-                # are ALREADY USD and must not be FX-converted again.
+            if _finviz_ahead:
                 _eps_overridden = fviz.get("eps_gaap_act") is not None
                 _rev_overridden = fviz.get("rev_act_m") is not None
-                if _eps_overridden:
-                    q_eps        = _safe(fviz["eps_gaap_act"])
-                    q_eps_source = (
-                        f"Finviz EPS GAAP Act ({fviz_date}) + computed vs Yahoo prior-year timeseries"
-                    )
-                if _rev_overridden:
-                    q_revenue    = _safe(fviz["rev_act_m"]) * 1_000_000
-                    q_rev_source = (
-                        f"Finviz Revenue Act $M ({fviz_date}) + computed vs Yahoo prior-year timeseries"
-                    )
-
-                # Recompute YoY using Yahoo timeseries as denominator
                 target_prior = date.fromisoformat(fviz_date) - timedelta(days=365)
 
                 def _closest_ts_value(ts_list, target_date):
@@ -648,51 +632,53 @@ def fetch_fundamental(ticker: str,
                 # (observed: TSM ~-95% "decline" = $39B USD vs NT$889B TWD).
                 _is_foreign = bool(financial_currency) and financial_currency != "USD"
                 _fx_rate = storage.get_fx_rates().get(financial_currency) if _is_foreign else None
+                _did_override = False
 
-                prior_rev = _closest_ts_value(q_rev_ts, target_prior)
-                if _is_foreign and _rev_overridden and prior_rev is not None:
-                    # Numerator (q_revenue) is Finviz USD; convert the
-                    # local-currency prior-year denominator to USD too.
-                    # Revenue is company-wide (no per-share basis), so FX
-                    # alone fully reconciles it. Only when the override
-                    # actually fired -- otherwise q_revenue is still Yahoo
-                    # local-currency and converting the denominator would
-                    # corrupt the YoY in the opposite direction.
-                    prior_rev = prior_rev * _fx_rate if _fx_rate is not None else None
-                if q_revenue and prior_rev and prior_rev != 0:
-                    q_rev_yoy    = round((q_revenue - prior_rev) / abs(prior_rev) * 100, 2)
-                else:
-                    q_rev_yoy    = None
-                    q_rev_source = q_rev_source.replace(
-                        "+ computed vs Yahoo prior-year timeseries", "— YoY unavailable"
-                    )
+                # Revenue: only when Yahoo gave no revenueGrowth of its own.
+                if raw_q_rev is None and _rev_overridden:
+                    q_revenue = _safe(fviz["rev_act_m"]) * 1_000_000
+                    prior_rev = _closest_ts_value(q_rev_ts, target_prior)
+                    if _is_foreign and prior_rev is not None:
+                        # Numerator is Finviz USD; convert the local-currency
+                        # prior-year denominator to USD too (revenue is
+                        # company-wide, so FX alone reconciles it).
+                        prior_rev = prior_rev * _fx_rate if _fx_rate is not None else None
+                    if q_revenue and prior_rev and prior_rev != 0:
+                        q_rev_yoy    = round((q_revenue - prior_rev) / abs(prior_rev) * 100, 2)
+                        q_rev_source = f"Finviz Revenue Act $M ({fviz_date}) + computed vs Yahoo prior-year timeseries"
+                    else:
+                        q_rev_yoy    = None
+                        q_rev_source = f"Finviz Revenue Act $M ({fviz_date}) — YoY unavailable"
+                    _did_override = True
 
-                prior_eps = _closest_ts_value(q_eps_ts, target_prior)
-                if _is_foreign and _eps_overridden:
-                    # EPS is per-share: Finviz reports USD per ADR/listed
-                    # share, Yahoo timeseries reports local currency per
-                    # ORDINARY share. Without the ADR conversion ratio
-                    # (e.g. 1 TSM ADR = 5 ordinary shares) these cannot be
-                    # reconciled by FX alone -- mark unavailable instead of
-                    # computing a structurally wrong number.
-                    prior_eps = None
-                if q_eps is not None and prior_eps and prior_eps != 0:
-                    q_eps_yoy    = round((q_eps - prior_eps) / abs(prior_eps) * 100, 2)
-                else:
-                    q_eps_yoy    = None
-                    q_eps_source = q_eps_source.replace(
-                        "+ computed vs Yahoo prior-year timeseries", "— YoY unavailable"
-                    )
+                # EPS: only when Yahoo gave no earningsGrowth of its own.
+                if raw_q_eps is None and _eps_overridden:
+                    q_eps = _safe(fviz["eps_gaap_act"])
+                    prior_eps = _closest_ts_value(q_eps_ts, target_prior)
+                    if _is_foreign:
+                        # EPS is per-share: Finviz reports USD per ADR/listed
+                        # share, Yahoo timeseries reports local currency per
+                        # ORDINARY share. Without the ADR conversion ratio these
+                        # cannot be reconciled by FX alone -- mark unavailable
+                        # rather than compute a structurally wrong number.
+                        prior_eps = None
+                    if q_eps is not None and prior_eps and prior_eps != 0:
+                        q_eps_yoy    = round((q_eps - prior_eps) / abs(prior_eps) * 100, 2)
+                        q_eps_source = f"Finviz EPS GAAP Act ({fviz_date}) + computed vs Yahoo prior-year timeseries"
+                    else:
+                        q_eps_yoy    = None
+                        q_eps_source = f"Finviz EPS GAAP Act ({fviz_date}) — YoY unavailable"
+                    _did_override = True
 
-                # Store computed YoY back to earnings_history
-                storage.save_earnings(ticker, {
-                    "earnings_date": fviz_date,
-                    "q_rev_yoy":     q_rev_yoy,
-                    "q_eps_yoy":     q_eps_yoy,
-                })
-
-                # Yahoo's q_end_date refers to the prior (stale) quarter — clear it
-                q_end_date = None
+                if _did_override:
+                    # Persist recomputed YoY, and clear Yahoo's now-stale
+                    # (prior-quarter) q_end_date.
+                    storage.save_earnings(ticker, {
+                        "earnings_date": fviz_date,
+                        "q_rev_yoy":     q_rev_yoy,
+                        "q_eps_yoy":     q_eps_yoy,
+                    })
+                    q_end_date = None
 
         # Build flat info dict (backward-compatible with app.py raw_info_json)
         flat_info = {
