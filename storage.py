@@ -559,6 +559,8 @@ CREATE TABLE IF NOT EXISTS index_dashboard (
     close       DOUBLE,
     change_pct  DOUBLE,
     rsi_14      DOUBLE,
+    close_date  DATE,
+    rsi_date    DATE,
     updated_at  TIMESTAMP NOT NULL
 );
 """
@@ -891,6 +893,15 @@ def _migrate_add_columns(con) -> None:
         if col not in existing_ph:
             con.execute(f"ALTER TABLE price_history ADD COLUMN {col} {dtype}")
 
+    # Add per-metric as-of dates to index_dashboard
+    new_dash_cols = [("close_date", "DATE"), ("rsi_date", "DATE")]
+    existing_dash = {row[0] for row in con.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'index_dashboard'"
+    ).fetchall()}
+    for col, dtype in new_dash_cols:
+        if col not in existing_dash:
+            con.execute(f"ALTER TABLE index_dashboard ADD COLUMN {col} {dtype}")
+
 
 def _backfill_high_low_flags(con) -> None:
     """Recompute made_high_*/made_low_* booleans from price_history.
@@ -1162,16 +1173,40 @@ def mark_tech_finalized(ticker: str, as_of_date: str) -> None:
 
 def get_tickers_with_stale_tech(min_date: str) -> list[str]:
     """
-    Return tickers whose latest as_of_date in tech_indicators is strictly
-    before min_date.  Used to detect cases where yfinance returned stale
-    data during a scan (is_finalized=TRUE but as_of_date behind the most
-    recent completed trading day).
+    Return tickers whose latest tech data is stale OR incomplete, i.e. either:
+
+      (a) latest as_of_date is strictly before min_date -- yfinance returned
+          stale data during a scan (as_of_date behind the most recent
+          completed trading day); or
+      (b) the latest row is a partial/broken compute: sma200 IS NULL despite
+          having >= 200 price_history rows. This catches the incremental
+          fast-path failure where the assembled compute DataFrame was too
+          shallow, leaving every long-window MA (sma50/150/200, ema200) NULL
+          while the as_of_date looks current. The >= 200-row guard excludes
+          genuinely young tickers (< 200 trading days), whose NULL sma200 is
+          correct and cannot be fixed by a re-scan.
+
+    Both feed the "Refresh Stale Data" button and the sidebar banner count, so
+    a re-scan repairs partial rows (their price_history is already deep, so the
+    fast path recomputes the MAs correctly).
     """
     con = _conn()
     rows = con.execute(
-        "SELECT ticker FROM tech_indicators "
-        "GROUP BY ticker HAVING MAX(CAST(as_of_date AS TEXT)) < ? "
-        "ORDER BY ticker",
+        """
+        SELECT ticker FROM tech_indicators
+          GROUP BY ticker HAVING MAX(CAST(as_of_date AS TEXT)) < ?
+        UNION
+        SELECT ticker FROM (
+            SELECT ticker, sma200,
+                   ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY as_of_date DESC) AS rn
+            FROM tech_indicators
+        ) t
+        WHERE rn = 1 AND sma200 IS NULL
+          AND ticker IN (
+              SELECT ticker FROM price_history GROUP BY ticker HAVING COUNT(*) >= 200
+          )
+        ORDER BY ticker
+        """,
         [min_date],
     ).fetchall()
     return [r[0] for r in rows]
@@ -1504,7 +1539,16 @@ def get_detail_for_run(analysis_dt: str) -> dict:
 def get_all_summaries(
     tickers: list[str] | None = None,
     datetimes: list[str] | None = None,
+    latest_only: bool = False,
 ) -> list[dict]:
+    """Return analysis_runs rows (each as a dict, newest run_dt first).
+
+    latest_only=True keeps only each ticker's most recent run_dt via a
+    QUALIFY window -- the app's default view is latest-only, and the full
+    table is ~300 run_dts deep (100x more rows), so this avoids fetching and
+    then Python-deduping all of history on every rerun. Ignored when explicit
+    `datetimes` are requested (the historical view wants those exact runs).
+    """
     where_clauses = []
     params: list = []
     if tickers:
@@ -1516,9 +1560,14 @@ def get_all_summaries(
         where_clauses.append(f"run_dt IN ({placeholders})")
         params.extend(datetimes)
     where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    qualify = ""
+    if latest_only and not datetimes:
+        qualify = ("QUALIFY ROW_NUMBER() OVER "
+                   "(PARTITION BY ticker ORDER BY run_dt DESC) = 1 ")
     con = _conn()
     rows = con.execute(
         f"SELECT *, run_dt AS analysis_datetime FROM analysis_runs {where} "
+        f"{qualify}"
         "ORDER BY run_dt DESC, ticker ASC",
         params,
     ).fetchall()
@@ -2222,25 +2271,31 @@ def delete_backtest_run(run_id: str) -> None:
 
 def save_dashboard_snapshot(rows: list[dict]) -> None:
     """Upsert index_dashboard rows. Each dict: ticker, close, change_pct,
-    rsi_14 (None allowed), updated_at (CST datetime)."""
+    rsi_14 (None allowed), close_date/rsi_date (YYYY-MM-DD str or None,
+    the as-of date of each figure), updated_at (CST datetime)."""
     if not rows:
         return
     con = _conn()
     con.executemany(
-        "INSERT OR REPLACE INTO index_dashboard (ticker, close, change_pct, rsi_14, updated_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [(r["ticker"], r.get("close"), r.get("change_pct"), r.get("rsi_14"), r["updated_at"]) for r in rows],
+        "INSERT OR REPLACE INTO index_dashboard "
+        "(ticker, close, change_pct, rsi_14, close_date, rsi_date, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [(r["ticker"], r.get("close"), r.get("change_pct"), r.get("rsi_14"),
+          r.get("close_date"), r.get("rsi_date"), r["updated_at"]) for r in rows],
     )
 
 
 def get_dashboard_snapshot() -> dict[str, dict]:
-    """Return {ticker: {close, change_pct, rsi_14, updated_at}} for all
-    persisted dashboard tickers. Empty dict if never fetched."""
+    """Return {ticker: {close, change_pct, rsi_14, close_date, rsi_date,
+    updated_at}} for all persisted dashboard tickers. Empty dict if never
+    fetched."""
     con = _conn()
     rows = con.execute(
-        "SELECT ticker, close, change_pct, rsi_14, updated_at FROM index_dashboard"
+        "SELECT ticker, close, change_pct, rsi_14, CAST(close_date AS TEXT), "
+        "CAST(rsi_date AS TEXT), updated_at FROM index_dashboard"
     ).fetchall()
-    return {r[0]: {"close": r[1], "change_pct": r[2], "rsi_14": r[3], "updated_at": r[4]} for r in rows}
+    return {r[0]: {"close": r[1], "change_pct": r[2], "rsi_14": r[3],
+                   "close_date": r[4], "rsi_date": r[5], "updated_at": r[6]} for r in rows}
 
 
 def save_fx_rates(rows: list[dict]) -> None:

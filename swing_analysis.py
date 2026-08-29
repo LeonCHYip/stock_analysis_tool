@@ -161,9 +161,43 @@ def fetch_and_cache_swing_history(
         (idx.date().isoformat(), _safe_float(o), _safe_float(h), _safe_float(l), _safe_float(c), _safe_int(v))
         for idx, o, h, l, c, v in zip(df.index, df["Open"], df["High"], df["Low"], df["Close"], df["Volume"])
     ]
+
+    # Never let an OLDER download overwrite newer cached data. A long-running
+    # YF_SESSION can degrade and return day-stale prices (observed: the index
+    # dashboard silently rolled back from 8/28 to 8/27 when a force_refresh
+    # pulled stale data). rows/cached are date-ascending, so compare last
+    # dates. Strict '<' only: an equal latest date is allowed to overwrite so
+    # a same-day re-fetch still picks up retroactive split/dividend
+    # re-adjustment of older bars. When we refuse, return the newer cache.
+    cached = storage.get_swing_price_history(ticker)
+    if cached and rows and rows[-1][0] < cached[-1][0]:
+        return _rows_to_df(cached)
+
     storage.save_swing_price_history(ticker, rows, fetched_on=today_str)
 
     return _rows_to_df(rows)
+
+
+def get_latest_quote_price(ticker: str) -> float | None:
+    """Return the latest live quote price (Yahoo regularMarketPrice) for
+    `ticker`, or None on any failure.
+
+    Fallback for the index dashboard when Yahoo's most-recent daily bar still
+    has a null close (its historical array lags the finalized close by up to a
+    day), so the settled series is one trading day behind. NOTE: this is a
+    LIVE quote -- during an open session it is an intraday price, not a settled
+    close -- so callers should use it only to fill a genuine gap, not to
+    replace an already-current settled close.
+    """
+    ticker = ticker.upper().strip()
+    try:
+        with YF_DL_LOCK:  # serialize with all other shared-session use
+            fi = yf.Ticker(ticker, session=YF_SESSION).fast_info
+            lp = fi.last_price
+        lp = float(lp)
+        return lp if lp == lp else None  # NaN guard (NaN != NaN)
+    except Exception:
+        return None
 
 
 # ── Detection: Method A -- percentage-reversal ZigZag ───────────────────────

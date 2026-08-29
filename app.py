@@ -128,7 +128,7 @@ from trigger_engine import (
     get_trigger_date_field_values,
 )
 from column_catalog import render_column_reference_tab
-from swing_analysis import analyze_swings, fetch_and_cache_swing_history
+from swing_analysis import analyze_swings, fetch_and_cache_swing_history, get_latest_quote_price
 import backtester as bt
 import ta
 from storage import (
@@ -143,6 +143,51 @@ from storage import (
     get_latest_earnings_for_tickers,
     MAIN_IND_COLS, ALL_SUB_COLS, SUB_COLS,
 )
+
+
+# ── Cached data loaders ────────────────────────────────────────────────────────
+# Streamlit re-executes app.py on EVERY interaction (sort, filter, any widget),
+# so the per-tab data load ran ~5s of DB queries every time even though the
+# underlying data only changes on a scan or an edit. These @st.cache_data
+# wrappers key on `ver` (a data-version token = latest run_dt + an edit counter,
+# see scan_state.DATA_VERSION) so an interaction that doesn't change the data
+# hits the cache instead of the DB. `ver` must NOT be underscore-prefixed --
+# Streamlit excludes _-prefixed args from the cache key. Ticker lists are passed
+# as sorted tuples so a set with a different iteration order still keys the same.
+def _tset(tickers) -> tuple:
+    return tuple(sorted(set(tickers))) if tickers else ()
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cx_summaries(ver, tickers: tuple, datetimes: tuple, latest_only: bool) -> list[dict]:
+    return get_all_summaries(
+        tickers=list(tickers) if tickers else None,
+        datetimes=list(datetimes) if datetimes else None,
+        latest_only=latest_only,
+    )
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cx_fundamentals(ver, tickers: tuple) -> dict:
+    return get_all_fundamentals_for_run(list(tickers))
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cx_tech(ver, tickers: tuple) -> dict:
+    return get_tech_for_tickers(list(tickers))
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cx_returns(ver, tickers: tuple) -> dict:
+    return storage.compute_returns_for_tickers(list(tickers))
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cx_custom_returns(ver, tickers: tuple, start: str, end: str) -> dict:
+    return storage.get_custom_period_returns(list(tickers), start, end)
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _cx_earnings(ver, tickers: tuple) -> dict:
+    return get_latest_earnings_for_tickers(list(tickers))
+
+def _bump_data_version() -> None:
+    """Invalidate the cached loaders after a user-facing write (edit/scan)."""
+    _scan_state.DATA_VERSION += 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -1793,6 +1838,10 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
     progress["current"]  = ""
     _slog(f"[scan] DONE  {done}/{total} tickers processed")
 
+    # Invalidate cached loaders so the finished scan's data is picked up
+    # (latest_run_dt also advances, but bump explicitly so it's immediate).
+    _bump_data_version()
+
     # Clear the process-level scan record so a reconnecting session doesn't
     # re-adopt a finished scan and block launching a fresh one.
     with _scan_state.PROC_SCAN_LOCK:
@@ -1947,6 +1996,9 @@ def save_edits(original_rows: list[dict], edited_df: pd.DataFrame,
                 save_source_for_ticker(str(ticker), str(new_val) if new_val is not None else "")
             elif db_col in ("company_summary", "revenue_composition", "tech_pos", "fund_pos", "tech_neg", "fund_neg"):
                 save_user_field_for_ticker(str(ticker), db_col, str(new_val) if new_val is not None else "")
+
+    # Invalidate the cached loaders so the edits show on the next rerun.
+    _bump_data_version()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3608,6 +3660,7 @@ def render_value_table(tickers: list[str], detail_map: dict,
                     orig_val = str(df.loc[ticker, disp_col]) if ticker in df.index else ""
                     if new_val != orig_val:
                         save_user_field_for_ticker(str(ticker), db_col, new_val)
+            _bump_data_version()   # invalidate cached loaders so edits show
             st.success("Saved.")
             st.rerun()
     else:
@@ -3651,12 +3704,31 @@ def _render_index_dashboard():
             "</style>",
             unsafe_allow_html=True,
         )
+        # "Last updated date" = the freshest as-of date across all figures.
+        # Any figure whose own as-of date is behind it is flagged so a stale
+        # metric (e.g. RSI computed from settled data while the close was
+        # advanced via the live-quote fallback) is never silently shown as
+        # current. Dates are ISO strings, so max() is chronological.
+        _all_asof = [v.get("close_date") for v in _dash_snap.values() if v.get("close_date")]
+        _all_asof += [v.get("rsi_date") for v in _dash_snap.values() if v.get("rsi_date")]
+        _ref_asof = max(_all_asof) if _all_asof else None
+
+        def _asof_note(d):
+            # d: ISO 'YYYY-MM-DD' or None. Return "as of DD/MM" only when it
+            # lags the reference date; None means "current, no indicator".
+            if d and _ref_asof and d != _ref_asof:
+                return f"as of {d[8:10]}/{d[5:7]}"
+            return None
+
         with st.container(key="index_dashboard"):
             _dash_cols = st.columns(5)
             _soxl = _dash_snap.get("SOXL", {})
             with _dash_cols[0]:
                 _rsi = _soxl.get("rsi_14")
                 st.metric("SOXL RSI 14", f"{_rsi:.1f}" if _rsi is not None else "N/A")
+                _rsi_note = _asof_note(_soxl.get("rsi_date"))
+                if _rsi_note:
+                    st.caption(f"⚠️ {_rsi_note}")
                 if _rsi is not None:
                     if _rsi <= DASHBOARD_SOXL_RSI_BUY_THRESHOLD:
                         st.success(f"🟢 Buy (RSI ≤ {DASHBOARD_SOXL_RSI_BUY_THRESHOLD:.0f})")
@@ -3671,6 +3743,9 @@ def _render_index_dashboard():
                         value=f"${_close:.2f}" if _close is not None else "N/A",
                         delta=f"{_chg:+.2f}%" if _chg is not None else None,
                     )
+                    _close_note = _asof_note(_row.get("close_date"))
+                    if _close_note:
+                        st.caption(f"⚠️ {_close_note}")
         _updates = [r["updated_at"] for r in _dash_snap.values() if r.get("updated_at")]
         if _updates:
             st.caption(f"Last updated: {min(_updates).strftime('%d/%m/%Y %H:%M:%S')} CST")
@@ -3814,6 +3889,14 @@ def _refresh_index_dashboard() -> None:
     """
     try:
         now = datetime.now(CST)
+        # Expected most-recent completed trading day -- used to detect when the
+        # settled series is behind (Yahoo's newest daily bar still has a null
+        # close and was dropped) so we can fall back to the live quote.
+        from market_calendar import (et_today as _et_today,
+                                      nyse_close_passed_today as _nyse_closed,
+                                      get_last_trading_day_before_today)
+        _expected_latest = (_et_today().isoformat() if _nyse_closed()
+                            else (get_last_trading_day_before_today() or _et_today().isoformat()))
         rows = []
         for ticker in DASHBOARD_TICKERS:
             try:
@@ -3828,15 +3911,37 @@ def _refresh_index_dashboard() -> None:
                 if data.empty or len(data) < 2:
                     _slog(f"[dashboard] Skipped {ticker}: insufficient valid price history")
                     continue
-                close = float(data["close"].iloc[-1])
-                prev_close = float(data["close"].iloc[-2])
-                change_pct = (close / prev_close - 1) * 100 if prev_close else None
+                settled_close = float(data["close"].iloc[-1])
+                settled_prev  = float(data["close"].iloc[-2])
+                settled_date  = data.index[-1].date().isoformat()
+
+                # RSI is computed from the SETTLED series only (never the live
+                # fallback price), so it is as-of settled_date -- which the UI
+                # flags when it lags the (fallback-advanced) close date.
                 rsi_14 = None
+                rsi_date = None
                 if ticker == "SOXL":
                     rsi_val = ta.momentum.RSIIndicator(data["close"], window=14).rsi().iloc[-1]
                     rsi_14 = float(rsi_val) if not pd.isna(rsi_val) else None
+                    rsi_date = settled_date if rsi_14 is not None else None
+
+                # Fallback: if the settled series is behind the expected latest
+                # trading day, Yahoo's newest daily bar had a null close (see
+                # get_latest_quote_price). Use the live quote as the latest
+                # figure, changed vs the last settled close.
+                if settled_date < _expected_latest:
+                    _live = get_latest_quote_price(ticker)
+                    if _live is not None:
+                        close, prev_close, close_date = _live, settled_close, _expected_latest
+                    else:
+                        close, prev_close, close_date = settled_close, settled_prev, settled_date
+                else:
+                    close, prev_close, close_date = settled_close, settled_prev, settled_date
+
+                change_pct = (close / prev_close - 1) * 100 if prev_close else None
                 rows.append({"ticker": ticker, "close": close, "change_pct": change_pct,
-                             "rsi_14": rsi_14, "updated_at": now})
+                             "rsi_14": rsi_14, "close_date": close_date, "rsi_date": rsi_date,
+                             "updated_at": now})
             except Exception as e:
                 _slog(f"[dashboard] Failed to refresh {ticker}: {e}")
         if rows:
@@ -4305,9 +4410,21 @@ def render_scan_tab(tab_id: str) -> None:
     _trig_end_logic_pre   = st.session_state.get(f"{tab_id}_trig_end_logic", "AND")
 
     # ── Fetch rows ────────────────────────────────────────────────────────────
-    filt_rows = get_all_summaries(
-        tickers   = _f_tickers_pre if _f_tickers_pre else None,
-        datetimes = _f_dts_pre     if _f_dts_pre     else None,
+    # Data-version token: latest run_dt (advances on any scan, any process) +
+    # a local edit counter (scan_state.DATA_VERSION, bumped on edits). Filter/
+    # sort reruns keep the same token -> the cached loaders below are hits.
+    _data_ver = f"{get_latest_run_datetime()}::{_scan_state.DATA_VERSION}"
+    # Latest-run-per-ticker fast path: only when the user wants one row per
+    # ticker (_only_latest) and isn't pinning specific historical datetimes.
+    # NOT triggered by _only_latest_close alone -- that's a per-ticker close-
+    # date filter applied over full history, a different semantic. Fetches
+    # ~120x fewer rows (see get_all_summaries).
+    _latest_only = _only_latest_pre and not _f_dts_pre
+    filt_rows = _cx_summaries(
+        _data_ver,
+        _tset(_f_tickers_pre),
+        tuple(_f_dts_pre) if _f_dts_pre else (),
+        _latest_only,
     )
     total_before = len(filt_rows)
 
@@ -4336,8 +4453,8 @@ def render_scan_tab(tab_id: str) -> None:
 
     # ── Fetch fund/tech data ──────────────────────────────────────────────────
     _tickers_pre   = list({r["ticker"] for r in filt_rows})
-    fund_map       = get_all_fundamentals_for_run(_tickers_pre)
-    tech_map       = get_tech_for_tickers(_tickers_pre)
+    fund_map       = _cx_fundamentals(_data_ver, _tset(_tickers_pre))
+    tech_map       = _cx_tech(_data_ver, _tset(_tickers_pre))
 
     if _only_latest_close_pre:
         _close_dates = {t: tc.get("as_of_date", "") for t, tc in tech_map.items() if tc.get("as_of_date")}
@@ -4435,13 +4552,13 @@ def render_scan_tab(tab_id: str) -> None:
     # on them silently excluded everything, no matter how many records
     # actually matched.
     _ph_tickers_all = [r["ticker"] for r in filt_rows]
-    _ph_returns: dict[str, dict] = storage.compute_returns_for_tickers(_ph_tickers_all) if _ph_tickers_all else {}
+    _ph_returns: dict[str, dict] = _cx_returns(_data_ver, _tset(_ph_tickers_all)) if _ph_tickers_all else {}
 
     from datetime import date as _date, timedelta as _td
     _today_str = _date.today().isoformat()
     _cust_s = _cust_start_pre or _date(_date.today().year, 1, 1).isoformat()
     _cust_e = _cust_end_pre or _today_str
-    _cust_returns = storage.get_custom_period_returns(_ph_tickers_all, _cust_s, _cust_e) if _ph_tickers_all else {}
+    _cust_returns = _cx_custom_returns(_data_ver, _tset(_ph_tickers_all), _cust_s, _cust_e) if _ph_tickers_all else {}
     for _t, _cr in _cust_returns.items():
         _ph_returns.setdefault(_t, {}).update(_cr)
 
@@ -4458,7 +4575,7 @@ def render_scan_tab(tab_id: str) -> None:
 
     if col_filter:
         _rows_by_ticker_all = {r["ticker"]: r for r in filt_rows}
-        _earnings_map_cf = get_latest_earnings_for_tickers(_ph_tickers_all) if filt_rows else {}
+        _earnings_map_cf = _cx_earnings(_data_ver, _tset(_ph_tickers_all)) if filt_rows else {}
         _pass = set(apply_col_filter(
             _ph_tickers_all, col_filter, detail_map,
             _rows_by_ticker_all, fund_map, tech_map,
@@ -4469,7 +4586,7 @@ def render_scan_tab(tab_id: str) -> None:
 
     # ── Pre-build value records ───────────────────────────────────────────────
     _rows_by_ticker = {r["ticker"]: r for r in filt_rows}
-    _earnings_map   = get_latest_earnings_for_tickers(list(_rows_by_ticker)) if filt_rows else {}
+    _earnings_map   = _cx_earnings(_data_ver, _tset(_rows_by_ticker)) if filt_rows else {}
     _ph_tickers     = list(_rows_by_ticker.keys())   # post-filter subset of _ph_tickers_all
 
     _pre_val_records: dict[str, dict] = {

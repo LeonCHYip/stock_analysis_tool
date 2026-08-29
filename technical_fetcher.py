@@ -72,6 +72,17 @@ _CHECK_WINDOW_DAYS = 60      # small check-window download size
 # ad_line off by orders of magnitude between two consecutive scans of the
 # same ticker with no new trading activity). The read is local DuckDB I/O,
 # not a network call, so reading everything stored is cheap regardless.
+# Fast-path safety net: if the assembled DataFrame is anomalously shallow for a
+# ticker that SHOULD have deep history (a transient empty/short older-DB read),
+# computing it would silently store a partial row -- every window >= 50 bars
+# (sma50/150/200, ema200) NULL while short windows/RSI look fine. Below this
+# many rows such a ticker is re-routed to a full download instead of saved
+# partial. 220 covers sma200's 200-bar need plus buffer.
+_MIN_ASSEMBLED_ROWS = 220
+# A depth anchor (ticker_history_depth.earliest_date) older than this many
+# calendar days (~275 trading days) means the ticker genuinely should have
+# >= 220 bars, so a shallow assembly is a bug, not a young ticker.
+_DEEP_HISTORY_MIN_DAYS = 400
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1078,6 +1089,19 @@ def fetch_and_store_bulk(tickers: list[str],
             for ticker, small_df in fast_path_dfs.items():
                 try:
                     assembled = _assemble_price_df(_older.get(ticker, []), small_df)
+
+                    # Safety net against storing a partial row: a depth-confirmed
+                    # ticker with a genuinely old history anchor should assemble
+                    # deep. If it's shallow, the older-DB read came back short
+                    # (transient) -- re-route to a full download rather than
+                    # compute NULL long-window MAs. Young tickers (recent anchor)
+                    # are let through; their shallow history is real.
+                    _anchor = _depth.get(ticker)
+                    _deep_cutoff = (today_et - timedelta(days=_DEEP_HISTORY_MIN_DAYS)).isoformat()
+                    if (len(assembled) < _MIN_ASSEMBLED_ROWS
+                            and _anchor is not None and _anchor < _deep_cutoff):
+                        needs_full.append(ticker)
+                        continue
 
                     fields = _compute_all_indicators(ticker, assembled, weekly_latest_date)
                     if "error" in fields:
