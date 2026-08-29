@@ -84,17 +84,6 @@ def _slog(msg: str) -> None:
 _SCRIPT_EXEC_ID = f"{os.getpid()}-{time.time_ns()}"
 _slog(f"[startup] SCRIPT EXEC  exec_id={_SCRIPT_EXEC_ID}  {_res_str()}")
 
-# Heartbeat: one daemon thread per process logs resources every 10s, so if the
-# process dies we know the time of death within 10s and the resource trend up
-# to that moment. Guarded via threading.enumerate() because module-level flags
-# in app.py do NOT persist across Streamlit reruns (fresh namespace each time).
-if not any(t.name == "diag-heartbeat" for t in threading.enumerate()):
-    def _heartbeat():
-        while True:
-            time.sleep(10)
-            _slog(f"[hb] {_res_str()}")
-    threading.Thread(target=_heartbeat, daemon=True, name="diag-heartbeat").start()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User preferences (persisted to JSON)
