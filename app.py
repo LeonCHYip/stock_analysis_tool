@@ -208,6 +208,19 @@ TICKERS_FILE = Path(__file__).parent / "tickers.txt"
 # rename, or remove columns here or in _build_value_record().
 VALUE_COL_GROUPS: dict[str, list[str]] = {
     "User": ["Source", "Status"],
+    # Curated "high-potential / stage-2 momentum" screen: the columns the 8-trait
+    # screen filters on, grouped for convenience (several also appear in their
+    # native groups). New columns (Med Vol Ratio, MA50>MA100/MA100>MA150, 26W-low
+    # multiple, 20D Px%, Max RSI 60/90) computed in technical_fetcher.
+    "Momentum Screen": [
+        "Earns 1D Px%", "Earns 1D Vol%", "Last Earnings Date",
+        "Med Vol Ratio 60D%", "Med Vol Ratio 90D%",
+        "MA50>MA100", "MA100>MA150",
+        "x Above 26W Low", "26W Low Close",
+        "20D Px%", "From SMA200%", "From 20D High%",
+        "Max RSI 60D", "Max RSI 90D",
+        "SMA100", "From SMA100%",
+    ],
     # ── Indicator-derived groups (from analysis detail JSON) ──────────────────
     "Price & Volume — Daily (T1)": [
         "3M Avg Px%", "3M Avg Vol%", "12M Avg Px%", "12M Avg Vol%",
@@ -566,7 +579,7 @@ TECH_DISPLAY_COL_MAP: dict[str, str] = {v: k for k, v in TECH_COL_MAP.items()}
 # Columns from tech_indicators that are boolean (rendered as ✅/❌)
 TECH_BOOL_COLS = {
     "Breakout 55D", "Breakout 3M",
-    "MA10>MA20", "MA20>MA50", "MA50>MA150", "MA150>MA200",
+    "MA10>MA20", "MA20>MA50", "MA50>MA100", "MA100>MA150", "MA50>MA150", "MA150>MA200",
     "Slope10>Slope20", "Slope20>Slope50", "Slope50>Slope150", "Slope150>Slope200",
     "5D High Now", "22D High Now", "52W High Now", "3M High Now", "3Y High Now",
     "5D Low Now",  "22D Low Now",  "52W Low Now",
@@ -1160,6 +1173,14 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "-DI":             _f(tc.get("minus_di")),
         "Real Vol 20D%":   _f(tc.get("realized_vol_20d")),
         "Real Vol 60D%":   _f(tc.get("realized_vol_60d")),
+        # ── Momentum / high-potential screen ──────────────────────────────
+        "Max RSI 60D":       _f(tc.get("max_rsi_60d")),
+        "Max RSI 90D":       _f(tc.get("max_rsi_90d")),
+        "Med Vol Ratio 60D%": _f(tc.get("med_vol_ratio_60d")),
+        "Med Vol Ratio 90D%": _f(tc.get("med_vol_ratio_90d")),
+        "26W Low Close":     _f(tc.get("low_close_26w")),
+        "x Above 26W Low":   _f(tc.get("px_over_26w_low")),
+        "20D Px%":           _f(tc.get("ret_20d")),
         "Max DD 63D%":     _f(tc.get("max_drawdown_63d")),
         "Max DD 252D%":    _f(tc.get("max_drawdown_252d")),
         "OBV":             _f(tc.get("obv")),
@@ -1198,10 +1219,13 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "SMA10":           _f(tc.get("sma10")),
         "SMA20":           _f(tc.get("sma20")),
         "SMA50":           _f(tc.get("sma50")),
+        "SMA100":          _f(tc.get("sma100")),
         "SMA150":          _f(tc.get("sma150")),
         "SMA200":          _f(tc.get("sma200")),
         "MA10>MA20":       _bi(tc.get("ma10_gt_ma20")),
         "MA20>MA50":       _bi(tc.get("ma20_gt_ma50")),
+        "MA50>MA100":      _bi(tc.get("ma50_gt_ma100")),
+        "MA100>MA150":     _bi(tc.get("ma100_gt_ma150")),
         "MA50>MA150":      _bi(tc.get("ma50_gt_ma150")),
         "MA150>MA200":     _bi(tc.get("ma150_gt_ma200")),
         "Slope10>Slope20":   _bi(tc.get("slope10_gt_slope20")),
@@ -1216,6 +1240,7 @@ def _build_value_record(ticker: str, detail: dict, row: dict, f_db: dict,
         "From SMA10%":      _f(tc.get("pct_from_sma10")),
         "From SMA20%":      _f(tc.get("pct_from_sma20")),
         "From SMA50%":      _f(tc.get("pct_from_sma50")),
+        "From SMA100%":     _f(tc.get("pct_from_sma100")),
         "From SMA150%":     _f(tc.get("pct_from_sma150")),
         "From EMA9%":       _f(tc.get("pct_from_ema9")),
         "From EMA21%":      _f(tc.get("pct_from_ema21")),

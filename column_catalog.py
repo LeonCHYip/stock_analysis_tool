@@ -348,6 +348,8 @@ COLUMNS = [
     _c("52W High Close",       "High/Low Levels (Close-Based)", _YFD, _SC, "raw",      "high_close_52w",          "float",  "Highest closing price over trailing 52 weeks"),
     _c("52W Low Close",        "High/Low Levels (Close-Based)", _YFD, _SC, "raw",      "low_close_52w",           "float",  "Lowest closing price over trailing 52 weeks"),
     _c("From 52W Low Close%",  "High/Low Levels (Close-Based)", _YFD, _SC, "computed", "pct_from_low_close_52w",  "float%", "% above the 52-week closing low"),
+    _c("26W Low Close",        "High/Low Levels (Close-Based)", _YFD, _SC, "raw",      "low_close_26w",           "float",  "Lowest closing price over trailing 26 weeks (126 trading days)"),
+    _c("x Above 26W Low",      "High/Low Levels (Close-Based)", _YFD, _SC, "computed", "px_over_26w_low",         "float",  "Latest close / 26W low close (a multiple; 3.0 = 3x above)"),
     _c("3Y High Close",        "High/Low Levels (Close-Based)", _YFD, _SC, "raw",      "high_close_3y",           "float",  "Highest closing price over trailing 3 years"),
     _c("3Y Low Close",         "High/Low Levels (Close-Based)", _YFD, _SC, "raw",      "low_close_3y",            "float",  "Lowest closing price over trailing 3 years"),
     _c("From 3Y Low Close%",   "High/Low Levels (Close-Based)", _YFD, _SC, "computed", "pct_from_low_close_3y",   "float%", "% above the 3-year closing low"),
@@ -365,6 +367,7 @@ COLUMNS = [
     _c("From EMA50%",  "Price vs MA (%)", _YFD, _SC, "computed", "pct_from_ema50",   "float%", "% above/below 50-day EMA"),
     _c("From EMA9%",   "Price vs MA (%)", _YFD, _SC, "computed", "pct_from_ema9",    "float%", "% above/below 9-day EMA"),
     _c("From SMA10%",  "Price vs MA (%)", _YFD, _SC, "computed", "pct_from_sma10",   "float%", "% above/below 10-day SMA"),
+    _c("From SMA100%", "Price vs MA (%)", _YFD, _SC, "computed", "pct_from_sma100",  "float%", "% above/below 100-day SMA"),
     _c("From SMA150%", "Price vs MA (%)", _YFD, _SC, "computed", "pct_from_sma150",  "float%", "% above/below 150-day SMA"),
     _c("From SMA20%",  "Price vs MA (%)", _YFD, _SC, "computed", "pct_from_sma20",   "float%", "% above/below 20-day SMA"),
     _c("From SMA200%", "Price vs MA (%)", _YFD, _SC, "computed", "pct_from_sma200",  "float%", "% above/below 200-day SMA"),
@@ -392,6 +395,9 @@ COLUMNS = [
     _c("MACD Line",   "Momentum", _YFD, _SC, "computed", "macd_line",   "float", "MACD line (12-day EMA − 26-day EMA)"),
     _c("MACD Signal", "Momentum", _YFD, _SC, "computed", "macd_signal", "float", "MACD signal line (9-day EMA of MACD)"),
     _c("RSI14",       "Momentum", _YFD, _SC, "computed", "rsi14",       "float", "14-period RSI (>70 overbought, <30 oversold)"),
+    _c("Max RSI 60D", "Momentum", _YFD, _SC, "computed", "max_rsi_60d", "float", "Highest RSI14 over the last 60 sessions"),
+    _c("Max RSI 90D", "Momentum", _YFD, _SC, "computed", "max_rsi_90d", "float", "Highest RSI14 over the last 90 sessions"),
+    _c("20D Px%",     "Momentum", _YFD, _SC, "computed", "ret_20d",     "float%", "20-trading-day close price return %"),
     _c("Stoch D",     "Momentum", _YFD, _SC, "computed", "stoch_d",     "float", "Stochastic %D (3-period SMA of %K)"),
     _c("Stoch K",     "Momentum", _YFD, _SC, "computed", "stoch_k",     "float", "Stochastic %K (14-period)"),
 
@@ -420,6 +426,8 @@ COLUMNS = [
     _c("Avg $Vol 50D",       "Volume", _YFD, _SC, "computed", "avg_dollar_vol_50d",    "float", "Avg daily dollar volume over 50 days"),
     _c("CMF20",              "Volume", _YFD, _SC, "computed", "cmf20",                 "float", "Chaikin Money Flow over 20 periods (−1 to +1)"),
     _c("Med Vol 50D",        "Volume", _YFD, _SC, "computed", "median_volume_50d",     "float", "Median daily volume over 50 days"),
+    _c("Med Vol Ratio 60D%", "Volume", _YFD, _SC, "computed", "med_vol_ratio_60d",     "float%", "Median volume of last 60 sessions vs prior 60 (% change)"),
+    _c("Med Vol Ratio 90D%", "Volume", _YFD, _SC, "computed", "med_vol_ratio_90d",     "float%", "Median volume of last 90 sessions vs prior 90 (% change)"),
     _c("OBV",                "Volume", _YFD, _SC, "computed", "obv",                   "float", "On-Balance Volume (cumulative)"),
     _c("Rel Vol 20D",        "Volume", _YFD, _SC, "computed", "rel_vol_20d",           "float", "Today's volume / 20-day median volume"),
     _c("Rel Vol 50D",        "Volume", _YFD, _SC, "computed", "rel_vol_50d",           "float", "Today's volume / 50-day median volume"),
@@ -477,11 +485,14 @@ COLUMNS = [
     _c("SMA20",  "SMA Values", _YFD, _SC, "raw", "sma20",  "float", "20-day simple moving average of close"),
     _c("SMA200", "SMA Values", _YFD, _SC, "raw", "sma200", "float", "200-day simple moving average of close"),
     _c("SMA50",  "SMA Values", _YFD, _SC, "raw", "sma50",  "float", "50-day simple moving average of close"),
+    _c("SMA100", "SMA Values", _YFD, _SC, "raw", "sma100", "float", "100-day simple moving average of close"),
 
     # ── MA Alignment (Raw) ────────────────────────────────────────────────────
     _c("MA10>MA20",   "MA Alignment (Raw)", _YFD, _SC, "raw", "ma10_gt_ma20",   "bool", "Raw DB boolean: SMA10 > SMA20 (tech_indicators)"),
     _c("MA150>MA200", "MA Alignment (Raw)", _YFD, _SC, "raw", "ma150_gt_ma200", "bool", "Raw DB boolean: SMA150 > SMA200"),
     _c("MA20>MA50",   "MA Alignment (Raw)", _YFD, _SC, "raw", "ma20_gt_ma50",   "bool", "Raw DB boolean: SMA20 > SMA50"),
+    _c("MA50>MA100",  "MA Alignment (Raw)", _YFD, _SC, "raw", "ma50_gt_ma100",  "bool", "Raw DB boolean: SMA50 > SMA100"),
+    _c("MA100>MA150", "MA Alignment (Raw)", _YFD, _SC, "raw", "ma100_gt_ma150", "bool", "Raw DB boolean: SMA100 > SMA150"),
     _c("MA50>MA150",  "MA Alignment (Raw)", _YFD, _SC, "raw", "ma50_gt_ma150",  "bool", "Raw DB boolean: SMA50 > SMA150"),
 
     # ── Tech Metadata ─────────────────────────────────────────────────────────

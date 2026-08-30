@@ -744,6 +744,18 @@ def _migrate_add_columns(con) -> None:
         ("swing_low_date",         "TEXT"),
         ("pct_from_swing_high",    "DOUBLE"),
         ("pct_from_swing_low",     "DOUBLE"),
+        # ── Momentum / high-potential screen ──────────────────────────────
+        ("sma100",                 "DOUBLE"),
+        ("pct_from_sma100",        "DOUBLE"),
+        ("ma50_gt_ma100",          "BOOLEAN"),
+        ("ma100_gt_ma150",         "BOOLEAN"),
+        ("med_vol_ratio_60d",      "DOUBLE"),
+        ("med_vol_ratio_90d",      "DOUBLE"),
+        ("low_close_26w",          "DOUBLE"),
+        ("px_over_26w_low",        "DOUBLE"),
+        ("ret_20d",                "DOUBLE"),
+        ("max_rsi_60d",            "DOUBLE"),
+        ("max_rsi_90d",            "DOUBLE"),
     ]
     existing = {row[0] for row in con.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'tech_indicators'"

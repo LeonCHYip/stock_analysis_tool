@@ -307,6 +307,7 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         sma10  = ta.trend.SMAIndicator(close, window=10).sma_indicator()
         sma20  = ta.trend.SMAIndicator(close, window=20).sma_indicator()
         sma50  = ta.trend.SMAIndicator(close, window=50).sma_indicator()
+        sma100 = ta.trend.SMAIndicator(close, window=100).sma_indicator()
         sma150 = ta.trend.SMAIndicator(close, window=150).sma_indicator()
         sma200 = ta.trend.SMAIndicator(close, window=200).sma_indicator()
         ema9   = ta.trend.EMAIndicator(close, window=9).ema_indicator()
@@ -373,6 +374,7 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         v_sma10  = _safe(_last(sma10))
         v_sma20  = _safe(_last(sma20))
         v_sma50  = _safe(_last(sma50))
+        v_sma100 = _safe(_last(sma100))
         v_sma150 = _safe(_last(sma150))
         v_sma200 = _safe(_last(sma200))
         v_ema9   = _safe(_last(ema9))
@@ -386,6 +388,10 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         ma20_gt_ma50   = (v_sma20 > v_sma50)   if _all_ma else None
         ma50_gt_ma150  = (v_sma50 > v_sma150)  if _all_ma else None
         ma150_gt_ma200 = (v_sma150 > v_sma200) if _all_ma else None
+        # MA50 > MA100 > MA150 (momentum screen) -- SMA100 is not part of _all_ma,
+        # so guard on its own availability.
+        ma50_gt_ma100  = (v_sma50 > v_sma100)  if (v_sma50 is not None and v_sma100 is not None) else None
+        ma100_gt_ma150 = (v_sma100 > v_sma150) if (v_sma100 is not None and v_sma150 is not None) else None
 
         # MA slopes
         def _slope(series: pd.Series, lookback: int) -> float | None:
@@ -420,6 +426,7 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         pct_from_sma10  = _pct_from_ma(latest_close, v_sma10)
         pct_from_sma20  = _pct_from_ma(latest_close, v_sma20)
         pct_from_sma50  = _pct_from_ma(latest_close, v_sma50)
+        pct_from_sma100 = _pct_from_ma(latest_close, v_sma100)
         pct_from_sma150 = _pct_from_ma(latest_close, v_sma150)
         pct_from_sma200 = _pct_from_ma(latest_close, v_sma200)
         pct_from_ema9   = _pct_from_ma(latest_close, v_ema9)
@@ -436,6 +443,20 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         avg_dv20 = _safe(dollar_vol.tail(20).mean(), 0)
         avg_dv50 = _safe(dollar_vol.tail(50).mean(), 0)
         med_vol50 = _safe(volume.tail(50).median(), 0)
+
+        # Median-volume regime shift: median of the last N sessions vs the
+        # median of the prior N (% change). Median (not mean) to resist single
+        # blow-off-volume days. Needs 2N sessions; else None.
+        def _med_vol_ratio(nwin: int) -> float | None:
+            if len(volume) < 2 * nwin:
+                return None
+            recent = volume.tail(nwin).median()
+            prior  = volume.iloc[-2 * nwin:-nwin].median()
+            if prior and prior != 0 and not pd.isna(recent) and not pd.isna(prior):
+                return _safe((recent - prior) / abs(prior) * 100)
+            return None
+        med_vol_ratio_60d = _med_vol_ratio(60)
+        med_vol_ratio_90d = _med_vol_ratio(90)
 
         # 1D volume %
         raw_vol = volume.replace(0, np.nan)
@@ -496,6 +517,22 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         close_3y = close.tail(756)
         high_close_3y  = _safe(close_3y.max())
         low_close_3y   = _safe(close_3y.min())
+
+        # 26-week (126 trading day) low + how many times price is above it
+        # (momentum screen: "3x above 26W low" -> px_over_26w_low >= 3).
+        close_26w = close.tail(126)
+        low_close_26w = _safe(close_26w.min())
+        px_over_26w_low = _safe(latest_close / low_close_26w) \
+            if (latest_close and low_close_26w and low_close_26w != 0) else None
+
+        # 20-trading-day close return % (momentum screen: >= +10).
+        ret_20d = _safe((latest_close / _safe(close.iloc[-21]) - 1) * 100) \
+            if (len(close) >= 21 and latest_close and _safe(close.iloc[-21])) else None
+
+        # Rolling max RSI(14) over the last 60 / 90 sessions (momentum screen:
+        # peaked > 80 recently). rsi14 is the full Series computed above.
+        max_rsi_60d = _safe(rsi14.tail(60).max()) if len(rsi14.dropna()) else None
+        max_rsi_90d = _safe(rsi14.tail(90).max()) if len(rsi14.dropna()) else None
 
         pct_from_high_close_52w = _pct_from_ma(latest_close, high_close_52w)
         pct_from_low_close_52w  = _pct_from_ma(latest_close, low_close_52w)
@@ -751,6 +788,7 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "sma10":               v_sma10,
             "sma20":               v_sma20,
             "sma50":               v_sma50,
+            "sma100":              v_sma100,
             "sma150":              v_sma150,
             "sma200":              v_sma200,
             "ema9":                v_ema9,
@@ -759,11 +797,15 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "ema200":              v_ema200,
             "ma10_gt_ma20":        ma10_gt_ma20,
             "ma20_gt_ma50":        ma20_gt_ma50,
+            "ma50_gt_ma100":       ma50_gt_ma100,
+            "ma100_gt_ma150":      ma100_gt_ma150,
             "ma50_gt_ma150":       ma50_gt_ma150,
             "ma150_gt_ma200":      ma150_gt_ma200,
             "sma50_slope_20d":     sma50_slope_20d,
             "pct_from_sma200":     pct_from_sma200,
             "rsi14":               _safe(_last(rsi14)),
+            "max_rsi_60d":         max_rsi_60d,
+            "max_rsi_90d":         max_rsi_90d,
             "macd_line":           _safe(_last(macd_line)),
             "macd_signal":         _safe(_last(macd_signal)),
             "macd_hist":           _safe(_last(macd_hist)),
@@ -784,6 +826,8 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "avg_dollar_vol_20d":  avg_dv20,
             "avg_dollar_vol_50d":  avg_dv50,
             "median_volume_50d":   med_vol50,
+            "med_vol_ratio_60d":   med_vol_ratio_60d,
+            "med_vol_ratio_90d":   med_vol_ratio_90d,
             "high_52w":            high_52w,
             "low_52w":             low_52w,
             "pct_from_52w_high":   pct_from_52w_high,
@@ -793,6 +837,9 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "low_close_52w":           low_close_52w,
             "pct_from_high_close_52w": pct_from_high_close_52w,
             "pct_from_low_close_52w":  pct_from_low_close_52w,
+            "low_close_26w":           low_close_26w,
+            "px_over_26w_low":         px_over_26w_low,
+            "ret_20d":                 ret_20d,
             "high_close_3y":           high_close_3y,
             "low_close_3y":            low_close_3y,
             "pct_from_high_close_3y":  pct_from_high_close_3y,
@@ -857,6 +904,7 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "pct_from_sma10":      pct_from_sma10,
             "pct_from_sma20":      pct_from_sma20,
             "pct_from_sma50":      pct_from_sma50,
+            "pct_from_sma100":     pct_from_sma100,
             "pct_from_sma150":     pct_from_sma150,
             "pct_from_ema9":       pct_from_ema9,
             "pct_from_ema21":      pct_from_ema21,
