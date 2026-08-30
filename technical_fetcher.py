@@ -1248,6 +1248,46 @@ def fetch_and_store_bulk(tickers: list[str],
     return results
 
 
+def compute_indicators_history(ticker: str, start_date: str | None,
+                                end_date: str | None, progress=None) -> list[dict]:
+    """Compute the full indicator set AS OF each trading day in [start_date,
+    end_date] for one ticker, from stored price_history -- the on-demand
+    historical fill for the export (tech_indicators itself only holds rows
+    from when daily scanning began).
+
+    For a target day D the indicators are computed on the OHLCV window from the
+    ticker's earliest stored bar THROUGH D (so long-window MAs and the
+    cumulative OBV / A-D line are correct as of D, not just a fixed lookback).
+    O(days-in-range) compute calls; use `progress(done, total)` for a bar.
+
+    Returns [{"ticker", "as_of_date", <indicator fields...>}, ...] oldest first;
+    days whose compute errors (e.g. too little data) are skipped.
+    """
+    ohlcv = storage.get_price_history_ohlcv_range(ticker, None, end_date)
+    if not ohlcv:
+        return []
+    df = pd.DataFrame(ohlcv).rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "adj_close": "Adj Close", "volume": "Volume",
+    })
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    dates = [d.date().isoformat() for d in df.index]
+    lo = start_date or dates[0]
+    hi = end_date or dates[-1]
+    idxs = [i for i, d in enumerate(dates) if lo <= d <= hi]
+    total = len(idxs)
+    out: list[dict] = []
+    for n_done, i in enumerate(idxs):
+        fields = _compute_all_indicators(ticker, df.iloc[: i + 1])
+        if "error" not in fields:
+            fields.pop("_as_of_date", None)
+            out.append({"ticker": ticker, "as_of_date": dates[i], **fields})
+        if progress and (n_done % 25 == 0 or n_done == total - 1):
+            progress(n_done + 1, total)
+    return out
+
+
 def refetch_unfinalized(log=print) -> int:
     """
     Re-fetch and update all (ticker, as_of_date) rows where is_finalized=FALSE.

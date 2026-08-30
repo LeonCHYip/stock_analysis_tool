@@ -1989,6 +1989,64 @@ def get_price_history_range(tickers: list[str], start_date: str, end_date: str) 
     return result
 
 
+# ── Export reads (data export tab) ─────────────────────────────────────────────
+# start_date/end_date are ISO 'YYYY-MM-DD' or None (None = unbounded on that end).
+
+def get_price_history_ohlcv_range(ticker: str, start_date: str | None,
+                                   end_date: str | None) -> list[dict]:
+    """Full OHLCV rows for one ticker over a date range, oldest first."""
+    con = _conn()
+    q = ("SELECT CAST(date AS TEXT) AS date, open, high, low, close, adj_close, volume "
+         "FROM price_history WHERE ticker = ?")
+    params: list = [ticker]
+    if start_date:
+        q += " AND date >= ?"; params.append(start_date)
+    if end_date:
+        q += " AND date <= ?"; params.append(end_date)
+    q += " ORDER BY date"
+    rows = con.execute(q, params).fetchall()
+    cols = ["date", "open", "high", "low", "close", "adj_close", "volume"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_tech_indicators_range(ticker: str, start_date: str | None,
+                               end_date: str | None) -> list[dict]:
+    """All computed indicator rows for one ticker over an as_of_date range,
+    oldest first (one row per trading day the ticker was scanned)."""
+    con = _conn()
+    q = "SELECT * FROM tech_indicators WHERE ticker = ?"
+    params: list = [ticker]
+    if start_date:
+        q += " AND as_of_date >= ?"; params.append(start_date)
+    if end_date:
+        q += " AND as_of_date <= ?"; params.append(end_date)
+    q += " ORDER BY as_of_date"
+    rows = con.execute(q, params).fetchall()
+    if not rows:
+        return []
+    cols = [d[0] for d in con.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_earnings_range(ticker: str, start_date: str | None,
+                        end_date: str | None) -> list[dict]:
+    """All earnings_history rows for one ticker over an earnings_date range,
+    oldest first."""
+    con = _conn()
+    q = "SELECT * FROM earnings_history WHERE ticker = ?"
+    params: list = [ticker]
+    if start_date:
+        q += " AND earnings_date >= ?"; params.append(start_date)
+    if end_date:
+        q += " AND earnings_date <= ?"; params.append(end_date)
+    q += " ORDER BY earnings_date"
+    rows = con.execute(q, params).fetchall()
+    if not rows:
+        return []
+    cols = [d[0] for d in con.description]
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def get_all_earnings_with_null_extended() -> dict[str, list[dict]]:
     """Return {earnings_date: [row_dict, ...]} for ALL earnings_history records
     where any extended column is NULL and earnings_date/earnings_time are set.

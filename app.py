@@ -112,6 +112,7 @@ from technical_fetcher import (
     fetch_and_store_bulk as fetch_technical_bulk_v2,
     refetch_unfinalized as _tf_refetch_unfinalized,
     refetch_stale_tickers as _tf_refetch_stale,
+    compute_indicators_history as _tf_compute_ind_history,
 )
 import fundamental_fetcher
 from fundamental_fetcher import fetch_fundamental
@@ -4705,18 +4706,21 @@ def render_scan_tab(tab_id: str) -> None:
         _sort_col = st.session_state.get(_tab_extra_ss(tab_id, "sort_col"), "Score")
         _sorted_tickers = []
 
-    # ── Show sub-indicators | Latest per ticker | Latest close | Row count ─────
-    row8c1, row8c2, row8c3, row8c4 = st.columns(4)
+    # ── Show sub-indicators | Show key columns | Latest per ticker | Latest close | Row count ─
+    row8c1, row8c2, row8c3, row8c4, row8c5 = st.columns(5)
     with row8c1:
         all_show_sub = st.checkbox("Show sub-indicators", value=False,
                                    key=tk["show_sub"])
     with row8c2:
+        all_show_key = st.checkbox("Show key columns", value=True,
+                                   key=_tab_extra_ss(tab_id, "show_key_cols"))
+    with row8c3:
         only_latest = st.checkbox("Latest entry per ticker only", value=False,
                                   key=tk["only_latest"])
-    with row8c3:
+    with row8c4:
         st.checkbox("Latest close date only", value=True,
                     key=tk["only_latest_close"])
-    with row8c4:
+    with row8c5:
         st.caption(f"Showing **{len(filt_rows)}** / {total_before} rows")
 
     st.markdown(
@@ -4737,7 +4741,7 @@ def render_scan_tab(tab_id: str) -> None:
         .stDataEditor [col-id="fundamental -ve"] .ag-group-value {
             white-space: pre-wrap !important;
         }
-        .stDataEditor [col-id="Sector"] { min-width: 48px; max-width: 48px; }
+        .stDataEditor [col-id="Sector"] { min-width: 29px; max-width: 29px; }
         .stDataEditor [col-id="Industry"] { min-width: 18px; max-width: 18px; }
         .stDataEditor [col-id="Mkt Cap ($B)"] { min-width: 25px; max-width: 25px; }
         </style>""",
@@ -4758,6 +4762,30 @@ def render_scan_tab(tab_id: str) -> None:
 
     _emoji_base = ["#"] + _emoji_ind_cols + ["Score"]
     _emoji_placed = set(_emoji_base)
+    # "Show key columns" (checkbox, default on): a fixed curated set placed
+    # immediately after Score, in this exact order, BEFORE any active filter
+    # cols. Deduped via _emoji_placed, so a filter col that is also a key col
+    # stays in this group and is NOT injected again below (no duplicate); the
+    # filter-col loop that follows therefore lands remaining filter cols to the
+    # right of this group (i.e. right of EV/EBITDA).
+    _key_emoji_cols = [
+        "PEG Ratio", "Institutions%", "Short % Float (Y)", "Ins Net %",
+        "Earns 1D Px%", "Earns 1D Vol%", "Earns 5D Px%", "Earns 5D Vol%",
+        "Up Streak Days", "From 52W High%", "ATR%", "Avg $Vol 20D / Mkt Cap%",
+        "Q Revenue ($B)", "Q EBITDA ($B)", "Q Net Income ($B)",
+        "EV/Revenue", "EV/EBITDA",
+    ]
+    if all_show_key:
+        for _kc in _key_emoji_cols:
+            if _kc not in _emoji_placed:
+                if _kc not in all_df_disp.columns:
+                    _kc_vals = {t: _pre_val_records.get(t, {}).get(_kc) for t in all_df_disp.index}
+                    all_df_disp = all_df_disp.copy()
+                    all_df_disp[_kc] = all_df_disp.index.map(_kc_vals)
+                # Read-only (computed value); "small" preset ≈ half default width.
+                all_col_cfg.setdefault(_kc, st.column_config.Column(_kc, width="small", disabled=True))
+                _emoji_base.append(_kc)
+                _emoji_placed.add(_kc)
     # Auto-inject active column filter cols then sort col immediately after Score
     _active_filt_cols = list(st.session_state.get(f"col_filt_cols_{tab_id}", []))
     for _fc in _active_filt_cols:
@@ -4992,14 +5020,15 @@ with _plus_col_r:
 
 _all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + [
     "🤖 AI Analysis", "📡 Event Scanner", "🔀 Swing Cycle Analysis",
-    "🧪 Strategy Backtester", "📖 Column Reference",
+    "🧪 Strategy Backtester", "📤 Export Data", "📖 Column Reference",
 ]
 _all_tab_widgets = st.tabs(_all_tab_labels)
-_scan_tab_widgets = _all_tab_widgets[:-5]
-tab_ai       = _all_tab_widgets[-5]
-tab_event    = _all_tab_widgets[-4]
-tab_swing    = _all_tab_widgets[-3]
-tab_backtest = _all_tab_widgets[-2]
+_scan_tab_widgets = _all_tab_widgets[:-6]
+tab_ai       = _all_tab_widgets[-6]
+tab_event    = _all_tab_widgets[-5]
+tab_swing    = _all_tab_widgets[-4]
+tab_backtest = _all_tab_widgets[-3]
+tab_export   = _all_tab_widgets[-2]
 tab_ref      = _all_tab_widgets[-1]
 
 
@@ -5844,6 +5873,135 @@ with tab_backtest:
 
     if "bt_result" in st.session_state:
         _bt_render_result(st.session_state["bt_result"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB: Export Data
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_export_files(tickers: list[str], start: str | None, end: str | None,
+                        want_ohlcv: bool, want_ind: bool, want_fund: bool,
+                        fmt: str, progress_cb=None) -> list[tuple[str, bytes]]:
+    """Return [(filename, bytes), ...]. Time-series (OHLCV, indicators) and
+    non-time-series (fundamentals snapshot, earnings history) each go to their
+    OWN file; filenames encode ticker + data-type + the actual date range of
+    the data returned. fmt is "CSV" or "JSON".
+
+    Indicators are computed ON DEMAND from price_history for the full requested
+    range (tech_indicators only holds rows since scanning began) -- the slow
+    step, so progress_cb(frac, label) is reported through it."""
+    ext = "csv" if fmt == "CSV" else "json"
+
+    def _bytes(df: pd.DataFrame) -> bytes:
+        if fmt == "CSV":
+            return df.to_csv(index=False).encode("utf-8")
+        return df.to_json(orient="records", indent=2, date_format="iso").encode("utf-8")
+
+    def _rng(rows: list[dict], key: str) -> str:
+        ds = sorted(str(r[key]) for r in rows if r.get(key))
+        return f"{ds[0]}_{ds[-1]}" if ds else f"{start or 'earliest'}_{end or 'latest'}"
+
+    files: list[tuple[str, bytes]] = []
+    n = len(tickers)
+    for i, t in enumerate(tickers):
+        if want_ohlcv:
+            rows = storage.get_price_history_ohlcv_range(t, start, end)
+            if rows:
+                files.append((f"{t}_ohlcv_{_rng(rows,'date')}.{ext}", _bytes(pd.DataFrame(rows))))
+        if want_ind:
+            def _sub(done, total, _t=t, _i=i):
+                if progress_cb:
+                    progress_cb((_i + done / max(total, 1)) / n, f"{_t}: indicators {done:,}/{total:,} days")
+            rows = _tf_compute_ind_history(t, start, end, progress=_sub)
+            if rows:
+                files.append((f"{t}_indicators_{_rng(rows,'as_of_date')}.{ext}", _bytes(pd.DataFrame(rows))))
+        if want_fund:
+            fund = storage.get_latest_fundamental(t)
+            if fund:
+                fund = {k: v for k, v in fund.items() if k != "raw_info_json"}  # drop bulky blob
+                _fd = str(fund.get("fetch_date") or "latest")
+                files.append((f"{t}_fundamentals_{_fd}.{ext}", _bytes(pd.DataFrame([fund]))))
+            earn = storage.get_earnings_range(t, start, end)
+            if earn:
+                files.append((f"{t}_earnings_{_rng(earn,'earnings_date')}.{ext}", _bytes(pd.DataFrame(earn))))
+        if progress_cb:
+            progress_cb((i + 1) / n, f"{t}: done")
+    return files
+
+
+with tab_export:
+    st.markdown("### 📤 Export Data")
+    st.caption("Export raw OHLCV, computed indicators, latest fundamentals and earnings "
+               "history for one or more tickers as CSV or JSON. Time-series and "
+               "fundamental data go to separate files; multiple files download as a .zip.")
+
+    _ex_tk_raw = st.text_input("Tickers (comma or space separated)",
+                               key="export_tickers", placeholder="e.g. AAPL, MSFT NVDA")
+    _exc1, _exc2 = st.columns(2)
+    with _exc1:
+        _ex_start = st.date_input("Start date (blank = earliest)", value=None,
+                                  key="export_start", format="YYYY-MM-DD")
+    with _exc2:
+        _ex_end = st.date_input("End date (blank = latest)", value=None,
+                                key="export_end", format="YYYY-MM-DD")
+
+    st.write("**Data to include:**")
+    _exd1, _exd2, _exd3 = st.columns(3)
+    with _exd1:
+        _ex_ohlcv = st.checkbox("OHLCV (raw price/volume)", value=True, key="export_ohlcv")
+    with _exd2:
+        _ex_ind = st.checkbox("Indicators (computed)", value=True, key="export_ind")
+    with _exd3:
+        _ex_fund = st.checkbox("Fundamentals + earnings", value=True, key="export_fund")
+
+    _ex_fmt = st.radio("File format", ["CSV", "JSON"], horizontal=True, key="export_fmt")
+
+    if st.button("Prepare export", type="primary", key="export_prepare"):
+        _tickers = [x.upper() for x in (_ex_tk_raw or "").replace(",", " ").split() if x.strip()]
+        _s = _ex_start.isoformat() if _ex_start else None
+        _e = _ex_end.isoformat() if _ex_end else None
+        if not _tickers:
+            st.warning("Enter at least one ticker.")
+            st.session_state.pop("_export_ready", None)
+        elif not (_ex_ohlcv or _ex_ind or _ex_fund):
+            st.warning("Select at least one data type.")
+            st.session_state.pop("_export_ready", None)
+        else:
+            _ex_prog = st.progress(0.0, text="Preparing export…")
+            def _ex_pcb(frac, label):
+                _ex_prog.progress(min(max(frac, 0.0), 1.0), text=label)
+            if _ex_ind:
+                st.caption("Indicators are computed on demand from full price history — "
+                           "this can take a while for long ranges / many tickers.")
+            _files = _build_export_files(_tickers, _s, _e, _ex_ohlcv, _ex_ind, _ex_fund,
+                                         _ex_fmt, progress_cb=_ex_pcb)
+            _ex_prog.empty()
+            if not _files:
+                st.warning("No matching data found for those tickers / date range.")
+                st.session_state.pop("_export_ready", None)
+            elif len(_files) == 1:
+                st.session_state["_export_ready"] = {
+                    "name": _files[0][0], "data": _files[0][1],
+                    "mime": "text/csv" if _ex_fmt == "CSV" else "application/json",
+                }
+            else:
+                import io, zipfile
+                _buf = io.BytesIO()
+                with zipfile.ZipFile(_buf, "w", zipfile.ZIP_DEFLATED) as _z:
+                    for _name, _data in _files:
+                        _z.writestr(_name, _data)
+                _tag = "-".join(_tickers[:4]) + ("" if len(_tickers) <= 4 else f"-plus{len(_tickers)-4}")
+                st.session_state["_export_ready"] = {
+                    "name": f"export_{_tag}_{_s or 'earliest'}_{_e or 'latest'}.zip",
+                    "data": _buf.getvalue(), "mime": "application/zip",
+                }
+
+    _ex_ready = st.session_state.get("_export_ready")
+    if _ex_ready:
+        st.download_button(f"⬇ Download {_ex_ready['name']}",
+                           data=_ex_ready["data"], file_name=_ex_ready["name"],
+                           mime=_ex_ready["mime"], key="export_download")
+        st.caption(f"Prepared **{_ex_ready['name']}** — {len(_ex_ready['data'])/1024:.1f} KB")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB: Column Reference
