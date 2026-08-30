@@ -626,6 +626,14 @@ _COL_FILTER_DATES = {"Q End Date", "A End Date", "Last Close Date", "Last Earnin
 _COL_FILTER_OPS   = [">=", "<=", ">", "<", "="]
 # All user-filterable value columns (ordered, deduplicated)
 _FILTERABLE_COLS  = [c for c in ALL_VALUE_COLS if c not in _COL_FILTER_SKIP]
+# Numeric-only filterable columns -- the pickable "second column" for
+# column-vs-column numeric comparisons (excludes emoji/bool, categorical,
+# free-text, and date columns).
+_NUMERIC_FILTER_COLS = [
+    c for c in _FILTERABLE_COLS
+    if c not in _COL_FILTER_EMOJI and c not in _COL_FILTER_TEXT_CAT
+    and c not in _COL_FILTER_TEXT_SEARCH and c not in _COL_FILTER_DATES
+]
 
 # Sub-indicator display labels (for column headers)
 SUB_DISPLAY = {
@@ -2954,7 +2962,12 @@ def _actually_clear_filter_keys(tab_key: str) -> None:
     stale = [k for k in st.session_state
              if k.startswith(f"col_filt_op_{tab_key}_")
              or k.startswith(f"col_filt_numval_{tab_key}_")
-             or k.startswith(f"col_filt_catvals_{tab_key}_")]
+             or k.startswith(f"col_filt_catvals_{tab_key}_")
+             or k.startswith(f"col_filt_textval_{tab_key}_")
+             or k.startswith(f"col_filt_mode_{tab_key}_")
+             or k.startswith(f"col_filt_col2_{tab_key}_")
+             or k.startswith(f"col_filt_factor_{tab_key}_")
+             or k.startswith(f"col_filt_offset_{tab_key}_")]
     for k in stale:
         del st.session_state[k]
 
@@ -2986,6 +2999,11 @@ def _actually_apply_filter_group(tab_key: str, group: dict) -> None:
         else:
             st.session_state[f"col_filt_op_{tab_key}_{col}"]     = group.get(f"_cfop_{col}", ">=")
             st.session_state[f"col_filt_numval_{tab_key}_{col}"] = group.get(f"_cfval_{col}")
+            # column-vs-column state (older groups lack these -> default to "vs value")
+            st.session_state[f"col_filt_mode_{tab_key}_{col}"]   = group.get(f"_cfmode_{col}", "vs value")
+            st.session_state[f"col_filt_col2_{tab_key}_{col}"]   = group.get(f"_cfcol2_{col}")
+            st.session_state[f"col_filt_factor_{tab_key}_{col}"] = group.get(f"_cffactor_{col}", 1.0)
+            st.session_state[f"col_filt_offset_{tab_key}_{col}"] = group.get(f"_cfoffset_{col}", 0.0)
 
 
 def _queue_filter_clear(tab_key: str) -> None:
@@ -3038,8 +3056,13 @@ def _snapshot_filter_group(tab_key: str) -> dict:
         elif col in _COL_FILTER_TEXT_SEARCH:
             group[f"_cftextval_{col}"] = st.session_state.get(f"col_filt_textval_{tab_key}_{col}", "")
         else:
-            group[f"_cfop_{col}"]  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
-            group[f"_cfval_{col}"] = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
+            group[f"_cfop_{col}"]     = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
+            group[f"_cfval_{col}"]    = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
+            # column-vs-column comparison (numeric/date "vs column" mode)
+            group[f"_cfmode_{col}"]   = st.session_state.get(f"col_filt_mode_{tab_key}_{col}", "vs value")
+            group[f"_cfcol2_{col}"]   = st.session_state.get(f"col_filt_col2_{tab_key}_{col}")
+            group[f"_cffactor_{col}"] = st.session_state.get(f"col_filt_factor_{tab_key}_{col}", 1.0)
+            group[f"_cfoffset_{col}"] = st.session_state.get(f"col_filt_offset_{tab_key}_{col}", 0.0)
     return group
 
 
@@ -3099,6 +3122,11 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
     )
     if col_filt_selected:
         for col in col_filt_selected:
+          # Keyed container anchors each filter row so its internal st.columns
+          # child-count change (3 slots in "vs value" ↔ 5 in "vs column")
+          # stays isolated and doesn't shift downstream siblings (Sort/row8),
+          # which otherwise leaves a ghost/overlap copy in Streamlit.
+          with st.container(key=f"colfilt_row_{tab_key}_{col}"):
             if col in _COL_FILTER_EMOJI:
                 st.multiselect(
                     f"{col}",
@@ -3118,42 +3146,65 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
                     placeholder="partial match (case-insensitive)",
                 )
             elif col in _COL_FILTER_DATES:
+                _dmode = st.radio(f"mode_{col}", ["vs value", "vs column"],
+                                  horizontal=True, key=f"col_filt_mode_{tab_key}_{col}",
+                                  label_visibility="collapsed")
                 dc1, dc2, dc3 = st.columns([2, 1, 3])
                 with dc1:
                     st.markdown(f"**{col}**")
                 with dc2:
-                    st.selectbox(
-                        f"op_{col}",
-                        options=_COL_FILTER_OPS,
-                        key=f"col_filt_op_{tab_key}_{col}",
-                        label_visibility="collapsed",
-                    )
+                    st.selectbox(f"op_{col}", options=_COL_FILTER_OPS,
+                                 key=f"col_filt_op_{tab_key}_{col}",
+                                 label_visibility="collapsed")
                 with dc3:
-                    st.text_input(
-                        f"val_{col}",
-                        key=f"col_filt_numval_{tab_key}_{col}",
-                        label_visibility="collapsed",
-                        placeholder="YYYY-MM-DD",
-                    )
+                    if _dmode == "vs column":
+                        st.selectbox(f"col2_{col}",
+                                     options=[c for c in sorted(_COL_FILTER_DATES) if c != col],
+                                     key=f"col_filt_col2_{tab_key}_{col}", index=None,
+                                     placeholder="compare to date column…",
+                                     label_visibility="collapsed")
+                    else:
+                        st.text_input(f"val_{col}",
+                                      key=f"col_filt_numval_{tab_key}_{col}",
+                                      label_visibility="collapsed", placeholder="YYYY-MM-DD")
             else:
-                nc1, nc2, nc3 = st.columns([2, 1, 3])
-                with nc1:
-                    st.markdown(f"**{col}**")
-                with nc2:
-                    st.selectbox(
-                        f"op_{col}",
-                        options=_COL_FILTER_OPS,
-                        key=f"col_filt_op_{tab_key}_{col}",
-                        label_visibility="collapsed",
-                    )
-                with nc3:
-                    st.number_input(
-                        f"val_{col}",
-                        key=f"col_filt_numval_{tab_key}_{col}",
-                        label_visibility="collapsed",
-                        value=None,
-                        placeholder="numeric value",
-                    )
+                _nmode = st.radio(f"mode_{col}", ["vs value", "vs column"],
+                                  horizontal=True, key=f"col_filt_mode_{tab_key}_{col}",
+                                  label_visibility="collapsed")
+                if _nmode == "vs column":
+                    nc1, nc2, nc3, nc4, nc5 = st.columns([2, 1, 1, 3, 1])
+                    with nc1:
+                        st.markdown(f"**{col}**")
+                    with nc2:
+                        st.selectbox(f"op_{col}", options=_COL_FILTER_OPS,
+                                     key=f"col_filt_op_{tab_key}_{col}",
+                                     label_visibility="collapsed")
+                    with nc3:
+                        st.number_input(f"factor_{col}", value=1.0, step=0.1,
+                                        key=f"col_filt_factor_{tab_key}_{col}",
+                                        label_visibility="collapsed", help="× second column")
+                    with nc4:
+                        st.selectbox(f"col2_{col}",
+                                     options=[c for c in _NUMERIC_FILTER_COLS if c != col],
+                                     key=f"col_filt_col2_{tab_key}_{col}", index=None,
+                                     placeholder="× column…", label_visibility="collapsed")
+                    with nc5:
+                        st.number_input(f"offset_{col}", value=0.0, step=1.0,
+                                        key=f"col_filt_offset_{tab_key}_{col}",
+                                        label_visibility="collapsed", help="+ offset")
+                else:
+                    nc1, nc2, nc3 = st.columns([2, 1, 3])
+                    with nc1:
+                        st.markdown(f"**{col}**")
+                    with nc2:
+                        st.selectbox(f"op_{col}", options=_COL_FILTER_OPS,
+                                     key=f"col_filt_op_{tab_key}_{col}",
+                                     label_visibility="collapsed")
+                    with nc3:
+                        st.number_input(f"val_{col}",
+                                        key=f"col_filt_numval_{tab_key}_{col}",
+                                        label_visibility="collapsed", value=None,
+                                        placeholder="numeric value")
 
     # Build col_filter dict from current widget states
     col_filter: dict = {}
@@ -3167,15 +3218,31 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
             if val:
                 col_filter[col] = {"type": "text", "val": val}
         elif col in _COL_FILTER_DATES:
-            op  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
-            val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}", "")
-            if val:
-                col_filter[col] = {"type": "date", "op": op, "val": str(val)}
+            op   = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
+            mode = st.session_state.get(f"col_filt_mode_{tab_key}_{col}", "vs value")
+            if mode == "vs column":
+                col2 = st.session_state.get(f"col_filt_col2_{tab_key}_{col}")
+                if col2:
+                    col_filter[col] = {"type": "datecol", "op": op, "col2": col2}
+            else:
+                val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}", "")
+                if val:
+                    col_filter[col] = {"type": "date", "op": op, "val": str(val)}
         else:
-            op  = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
-            val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
-            if val is not None:
-                col_filter[col] = {"type": "num", "op": op, "val": float(val)}
+            op   = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
+            mode = st.session_state.get(f"col_filt_mode_{tab_key}_{col}", "vs value")
+            if mode == "vs column":
+                col2 = st.session_state.get(f"col_filt_col2_{tab_key}_{col}")
+                if col2:
+                    col_filter[col] = {
+                        "type": "numcol", "op": op, "col2": col2,
+                        "factor": float(st.session_state.get(f"col_filt_factor_{tab_key}_{col}", 1.0) or 1.0),
+                        "offset": float(st.session_state.get(f"col_filt_offset_{tab_key}_{col}", 0.0) or 0.0),
+                    }
+            else:
+                val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
+                if val is not None:
+                    col_filter[col] = {"type": "num", "op": op, "val": float(val)}
 
     # ── Custom filter groups manager ──────────────────────────────────────────
     with st.expander("Manage filter groups"):
@@ -3285,7 +3352,12 @@ def apply_indicator_filter(rows: list[dict],
 
 
 def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
-    """Return True if a value-table record passes one column filter spec."""
+    """Return True if a value-table record passes one column filter spec.
+
+    Spec types: "cat", "text", "num"/"date" (vs a fixed value), and
+    "numcol"/"datecol" (vs a SECOND column). numcol compares
+    col1 <op> factor*col2 + offset; datecol compares the two ISO date strings.
+    """
     val = rec.get(col)
     if val is None:
         return False
@@ -3294,22 +3366,43 @@ def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
         return str(val) in spec["vals"]
     if t == "text":
         return spec["val"].lower() in str(val).lower()
-    op, fv = spec["op"], spec["val"]
+
+    op = spec["op"]
+    def _cmp(a, b):  # works for floats and (ISO) date strings alike
+        return (op == "=" and a == b) or (op == ">" and a > b) \
+            or (op == "<" and a < b) or (op == ">=" and a >= b) \
+            or (op == "<=" and a <= b)
+
+    _BADDATE = ("N/A", "", "None", "nan")
+
+    if t == "numcol":
+        try:
+            n1 = float(val); n2 = float(rec.get(spec["col2"]))
+        except (TypeError, ValueError):
+            return False
+        # Round the computed target: factor*col2 introduces float noise
+        # (e.g. 1.1*100 = 110.00000000000001) that would break boundary
+        # equality; 9 dp keeps ample precision for financial values.
+        target = round(spec.get("factor", 1.0) * n2 + spec.get("offset", 0.0), 9)
+        return _cmp(round(n1, 9), target)
+    if t == "datecol":
+        s1, s2 = str(val), str(rec.get(spec["col2"]))
+        if s1 in _BADDATE or s2 in _BADDATE:
+            return False
+        return _cmp(s1, s2)
+
+    fv = spec["val"]
     if t == "date":
         sval = str(val)
-        if sval in ("N/A", "", "None", "nan"):
+        if sval in _BADDATE:
             return False
-        return (op == "=" and sval == fv) or (op == ">" and sval > fv) \
-            or (op == "<" and sval < fv) or (op == ">=" and sval >= fv) \
-            or (op == "<=" and sval <= fv)
-    # numeric
+        return _cmp(sval, fv)
+    # numeric (vs fixed value)
     try:
         nval = float(val)
     except (TypeError, ValueError):
         return False
-    return (op == "=" and nval == fv) or (op == ">" and nval > fv) \
-        or (op == "<" and nval < fv) or (op == ">=" and nval >= fv) \
-        or (op == "<=" and nval <= fv)
+    return _cmp(nval, fv)
 
 
 def apply_col_filter(tickers: list[str], col_filter: dict,
