@@ -2739,12 +2739,17 @@ def _copy_tab_settings(src_id: str, dst_id: str) -> None:
     sk = f"filt_inds_{src_id}"
     if sk in st.session_state:
         st.session_state[f"filt_inds_{dst_id}"] = copy.deepcopy(st.session_state[sk])
-    # Column filter sub-keys
-    for col in st.session_state.get(f"col_filt_cols_{src_id}", []):
-        for prefix in ["col_filt_catvals", "col_filt_op", "col_filt_numval"]:
-            sk = f"{prefix}_{src_id}_{col}"
+    # Column filter rows (id list + counter + every per-row widget key)
+    for _base in [f"col_filt_rows_{src_id}", f"col_filt_nextid_{src_id}"]:
+        if _base in st.session_state:
+            st.session_state[_base.replace(src_id, dst_id, 1)] = copy.deepcopy(
+                st.session_state[_base])
+    for rid in st.session_state.get(f"col_filt_rows_{src_id}", []):
+        for field in _COL_FILTER_ROW_FIELDS:
+            sk = f"col_filt_{field}_{src_id}_{rid}"
             if sk in st.session_state:
-                st.session_state[f"{prefix}_{dst_id}_{col}"] = copy.deepcopy(st.session_state[sk])
+                st.session_state[f"col_filt_{field}_{dst_id}_{rid}"] = copy.deepcopy(
+                    st.session_state[sk])
     # Column group selection
     for sfx in [f"val_cols_{src_id}", f"_val_cols_shadow_{src_id}"]:
         if sfx in st.session_state:
@@ -2957,17 +2962,13 @@ def _actually_clear_filter_keys(tab_key: str) -> None:
         k = f"filt_vals_{tab_key}_{ind}"
         if k in st.session_state:
             del st.session_state[k]
-    # Clear column filter keys
-    st.session_state[f"col_filt_cols_{tab_key}"] = []
+    # Clear column filter rows + all per-row widget keys (also sweeps any
+    # legacy per-column keys, which share the same col_filt_{field}_ prefixes).
+    st.session_state[f"col_filt_rows_{tab_key}"]   = []
+    st.session_state[f"col_filt_nextid_{tab_key}"] = 0
+    st.session_state.pop(f"col_filt_cols_{tab_key}", None)  # legacy multiselect key
     stale = [k for k in st.session_state
-             if k.startswith(f"col_filt_op_{tab_key}_")
-             or k.startswith(f"col_filt_numval_{tab_key}_")
-             or k.startswith(f"col_filt_catvals_{tab_key}_")
-             or k.startswith(f"col_filt_textval_{tab_key}_")
-             or k.startswith(f"col_filt_mode_{tab_key}_")
-             or k.startswith(f"col_filt_col2_{tab_key}_")
-             or k.startswith(f"col_filt_factor_{tab_key}_")
-             or k.startswith(f"col_filt_offset_{tab_key}_")]
+             if any(k.startswith(f"col_filt_{f}_{tab_key}_") for f in _COL_FILTER_ROW_FIELDS)]
     for k in stale:
         del st.session_state[k]
 
@@ -2989,21 +2990,12 @@ def _actually_apply_filter_group(tab_key: str, group: dict) -> None:
     st.session_state[f"filt_inds_{tab_key}"] = group.get("selected_inds", [])
     for ind, vals in group.get("ind_vals", {}).items():
         st.session_state[f"filt_vals_{tab_key}_{ind}"] = vals
-    # Column filter
-    st.session_state[f"col_filt_cols_{tab_key}"] = group.get("col_filt_cols", [])
-    for col in group.get("col_filt_cols", []):
-        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
-            st.session_state[f"col_filt_catvals_{tab_key}_{col}"] = group.get(f"_cfcatvals_{col}", [])
-        elif col in _COL_FILTER_TEXT_SEARCH:
-            st.session_state[f"col_filt_textval_{tab_key}_{col}"] = group.get(f"_cftextval_{col}", "")
-        else:
-            st.session_state[f"col_filt_op_{tab_key}_{col}"]     = group.get(f"_cfop_{col}", ">=")
-            st.session_state[f"col_filt_numval_{tab_key}_{col}"] = group.get(f"_cfval_{col}")
-            # column-vs-column state (older groups lack these -> default to "vs value")
-            st.session_state[f"col_filt_mode_{tab_key}_{col}"]   = group.get(f"_cfmode_{col}", "vs value")
-            st.session_state[f"col_filt_col2_{tab_key}_{col}"]   = group.get(f"_cfcol2_{col}")
-            st.session_state[f"col_filt_factor_{tab_key}_{col}"] = group.get(f"_cffactor_{col}", 1.0)
-            st.session_state[f"col_filt_offset_{tab_key}_{col}"] = group.get(f"_cfoffset_{col}", 0.0)
+    # Column filter — clear any existing rows, then load from the saved group
+    # (new col_filt_conditions format, or migrated legacy per-column format).
+    for _k in [k for k in st.session_state
+               if any(k.startswith(f"col_filt_{f}_{tab_key}_") for f in _COL_FILTER_ROW_FIELDS)]:
+        del st.session_state[_k]
+    _load_col_filter_conditions(tab_key, _col_filter_conditions_from_group(group))
 
 
 def _queue_filter_clear(tab_key: str) -> None:
@@ -3035,6 +3027,163 @@ def _process_pending_ops() -> None:
             st.session_state[f"_val_cols_shadow_{tab_key}"] = cols
 
 
+# ── Column-value filter rows ──────────────────────────────────────────────────
+# Each row is one condition. A column may appear in multiple rows so it can be
+# compared against different values/columns (e.g. Close >= 1.1*SMA50 AND
+# Close <= 1.3*SMA200). Rows are identified by a stable integer id in
+# session_state[f"col_filt_rows_{tab}"]; per-row widget keys are
+# f"col_filt_{field}_{tab}_{rid}" for field in _COL_FILTER_ROW_FIELDS.
+# "numval" is the numeric number_input; "dateval" is the date text_input. They
+# are kept separate so a row whose column switches numeric<->date never feeds a
+# float into a text_input (which raises in Streamlit).
+_COL_FILTER_ROW_FIELDS = ("col", "op", "numval", "dateval", "catvals", "textval",
+                          "mode", "col2", "factor", "offset")
+
+
+def _cf_get(tab_key: str, rid, field, default=None):
+    return st.session_state.get(f"col_filt_{field}_{tab_key}_{rid}", default)
+
+
+def _col_filter_row_ids(tab_key: str) -> list:
+    return list(st.session_state.get(f"col_filt_rows_{tab_key}", []))
+
+
+def _build_col_row_spec(tab_key: str, rid):
+    """Return (col, spec) for one filter row, or (None, None) if incomplete."""
+    col = _cf_get(tab_key, rid, "col")
+    if not col:
+        return None, None
+    if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
+        catvals = _cf_get(tab_key, rid, "catvals", [])
+        if catvals:
+            return col, {"type": "cat", "vals": set(catvals)}
+    elif col in _COL_FILTER_TEXT_SEARCH:
+        val = _cf_get(tab_key, rid, "textval", "")
+        if val:
+            return col, {"type": "text", "val": val}
+    elif col in _COL_FILTER_DATES:
+        op   = _cf_get(tab_key, rid, "op", ">=")
+        mode = _cf_get(tab_key, rid, "mode", "vs value")
+        if mode == "vs column":
+            col2 = _cf_get(tab_key, rid, "col2")
+            if col2:
+                return col, {"type": "datecol", "op": op, "col2": col2}
+        else:
+            val = _cf_get(tab_key, rid, "dateval", "")
+            if val:
+                return col, {"type": "date", "op": op, "val": str(val)}
+    else:
+        op   = _cf_get(tab_key, rid, "op", ">=")
+        mode = _cf_get(tab_key, rid, "mode", "vs value")
+        if mode == "vs column":
+            col2 = _cf_get(tab_key, rid, "col2")
+            if col2:
+                return col, {"type": "numcol", "op": op, "col2": col2,
+                             "factor": float(_cf_get(tab_key, rid, "factor", 1.0) or 1.0),
+                             "offset": float(_cf_get(tab_key, rid, "offset", 0.0) or 0.0)}
+        else:
+            val = _cf_get(tab_key, rid, "numval")
+            if val is not None:
+                return col, {"type": "num", "op": op, "val": float(val)}
+    return None, None
+
+
+def _build_col_filter(tab_key: str) -> list:
+    """List of (col, spec) for all complete filter rows, in display order."""
+    out = []
+    for rid in _col_filter_row_ids(tab_key):
+        col, spec = _build_col_row_spec(tab_key, rid)
+        if spec is not None:
+            out.append((col, spec))
+    return out
+
+
+def _active_filter_columns(tab_key: str) -> list:
+    """Columns referenced by any filter row (primary col + comparison col2)."""
+    cols: list = []
+    for rid in _col_filter_row_ids(tab_key):
+        for fld in ("col", "col2"):
+            c = _cf_get(tab_key, rid, fld)
+            if c and c not in cols:
+                cols.append(c)
+    return cols
+
+
+def _col_filter_conditions_snapshot(tab_key: str) -> list:
+    """Serialise current filter rows to a list of plain-dict conditions."""
+    conditions = []
+    for rid in _col_filter_row_ids(tab_key):
+        col = _cf_get(tab_key, rid, "col")
+        if not col:
+            continue
+        cond = {"col": col}
+        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
+            cond["catvals"] = _cf_get(tab_key, rid, "catvals", [])
+        elif col in _COL_FILTER_TEXT_SEARCH:
+            cond["textval"] = _cf_get(tab_key, rid, "textval", "")
+        elif col in _COL_FILTER_DATES:
+            cond["op"]      = _cf_get(tab_key, rid, "op", ">=")
+            cond["mode"]    = _cf_get(tab_key, rid, "mode", "vs value")
+            cond["col2"]    = _cf_get(tab_key, rid, "col2")
+            cond["dateval"] = _cf_get(tab_key, rid, "dateval", "")
+        else:
+            cond["op"]     = _cf_get(tab_key, rid, "op", ">=")
+            cond["numval"] = _cf_get(tab_key, rid, "numval")
+            cond["mode"]   = _cf_get(tab_key, rid, "mode", "vs value")
+            cond["col2"]   = _cf_get(tab_key, rid, "col2")
+            cond["factor"] = _cf_get(tab_key, rid, "factor", 1.0)
+            cond["offset"] = _cf_get(tab_key, rid, "offset", 0.0)
+        conditions.append(cond)
+    return conditions
+
+
+def _col_filter_conditions_from_group(group: dict) -> list:
+    """Read a saved group's column filters as a conditions list, migrating the
+    legacy per-column format (col_filt_cols + _cf*_{col}) when needed."""
+    conditions = group.get("col_filt_conditions")
+    if conditions is not None:
+        return conditions
+    conditions = []
+    for col in group.get("col_filt_cols", []):
+        cond = {"col": col}
+        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
+            cond["catvals"] = group.get(f"_cfcatvals_{col}", [])
+        elif col in _COL_FILTER_TEXT_SEARCH:
+            cond["textval"] = group.get(f"_cftextval_{col}", "")
+        elif col in _COL_FILTER_DATES:
+            cond["op"]      = group.get(f"_cfop_{col}", ">=")
+            cond["mode"]    = group.get(f"_cfmode_{col}", "vs value")
+            cond["col2"]    = group.get(f"_cfcol2_{col}")
+            cond["dateval"] = group.get(f"_cfval_{col}") or ""  # legacy date value
+        else:
+            cond["op"]     = group.get(f"_cfop_{col}", ">=")
+            cond["numval"] = group.get(f"_cfval_{col}")
+            cond["mode"]   = group.get(f"_cfmode_{col}", "vs value")
+            cond["col2"]   = group.get(f"_cfcol2_{col}")
+            cond["factor"] = group.get(f"_cffactor_{col}", 1.0)
+            cond["offset"] = group.get(f"_cfoffset_{col}", 0.0)
+        conditions.append(cond)
+    return conditions
+
+
+def _load_col_filter_conditions(tab_key: str, conditions: list) -> None:
+    """Populate row session state from a conditions list. Call before widgets."""
+    rids = list(range(len(conditions)))
+    for rid, cond in zip(rids, conditions):
+        st.session_state[f"col_filt_col_{tab_key}_{rid}"]     = cond.get("col")
+        st.session_state[f"col_filt_catvals_{tab_key}_{rid}"] = cond.get("catvals", [])
+        st.session_state[f"col_filt_textval_{tab_key}_{rid}"] = cond.get("textval", "")
+        st.session_state[f"col_filt_op_{tab_key}_{rid}"]      = cond.get("op", ">=")
+        st.session_state[f"col_filt_numval_{tab_key}_{rid}"]  = cond.get("numval")
+        st.session_state[f"col_filt_dateval_{tab_key}_{rid}"] = cond.get("dateval", "")
+        st.session_state[f"col_filt_mode_{tab_key}_{rid}"]    = cond.get("mode", "vs value")
+        st.session_state[f"col_filt_col2_{tab_key}_{rid}"]    = cond.get("col2")
+        st.session_state[f"col_filt_factor_{tab_key}_{rid}"]  = cond.get("factor", 1.0) or 1.0
+        st.session_state[f"col_filt_offset_{tab_key}_{rid}"]  = cond.get("offset", 0.0) or 0.0
+    st.session_state[f"col_filt_rows_{tab_key}"]   = rids
+    st.session_state[f"col_filt_nextid_{tab_key}"] = len(rids)
+
+
 def _snapshot_filter_group(tab_key: str) -> dict:
     """Snapshot current filter state into a serialisable dict."""
     mapping = _TAB_FILTER_KEYS.get(tab_key, {})
@@ -3047,31 +3196,18 @@ def _snapshot_filter_group(tab_key: str) -> dict:
         k = f"filt_vals_{tab_key}_{ind}"
         ind_vals[ind] = st.session_state.get(k, ["PASS"])
     group["ind_vals"] = ind_vals
-    # Column filter snapshot
-    col_filt_cols = list(st.session_state.get(f"col_filt_cols_{tab_key}", []))
-    group["col_filt_cols"] = col_filt_cols
-    for col in col_filt_cols:
-        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
-            group[f"_cfcatvals_{col}"] = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
-        elif col in _COL_FILTER_TEXT_SEARCH:
-            group[f"_cftextval_{col}"] = st.session_state.get(f"col_filt_textval_{tab_key}_{col}", "")
-        else:
-            group[f"_cfop_{col}"]     = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
-            group[f"_cfval_{col}"]    = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
-            # column-vs-column comparison (numeric/date "vs column" mode)
-            group[f"_cfmode_{col}"]   = st.session_state.get(f"col_filt_mode_{tab_key}_{col}", "vs value")
-            group[f"_cfcol2_{col}"]   = st.session_state.get(f"col_filt_col2_{tab_key}_{col}")
-            group[f"_cffactor_{col}"] = st.session_state.get(f"col_filt_factor_{tab_key}_{col}", 1.0)
-            group[f"_cfoffset_{col}"] = st.session_state.get(f"col_filt_offset_{tab_key}_{col}", 0.0)
+    # Column filter snapshot — list of condition rows (a column may repeat)
+    group["col_filt_conditions"] = _col_filter_conditions_snapshot(tab_key)
     return group
 
 
-def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
+def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
     """
     Renders per-indicator value filter UI inline.
     Returns (ind_filters, col_filter):
       ind_filters: {indicator_id: set_of_accepted_values} for active filters only.
-      col_filter:  {col_name: {"type":..., ...}} for active column value filters.
+      col_filter:  list of (col_name, {"type":..., ...}) condition rows; a column
+                   may appear more than once (compared to different values/cols).
     Includes clear/reset buttons, a filter group manager, and column value filter.
     """
     # ── Auto-load custom default group (once per session per tab) ─────────────
@@ -3111,138 +3247,105 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], dict]:
                 if vals:
                     ind_filters[ind] = set(vals)
 
-    # ── Column value filter ────────────────────────────────────────────────────
+    # ── Column value filter (list of condition rows; a column may repeat) ───────
     st.markdown("**Filter by Column Values**")
-    col_filt_selected = st.multiselect(
-        "Filter on columns:",
-        options=_FILTERABLE_COLS,
-        key=f"col_filt_cols_{tab_key}",
-        label_visibility="collapsed",
-        placeholder="Select columns to filter by value…",
-    )
-    if col_filt_selected:
-        for col in col_filt_selected:
-          # Keyed container anchors each filter row so its internal st.columns
-          # child-count change (3 slots in "vs value" ↔ 5 in "vs column")
-          # stays isolated and doesn't shift downstream siblings (Sort/row8),
-          # which otherwise leaves a ghost/overlap copy in Streamlit.
-          with st.container(key=f"colfilt_row_{tab_key}_{col}"):
-            if col in _COL_FILTER_EMOJI:
-                st.multiselect(
-                    f"{col}",
-                    options=["✅", "❌", "⚪️"],
-                    key=f"col_filt_catvals_{tab_key}_{col}",
-                )
-            elif col in _COL_FILTER_TEXT_CAT:
-                st.multiselect(
-                    f"{col}",
-                    options=_COL_FILTER_TEXT_CAT[col],
-                    key=f"col_filt_catvals_{tab_key}_{col}",
-                )
-            elif col in _COL_FILTER_TEXT_SEARCH:
-                st.text_input(
-                    f"{col} contains:",
-                    key=f"col_filt_textval_{tab_key}_{col}",
-                    placeholder="partial match (case-insensitive)",
-                )
-            elif col in _COL_FILTER_DATES:
-                _dmode = st.radio(f"mode_{col}", ["vs value", "vs column"],
-                                  horizontal=True, key=f"col_filt_mode_{tab_key}_{col}",
-                                  label_visibility="collapsed")
-                dc1, dc2, dc3 = st.columns([2, 1, 3])
-                with dc1:
-                    st.markdown(f"**{col}**")
-                with dc2:
-                    st.selectbox(f"op_{col}", options=_COL_FILTER_OPS,
-                                 key=f"col_filt_op_{tab_key}_{col}",
-                                 label_visibility="collapsed")
-                with dc3:
-                    if _dmode == "vs column":
-                        st.selectbox(f"col2_{col}",
-                                     options=[c for c in sorted(_COL_FILTER_DATES) if c != col],
-                                     key=f"col_filt_col2_{tab_key}_{col}", index=None,
-                                     placeholder="compare to date column…",
-                                     label_visibility="collapsed")
-                    else:
-                        st.text_input(f"val_{col}",
-                                      key=f"col_filt_numval_{tab_key}_{col}",
-                                      label_visibility="collapsed", placeholder="YYYY-MM-DD")
-            else:
-                _nmode = st.radio(f"mode_{col}", ["vs value", "vs column"],
-                                  horizontal=True, key=f"col_filt_mode_{tab_key}_{col}",
-                                  label_visibility="collapsed")
-                if _nmode == "vs column":
-                    nc1, nc2, nc3, nc4, nc5 = st.columns([2, 1, 1, 3, 1])
-                    with nc1:
-                        st.markdown(f"**{col}**")
-                    with nc2:
-                        st.selectbox(f"op_{col}", options=_COL_FILTER_OPS,
-                                     key=f"col_filt_op_{tab_key}_{col}",
-                                     label_visibility="collapsed")
-                    with nc3:
-                        st.number_input(f"factor_{col}", value=1.0, step=0.1,
-                                        key=f"col_filt_factor_{tab_key}_{col}",
-                                        label_visibility="collapsed", help="× second column")
-                    with nc4:
-                        st.selectbox(f"col2_{col}",
-                                     options=[c for c in _NUMERIC_FILTER_COLS if c != col],
-                                     key=f"col_filt_col2_{tab_key}_{col}", index=None,
-                                     placeholder="× column…", label_visibility="collapsed")
-                    with nc5:
-                        st.number_input(f"offset_{col}", value=0.0, step=1.0,
-                                        key=f"col_filt_offset_{tab_key}_{col}",
-                                        label_visibility="collapsed", help="+ offset")
-                else:
-                    nc1, nc2, nc3 = st.columns([2, 1, 3])
-                    with nc1:
-                        st.markdown(f"**{col}**")
-                    with nc2:
-                        st.selectbox(f"op_{col}", options=_COL_FILTER_OPS,
-                                     key=f"col_filt_op_{tab_key}_{col}",
-                                     label_visibility="collapsed")
-                    with nc3:
-                        st.number_input(f"val_{col}",
-                                        key=f"col_filt_numval_{tab_key}_{col}",
-                                        label_visibility="collapsed", value=None,
-                                        placeholder="numeric value")
-
-    # Build col_filter dict from current widget states
-    col_filter: dict = {}
-    for col in st.session_state.get(f"col_filt_cols_{tab_key}", []):
-        if col in _COL_FILTER_EMOJI or col in _COL_FILTER_TEXT_CAT:
-            catvals = st.session_state.get(f"col_filt_catvals_{tab_key}_{col}", [])
-            if catvals:
-                col_filter[col] = {"type": "cat", "vals": set(catvals)}
+    st.caption("Each row is one condition. Add the same column more than once to "
+               "compare it against different values or columns (all conditions "
+               "combine with AND).")
+    st.session_state.setdefault(f"col_filt_rows_{tab_key}", [])
+    st.session_state.setdefault(f"col_filt_nextid_{tab_key}", 0)
+    _rows = st.session_state[f"col_filt_rows_{tab_key}"]
+    for rid in list(_rows):
+      # Keyed container anchors each row so its internal st.columns child-count
+      # change (vs value ↔ vs column) stays isolated and doesn't shift the
+      # downstream Sort/checkbox rows (which would leave a ghost/overlap copy).
+      with st.container(key=f"colfilt_row_{tab_key}_{rid}"):
+        _hc1, _hc2 = st.columns([5, 1])
+        with _hc1:
+            col = st.selectbox(f"col_{rid}", options=_FILTERABLE_COLS, index=None,
+                               key=f"col_filt_col_{tab_key}_{rid}",
+                               placeholder="Select column…", label_visibility="collapsed")
+        with _hc2:
+            if st.button("🗑", key=f"col_filt_del_{tab_key}_{rid}",
+                         help="Remove this condition"):
+                st.session_state[f"col_filt_rows_{tab_key}"] = [x for x in _rows if x != rid]
+                for _f in _COL_FILTER_ROW_FIELDS:
+                    st.session_state.pop(f"col_filt_{_f}_{tab_key}_{rid}", None)
+                st.rerun()
+        if not col:
+            continue
+        if col in _COL_FILTER_EMOJI:
+            st.multiselect(f"vals_{rid}", options=["✅", "❌", "⚪️"],
+                           key=f"col_filt_catvals_{tab_key}_{rid}",
+                           label_visibility="collapsed")
+        elif col in _COL_FILTER_TEXT_CAT:
+            st.multiselect(f"vals_{rid}", options=_COL_FILTER_TEXT_CAT[col],
+                           key=f"col_filt_catvals_{tab_key}_{rid}",
+                           label_visibility="collapsed")
         elif col in _COL_FILTER_TEXT_SEARCH:
-            val = st.session_state.get(f"col_filt_textval_{tab_key}_{col}", "")
-            if val:
-                col_filter[col] = {"type": "text", "val": val}
+            st.text_input(f"contains_{rid}", key=f"col_filt_textval_{tab_key}_{rid}",
+                          placeholder="contains… (case-insensitive)",
+                          label_visibility="collapsed")
         elif col in _COL_FILTER_DATES:
-            op   = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
-            mode = st.session_state.get(f"col_filt_mode_{tab_key}_{col}", "vs value")
-            if mode == "vs column":
-                col2 = st.session_state.get(f"col_filt_col2_{tab_key}_{col}")
-                if col2:
-                    col_filter[col] = {"type": "datecol", "op": op, "col2": col2}
-            else:
-                val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}", "")
-                if val:
-                    col_filter[col] = {"type": "date", "op": op, "val": str(val)}
+            _dmode = st.radio(f"mode_{rid}", ["vs value", "vs column"],
+                              horizontal=True, key=f"col_filt_mode_{tab_key}_{rid}",
+                              label_visibility="collapsed")
+            dc1, dc2 = st.columns([1, 3])
+            with dc1:
+                st.selectbox(f"op_{rid}", options=_COL_FILTER_OPS,
+                             key=f"col_filt_op_{tab_key}_{rid}",
+                             label_visibility="collapsed")
+            with dc2:
+                if _dmode == "vs column":
+                    st.selectbox(f"col2_{rid}",
+                                 options=[c for c in sorted(_COL_FILTER_DATES) if c != col],
+                                 key=f"col_filt_col2_{tab_key}_{rid}", index=None,
+                                 placeholder="compare to date column…",
+                                 label_visibility="collapsed")
+                else:
+                    st.text_input(f"dval_{rid}", key=f"col_filt_dateval_{tab_key}_{rid}",
+                                  label_visibility="collapsed", placeholder="YYYY-MM-DD")
         else:
-            op   = st.session_state.get(f"col_filt_op_{tab_key}_{col}", ">=")
-            mode = st.session_state.get(f"col_filt_mode_{tab_key}_{col}", "vs value")
-            if mode == "vs column":
-                col2 = st.session_state.get(f"col_filt_col2_{tab_key}_{col}")
-                if col2:
-                    col_filter[col] = {
-                        "type": "numcol", "op": op, "col2": col2,
-                        "factor": float(st.session_state.get(f"col_filt_factor_{tab_key}_{col}", 1.0) or 1.0),
-                        "offset": float(st.session_state.get(f"col_filt_offset_{tab_key}_{col}", 0.0) or 0.0),
-                    }
+            _nmode = st.radio(f"mode_{rid}", ["vs value", "vs column"],
+                              horizontal=True, key=f"col_filt_mode_{tab_key}_{rid}",
+                              label_visibility="collapsed")
+            if _nmode == "vs column":
+                nc1, nc2, nc3, nc4 = st.columns([1, 1, 3, 1])
+                with nc1:
+                    st.selectbox(f"op_{rid}", options=_COL_FILTER_OPS,
+                                 key=f"col_filt_op_{tab_key}_{rid}",
+                                 label_visibility="collapsed")
+                with nc2:
+                    st.number_input(f"factor_{rid}", value=1.0, step=0.1,
+                                    key=f"col_filt_factor_{tab_key}_{rid}",
+                                    label_visibility="collapsed", help="× second column")
+                with nc3:
+                    st.selectbox(f"col2_{rid}",
+                                 options=[c for c in _NUMERIC_FILTER_COLS if c != col],
+                                 key=f"col_filt_col2_{tab_key}_{rid}", index=None,
+                                 placeholder="× column…", label_visibility="collapsed")
+                with nc4:
+                    st.number_input(f"offset_{rid}", value=0.0, step=1.0,
+                                    key=f"col_filt_offset_{tab_key}_{rid}",
+                                    label_visibility="collapsed", help="+ offset")
             else:
-                val = st.session_state.get(f"col_filt_numval_{tab_key}_{col}")
-                if val is not None:
-                    col_filter[col] = {"type": "num", "op": op, "val": float(val)}
+                nc1, nc2 = st.columns([1, 3])
+                with nc1:
+                    st.selectbox(f"op_{rid}", options=_COL_FILTER_OPS,
+                                 key=f"col_filt_op_{tab_key}_{rid}",
+                                 label_visibility="collapsed")
+                with nc2:
+                    st.number_input(f"val_{rid}", key=f"col_filt_numval_{tab_key}_{rid}",
+                                    label_visibility="collapsed", value=None,
+                                    placeholder="numeric value")
+    if st.button("➕ Add condition", key=f"col_filt_add_{tab_key}"):
+        _nid = st.session_state[f"col_filt_nextid_{tab_key}"]
+        st.session_state[f"col_filt_nextid_{tab_key}"] = _nid + 1
+        st.session_state[f"col_filt_rows_{tab_key}"] = _rows + [_nid]
+        st.rerun()
+
+    # Build col_filter: list of (col, spec) for all complete rows
+    col_filter = _build_col_filter(tab_key)
 
     # ── Custom filter groups manager ──────────────────────────────────────────
     with st.expander("Manage filter groups"):
@@ -3405,12 +3508,15 @@ def _col_filter_passes(rec: dict, col: str, spec: dict) -> bool:
     return _cmp(nval, fv)
 
 
-def apply_col_filter(tickers: list[str], col_filter: dict,
+def apply_col_filter(tickers: list[str], col_filter: list,
                      detail_map: dict, rows_by_ticker: dict,
                      fund_map: dict, tech_map: dict,
                      earnings_map: dict | None = None,
                      returns_map: dict | None = None) -> list[str]:
     """Return subset of tickers whose value-table records pass all column filters.
+
+    col_filter is a list of (col, spec) tuples (a column may appear more than
+    once); a ticker must satisfy every one of them (AND).
 
     returns_map must be supplied to filter correctly on any price_history-derived
     column (5D/1M/.../Cust/Trig Px%/Vol%) -- those columns are populated from
@@ -3433,7 +3539,7 @@ def apply_col_filter(tickers: list[str], col_filter: dict,
             em.get(t),
             rm.get(t),
         )
-        if all(_col_filter_passes(rec, col, spec) for col, spec in col_filter.items()):
+        if all(_col_filter_passes(rec, col, spec) for col, spec in col_filter):
             out.append(t)
     return out
 
@@ -3792,6 +3898,10 @@ def render_value_table(tickers: list[str], detail_map: dict,
 DASHBOARD_TICKERS = ["SOXL", "DRAM", "QQQ", "VOO"]
 DASHBOARD_SOXL_RSI_BUY_THRESHOLD  = 35.0
 DASHBOARD_SOXL_RSI_SELL_THRESHOLD = 70.2
+# Recent NYSE sessions that must be present (gapless) for the SOXL RSI(14) to be
+# trusted. RSI is a Wilder EMA (alpha 1/14); 30 sessions carry ~89% of its
+# weight, so a gapless 30-day tail makes the value accurate to <1 RSI point.
+_RSI_GAPLESS_SESSIONS = 30
 
 st.set_page_config(page_title="Stock Analysis Tool", page_icon="📈", layout="wide")
 st.title("📈 Stock Analysis Tool")
@@ -4013,18 +4123,48 @@ def _refresh_index_dashboard() -> None:
         # completed session, not just "today after 4pm" -- see
         # last_completed_trading_day (a weekend date would spuriously fire the
         # fallback and yield a 0% change).
-        from market_calendar import last_completed_trading_day, et_today as _et_today
+        from market_calendar import (last_completed_trading_day,
+                                      et_today as _et_today, get_trading_days)
         _expected_latest = last_completed_trading_day() or _et_today().isoformat()
+
+        def _consecutive_sessions(d1: str, d2: str) -> bool:
+            # True iff d1 and d2 are adjacent NYSE trading days (no session in
+            # between). Guards against a transient Yahoo hole -- e.g. a null
+            # close on Fri that dropna removes, leaving Thu and Mon as the last
+            # two bars, which would make a Thu->Mon move masquerade as a 1-day
+            # change (the SOXL -8.34% bug). ISO date strings sort chronologically.
+            if not d1 or not d2 or d1 >= d2:
+                return False
+            span = get_trading_days(d1, d2)
+            return span == [d1, d2]
+
+        def _recent_window_gapless(present: set[str], as_of: str, n: int) -> bool:
+            # True iff the last `n` NYSE trading days ending at `as_of` are all
+            # present in `present` (the dates actually in the fetched series).
+            # RSI(14) is a Wilder EMA, so a missing recent session would pair
+            # non-adjacent closes and skew the value; requiring a gapless recent
+            # window (self-healed by fetching fresh each refresh) keeps it honest.
+            from datetime import date as _date, timedelta as _td
+            try:
+                start = (_date.fromisoformat(as_of) - _td(days=int(n * 2.2) + 15)).isoformat()
+            except ValueError:
+                return False
+            sessions = get_trading_days(start, as_of)
+            if len(sessions) < n:
+                return False  # not enough history to trust the indicator
+            return all(d in present for d in sessions[-n:])
+
         rows = []
         for ticker in DASHBOARD_TICKERS:
             try:
+                # Always fetch fresh and derive the 1-day change from the two
+                # most recent bars Yahoo itself returns -- never from a stored
+                # prev_close. A persisted prev can silently go stale/gapped and
+                # get "locked in" for the rest of the day; recomputing fresh
+                # every refresh self-heals once Yahoo's data is corrected.
                 data = fetch_and_cache_swing_history(ticker, years=1, force_refresh=True)
-                # Guard against a None/NaN close on the most recent cached day
-                # (a stale or partially-written row) -- an unguarded float()
-                # on that crashes THIS ticker's whole iteration before
-                # rows.append() runs, silently dropping price AND RSI both.
-                # dropna naturally falls back to the last genuinely valid
-                # close/prior-close instead of failing outright.
+                # Drop any None/NaN close (stale or partially-written bar) so
+                # float() below can't crash this ticker's whole iteration.
                 data = data.dropna(subset=["close"])
                 if data.empty or len(data) < 2:
                     _slog(f"[dashboard] Skipped {ticker}: insufficient valid price history")
@@ -4032,16 +4172,26 @@ def _refresh_index_dashboard() -> None:
                 settled_close = float(data["close"].iloc[-1])
                 settled_prev  = float(data["close"].iloc[-2])
                 settled_date  = data.index[-1].date().isoformat()
+                settled_prev_date = data.index[-2].date().isoformat()
 
                 # RSI is computed from the SETTLED series only (never the live
                 # fallback price), so it is as-of settled_date -- which the UI
-                # flags when it lags the (fallback-advanced) close date.
+                # flags when it lags the (fallback-advanced) close date. It is
+                # recomputed fresh from the just-downloaded closes each refresh
+                # (no stored RSI reused), and only when the recent window is
+                # gapless -- a dropped session (transient Yahoo null) would pair
+                # non-adjacent closes and skew the value.
                 rsi_14 = None
                 rsi_date = None
                 if ticker == "SOXL":
-                    rsi_val = ta.momentum.RSIIndicator(data["close"], window=14).rsi().iloc[-1]
-                    rsi_14 = float(rsi_val) if not pd.isna(rsi_val) else None
-                    rsi_date = settled_date if rsi_14 is not None else None
+                    _present = {ix.date().isoformat() for ix in data.index}
+                    if _recent_window_gapless(_present, settled_date, _RSI_GAPLESS_SESSIONS):
+                        rsi_val = ta.momentum.RSIIndicator(data["close"], window=14).rsi().iloc[-1]
+                        rsi_14 = float(rsi_val) if not pd.isna(rsi_val) else None
+                        rsi_date = settled_date if rsi_14 is not None else None
+                    else:
+                        _slog(f"[dashboard] SOXL RSI omitted: recent sessions gapped "
+                              f"near {settled_date}")
 
                 # Fallback: if the settled series is behind the expected latest
                 # trading day, Yahoo's newest daily bar had a null close (see
@@ -4050,13 +4200,26 @@ def _refresh_index_dashboard() -> None:
                 if settled_date < _expected_latest:
                     _live = get_latest_quote_price(ticker)
                     if _live is not None:
-                        close, prev_close, close_date = _live, settled_close, _expected_latest
+                        close, prev_close = _live, settled_close
+                        close_date, prev_date = _expected_latest, settled_date
                     else:
-                        close, prev_close, close_date = settled_close, settled_prev, settled_date
+                        close, prev_close = settled_close, settled_prev
+                        close_date, prev_date = settled_date, settled_prev_date
                 else:
-                    close, prev_close, close_date = settled_close, settled_prev, settled_date
+                    close, prev_close = settled_close, settled_prev
+                    close_date, prev_date = settled_date, settled_prev_date
 
-                change_pct = (close / prev_close - 1) * 100 if prev_close else None
+                # Only report a 1-day change when the two prices are from
+                # consecutive trading sessions. If a session is missing between
+                # them (Yahoo hole), show no delta rather than a misleading
+                # multi-day figure -- the next fresh refresh recovers it.
+                if prev_close and _consecutive_sessions(prev_date, close_date):
+                    change_pct = (close / prev_close - 1) * 100
+                else:
+                    change_pct = None
+                    if prev_close:
+                        _slog(f"[dashboard] {ticker}: non-consecutive sessions "
+                              f"{prev_date} -> {close_date}; change omitted")
                 rows.append({"ticker": ticker, "close": close, "change_pct": change_pct,
                              "rsi_14": rsi_14, "close_date": close_date, "rsi_date": rsi_date,
                              "updated_at": now})
@@ -4835,7 +4998,7 @@ def render_scan_tab(tab_id: str) -> None:
             white-space: pre-wrap !important;
         }
         .stDataEditor [col-id="Sector"] { min-width: 29px; max-width: 29px; }
-        .stDataEditor [col-id="Industry"] { min-width: 18px; max-width: 18px; }
+        .stDataEditor [col-id="Industry"] { min-width: 11px; max-width: 11px; }
         .stDataEditor [col-id="Mkt Cap ($B)"] { min-width: 25px; max-width: 25px; }
         </style>""",
         unsafe_allow_html=True,
@@ -4880,7 +5043,7 @@ def render_scan_tab(tab_id: str) -> None:
                 _emoji_base.append(_kc)
                 _emoji_placed.add(_kc)
     # Auto-inject active column filter cols then sort col immediately after Score
-    _active_filt_cols = list(st.session_state.get(f"col_filt_cols_{tab_id}", []))
+    _active_filt_cols = _active_filter_columns(tab_id)
     for _fc in _active_filt_cols:
         if _fc not in _emoji_placed:
             if _fc not in all_df_disp.columns:
@@ -4951,7 +5114,7 @@ def render_scan_tab(tab_id: str) -> None:
             )
 
     _emoji_fixed_right = [
-        "Source", "Status", "Comments",
+        "Status", "Source", "Comments",
         "technical +ve", "fundamental +ve", "technical -ve", "fundamental -ve",
         "Company Summary", "Revenue Composition",
         "Company Name", "Company Description",
