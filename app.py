@@ -123,6 +123,7 @@ from indicators    import evaluate_all, score_indicators
 import storage
 import fx_rates
 import fx_display
+import ticker_fetcher
 import trigger_engine
 from trigger_engine import (
     TRIG_FIELD_OPTIONS, TRIG_FIELD_DISPLAY, TRIG_OP_OPTIONS,
@@ -4036,6 +4037,46 @@ with st.sidebar:
         help="Re-scans tickers whose Close/Change% is from a prior trading day.",
     )
     st.divider()
+
+    # ── Ticker universe refresh (NASDAQ Trader symbol directory) ──────────────
+    with st.expander("🔄 Ticker universe"):
+        st.caption(
+            "Refresh the US-listed symbol universe from the NASDAQ Trader "
+            "directory. Writes **tickers_common.txt** (common stocks / ADRs — "
+            "kept separate from the in-use tickers.txt for comparison) and "
+            "**etfs.txt** (ETFs / ETNs / closed-end funds)."
+        )
+        if st.button("Fetch latest ticker lists", width="stretch",
+                     key="refresh_ticker_universe_btn"):
+            with st.spinner("Downloading NASDAQ Trader symbol directory…"):
+                try:
+                    st.session_state["_ticker_refresh_result"] = \
+                        ticker_fetcher.refresh_ticker_universe(write=True)
+                except Exception as e:
+                    st.session_state["_ticker_refresh_result"] = {"error": str(e)}
+        _res = st.session_state.get("_ticker_refresh_result")
+        if _res:
+            if _res.get("error"):
+                st.error(f"Fetch failed: {_res['error']}")
+            else:
+                m = _res["meta"]
+                st.success(
+                    f"Common: {m['n_common']} · Funds: {m['n_funds']} · "
+                    f"Dropped: {m['n_dropped']}"
+                )
+                for _k, _lbl in (("common", "tickers_common.txt"),
+                                 ("etf", "etfs.txt")):
+                    d = _res[_k]
+                    st.caption(
+                        f"**{_lbl}**: {d['n_old']} → {d['n_new']} "
+                        f"(+{len(d['added'])} / −{len(d['removed'])})"
+                    )
+                    if d["added"]:
+                        st.caption(f"➕ {', '.join(d['added'][:15])}"
+                                   f"{' …' if len(d['added']) > 15 else ''}")
+                    if d["removed"]:
+                        st.caption(f"➖ {', '.join(d['removed'][:15])}"
+                                   f"{' …' if len(d['removed']) > 15 else ''}")
 
     st.markdown("""
 **Indicators**  
