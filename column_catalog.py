@@ -497,6 +497,38 @@ COLUMNS = [
 
     # ── Tech Metadata ─────────────────────────────────────────────────────────
     _c("Finalized", "Tech Metadata", _YFD, _SC, "raw", "is_finalized", "bool", "True if tech data was fetched after NYSE 4pm ET close (data is final for the day)"),
+
+    # ── ETF Screen — technicals (tech_indicators, asset_type='etf') ────────────
+    # New tech columns are also computed for the ETF screener; several are usable
+    # for stocks too once wired into the stock scan.
+    _c("Trend Score",   "ETF Screen (Technical)", _YFD, _SC, "computed", "trend_score",        "float",  "ETF 0–100 composite: MA alignment, momentum, RS-vs-SPY, RSI health, drawdown, volume (etf_fetcher.compute_trend_score)"),
+    _c("1D %",          "ETF Screen (Technical)", _YFD, _SC, "computed", "ret_1d",             "float%", "Adj-Close return over the last 1 trading day"),
+    _c("5D %",          "ETF Screen (Technical)", _YFD, _SC, "computed", "ret_5d",             "float%", "Adj-Close return over the last 5 trading days"),
+    _c("10D %",         "ETF Screen (Technical)", _YFD, _SC, "computed", "ret_10d",            "float%", "Adj-Close return over the last 10 trading days"),
+    _c("60D %",         "ETF Screen (Technical)", _YFD, _SC, "computed", "ret_60d",            "float%", "Adj-Close return over the last 60 trading days"),
+    _c("126D %",        "ETF Screen (Technical)", _YFD, _SC, "computed", "ret_126d",           "float%", "Adj-Close return over the last 126 trading days"),
+    _c("252D %",        "ETF Screen (Technical)", _YFD, _SC, "computed", "ret_252d",           "float%", "Adj-Close return over the last 252 trading days"),
+    _c("RS SPY 20D",    "ETF Screen (Technical)", _YFD, _SC, "computed", "rs_spy_20d",         "float",  "Relative strength vs SPY over 20D: (1+etf_ret)/(1+spy_ret); >1 = out-performing"),
+    _c("RS SPY 60D",    "ETF Screen (Technical)", _YFD, _SC, "computed", "rs_spy_60d",         "float",  "Relative strength vs SPY over 60D; 1.0 = in line with SPY"),
+    _c("RS SPY 126D",   "ETF Screen (Technical)", _YFD, _SC, "computed", "rs_spy_126d",        "float",  "Relative strength vs SPY over 126D"),
+    _c("Beta SPY 60D",  "ETF Screen (Technical)", _YFD, _SC, "computed", "beta_spy_60d",       "float",  "Beta vs SPY from 60 daily returns"),
+    _c("Corr SPY 60D",  "ETF Screen (Technical)", _YFD, _SC, "computed", "corr_spy_60d",       "float",  "Correlation of daily returns vs SPY over 60D"),
+    _c("RSI Δ5D",       "ETF Screen (Technical)", _YFD, _SC, "computed", "rsi_change_5d",      "float",  "Change in RSI(14) over the last 5 sessions"),
+    _c("Vol Ratio",     "ETF Screen (Technical)", _YFD, _SC, "computed", "vol_ratio",          "float",  "Realized vol 20D / 60D (>1 = volatility expanding)"),
+    _c("BB Width",      "ETF Screen (Technical)", _YFD, _SC, "computed", "bb_width",           "float",  "Bollinger band width as % of the middle band"),
+    _c("BB Width %ile", "ETF Screen (Technical)", _YFD, _SC, "computed", "bb_width_percentile","float%", "Percentile rank of current BB width over the trailing 1y"),
+
+    # ── ETF Screen — fund profile (etf_profile) ────────────────────────────────
+    _c("Category",    "ETF Screen (Fund)", _QS, _SC, "raw", "category",          "str",    "Morningstar-style fund category (e.g. Large Growth)"),
+    _c("AUM ($B)",    "ETF Screen (Fund)", _QS, _SC, "raw", "aum",               "float",  "Assets under management in USD billions (totalAssets)"),
+    _c("Expense %",   "ETF Screen (Fund)", _QS, _SC, "raw", "expense_ratio",     "float%", "Annual net expense ratio (%)"),
+    _c("Yield %",     "ETF Screen (Fund)", _QS, _SC, "raw", "yield_pct",         "float%", "Trailing distribution yield (%)"),
+    _c("YTD Ret %",   "ETF Screen (Fund)", _QS, _SC, "raw", "ytd_return",        "float%", "Year-to-date total return (%)"),
+    _c("3Y Ret %",    "ETF Screen (Fund)", _QS, _SC, "raw", "three_year_return", "float%", "3-year average annual return (%)"),
+    _c("5Y Ret %",    "ETF Screen (Fund)", _QS, _SC, "raw", "five_year_return",  "float%", "5-year average annual return (%)"),
+    _c("Beta 3Y",     "ETF Screen (Fund)", _QS, _SC, "raw", "beta_3y",           "float",  "3-year beta (Yahoo beta3Year)"),
+    _c("Fund Family", "ETF Screen (Fund)", _QS, _SC, "raw", "fund_family",       "str",    "Fund issuer / family (e.g. Invesco, Vanguard)"),
+    _c("NAV",         "ETF Screen (Fund)", _QS, _SC, "raw", "nav",               "float",  "Net asset value per share"),
 ]
 
 

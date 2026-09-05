@@ -641,6 +641,42 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
         if len(log_ret) >= 60:
             realized_vol_60d = _safe(log_ret.tail(60).std() * math.sqrt(252) * 100)
 
+        # ── ETF-screener extras (benchmark-free; also useful for stocks) ──────
+        # Multi-horizon Adj-Close returns (%); ret_20d is computed above.
+        def _hret(n: int):
+            if len(close) < n + 1 or not latest_close:
+                return None
+            prev = _safe(close.iloc[-(n + 1)])
+            return _safe((latest_close / prev - 1) * 100) if prev else None
+        ret_1d   = _hret(1)
+        ret_5d   = _hret(5)
+        ret_10d  = _hret(10)
+        ret_60d  = _hret(60)
+        ret_126d = _hret(126)
+        ret_252d = _hret(252)
+
+        # Bollinger band width (% of middle band) + its 1y rolling percentile.
+        bb_width = None
+        bb_width_percentile = None
+        _bbw_series = ((bb_upper - bb_lower) / bb_middle * 100).replace(
+            [np.inf, -np.inf], np.nan)
+        if _bbw_series.notna().any():
+            bb_width = _safe(_last(_bbw_series))
+            _bbw_win = _bbw_series.dropna().tail(252)
+            if len(_bbw_win) >= 20 and bb_width is not None:
+                bb_width_percentile = _safe((_bbw_win < bb_width).mean() * 100)
+
+        # RSI(14) change over the last 5 sessions.
+        rsi_change_5d = None
+        if len(rsi14.dropna()) >= 6:
+            _r_now, _r_prev = _last(rsi14), _safe(rsi14.iloc[-6])
+            if _r_now is not None and _r_prev is not None:
+                rsi_change_5d = _safe(_r_now - _r_prev)
+
+        # Short/long realized-vol ratio (>1 = volatility expanding).
+        vol_ratio = _safe(realized_vol_20d / realized_vol_60d) \
+            if (realized_vol_20d and realized_vol_60d) else None
+
         # ── Max drawdown ──────────────────────────────────────────────────────
         def _max_drawdown(series: pd.Series) -> float | None:
             if series.empty:
@@ -840,6 +876,16 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
             "low_close_26w":           low_close_26w,
             "px_over_26w_low":         px_over_26w_low,
             "ret_20d":                 ret_20d,
+            "ret_1d":                  ret_1d,
+            "ret_5d":                  ret_5d,
+            "ret_10d":                 ret_10d,
+            "ret_60d":                 ret_60d,
+            "ret_126d":                ret_126d,
+            "ret_252d":                ret_252d,
+            "bb_width":                bb_width,
+            "bb_width_percentile":     bb_width_percentile,
+            "rsi_change_5d":           rsi_change_5d,
+            "vol_ratio":               vol_ratio,
             "high_close_3y":           high_close_3y,
             "low_close_3y":            low_close_3y,
             "pct_from_high_close_3y":  pct_from_high_close_3y,
@@ -944,6 +990,48 @@ def _compute_all_indicators(ticker: str, df_raw: pd.DataFrame,
 
     except Exception as e:
         return {"error": f"Technical compute failed for {ticker}: {e}"}
+
+
+def compute_benchmark_rs(etf_close: "pd.Series", spy_close: "pd.Series") -> dict:
+    """Relative strength / beta / correlation of a series vs a benchmark (SPY).
+
+    etf_close, spy_close: Adj-Close (or return-adjusted close) series indexed by
+    date. They are inner-joined on date so mismatched histories align.
+
+    Returns rs_spy_20d/60d/126d -- the cumulative-return ratio
+    (1 + etf_ret) / (1 + spy_ret) over the window, where 1.0 means "in line with
+    SPY" and > 1 means out-performance -- plus beta_spy_60d and corr_spy_60d
+    from a 60-session daily-return regression. A window without enough
+    overlapping data yields None for that field.
+    """
+    out = {"rs_spy_20d": None, "rs_spy_60d": None, "rs_spy_126d": None,
+           "beta_spy_60d": None, "corr_spy_60d": None}
+    if etf_close is None or spy_close is None:
+        return out
+    df = pd.concat([etf_close.rename("e"), spy_close.rename("s")], axis=1).dropna()
+    if len(df) < 2:
+        return out
+    e, s = df["e"], df["s"]
+
+    def _rs(n: int):
+        if len(df) < n + 1:
+            return None
+        er = e.iloc[-1] / e.iloc[-(n + 1)] - 1
+        sr = s.iloc[-1] / s.iloc[-(n + 1)] - 1
+        denom = 1 + sr
+        return _safe((1 + er) / denom, 4) if denom else None
+
+    out["rs_spy_20d"]  = _rs(20)
+    out["rs_spy_60d"]  = _rs(60)
+    out["rs_spy_126d"] = _rs(126)
+
+    j = pd.concat([e.pct_change().rename("e"), s.pct_change().rename("s")],
+                  axis=1).dropna().tail(60)
+    if len(j) >= 30:
+        var = j["s"].var()
+        out["beta_spy_60d"] = _safe(j["e"].cov(j["s"]) / var, 3) if var else None
+        out["corr_spy_60d"] = _safe(j["e"].corr(j["s"]), 3)
+    return out
 
 
 # ── Also expose a dict compatible with the old data_fetcher.py format ─────────

@@ -599,6 +599,45 @@ CREATE TABLE IF NOT EXISTS trigger_cache (
 );
 """
 
+_DDL_ETF_PROFILE = """
+CREATE TABLE IF NOT EXISTS etf_profile (
+    ticker              TEXT NOT NULL,
+    fetch_date          DATE NOT NULL,
+    long_name           TEXT,
+    category            TEXT,
+    fund_family         TEXT,
+    legal_type          TEXT,
+    expense_ratio       DOUBLE,
+    aum                 DOUBLE,
+    nav                 DOUBLE,
+    yield_pct           DOUBLE,
+    ytd_return          DOUBLE,
+    three_year_return   DOUBLE,
+    five_year_return    DOUBLE,
+    beta_3y             DOUBLE,
+    avg_volume          DOUBLE,
+    trailing_pe         DOUBLE,
+    fifty_two_wk_high   DOUBLE,
+    fifty_two_wk_low    DOUBLE,
+    prev_close          DOUBLE,
+    stock_pct           DOUBLE,
+    bond_pct            DOUBLE,
+    cash_pct            DOUBLE,
+    other_pct           DOUBLE,
+    sector_weightings_json TEXT,
+    top_holdings_json   TEXT,
+    description         TEXT,
+    raw_info_json       TEXT,
+    fetched_at          TIMESTAMP,
+    PRIMARY KEY (ticker, fetch_date)
+);
+"""
+# ETF fund fundamentals (one row per ticker per fetch date). Distinct from the
+# stock `fundamentals` table -- ETFs have no EPS/revenue/PE-vs-peer; they carry
+# expense ratio, AUM, category, yield, trailing returns, asset-class splits, and
+# sector/holdings weights (JSON) for the detail drill-down. Populated by
+# etf_fetcher.py. ETF *technicals* live in tech_indicators with asset_type='etf'.
+
 _init_lock = threading.Lock()
 _db_lock   = threading.RLock()    # serialises ALL DB operations (reads + writes)
 _global_conn: duckdb.DuckDBPyConnection | None = None
@@ -673,6 +712,7 @@ def init_db() -> None:
     con.execute(_DDL_INDEX_DASHBOARD)
     con.execute(_DDL_FX_RATES)
     con.execute(_DDL_TRIGGER_CACHE)
+    con.execute(_DDL_ETF_PROFILE)
     # Migrate: add columns introduced after initial schema creation
     _migrate_add_columns(con)
 
@@ -756,6 +796,24 @@ def _migrate_add_columns(con) -> None:
         ("ret_20d",                "DOUBLE"),
         ("max_rsi_60d",            "DOUBLE"),
         ("max_rsi_90d",            "DOUBLE"),
+        # ── ETF screener extras (also usable for stocks) ──────────────────
+        ("asset_type",             "TEXT DEFAULT 'stock'"),
+        ("ret_1d",                 "DOUBLE"),
+        ("ret_5d",                 "DOUBLE"),
+        ("ret_10d",                "DOUBLE"),
+        ("ret_60d",                "DOUBLE"),
+        ("ret_126d",               "DOUBLE"),
+        ("ret_252d",               "DOUBLE"),
+        ("bb_width",               "DOUBLE"),
+        ("bb_width_percentile",    "DOUBLE"),
+        ("rsi_change_5d",          "DOUBLE"),
+        ("vol_ratio",              "DOUBLE"),
+        ("trend_score",            "DOUBLE"),
+        ("rs_spy_20d",             "DOUBLE"),
+        ("rs_spy_60d",             "DOUBLE"),
+        ("rs_spy_126d",            "DOUBLE"),
+        ("beta_spy_60d",           "DOUBLE"),
+        ("corr_spy_60d",           "DOUBLE"),
     ]
     existing = {row[0] for row in con.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'tech_indicators'"
@@ -1138,14 +1196,19 @@ def _sub_val(indicators: dict, ind_id: str, sub_col: str) -> str:
 # ── Tech indicators ───────────────────────────────────────────────────────────
 
 def save_tech_indicators(ticker: str, as_of_date: str, fields: dict,
-                         is_finalized: bool = False) -> None:
+                         is_finalized: bool = False,
+                         asset_type: str = "stock") -> None:
     """
     Upsert a row into tech_indicators.
     `fields` is a flat dict matching column names (any subset; missing = NULL).
+    `asset_type` marks the row as 'stock' (default) or 'etf'. If `fields`
+    already carries asset_type it wins (so callers can override per-row).
     """
     now = datetime.now(CST)
     con = _conn()
     # Build column list dynamically from what's in `fields`
+    fields = dict(fields)
+    fields.setdefault("asset_type", asset_type)
     cols = list(fields.keys()) + ["ticker", "as_of_date", "is_finalized", "computed_at"]
     vals = list(fields.values()) + [ticker, as_of_date, is_finalized, now]
     placeholders = ", ".join(["?" for _ in vals])
@@ -1290,6 +1353,16 @@ def get_tech_for_tickers(tickers: list[str]) -> dict[str, dict]:
     return {dict(zip(cols, r))["ticker"]: dict(zip(cols, r)) for r in rows}
 
 
+def get_etf_tickers() -> list[str]:
+    """Distinct tickers stored as ETFs (tech_indicators.asset_type='etf')."""
+    con = _conn()
+    rows = con.execute(
+        "SELECT DISTINCT ticker FROM tech_indicators "
+        "WHERE asset_type = 'etf' ORDER BY ticker"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 # ── Fundamentals ──────────────────────────────────────────────────────────────
 
 def save_fundamental(ticker: str, fetch_date: str, fields: dict) -> None:
@@ -1349,6 +1422,63 @@ def get_all_fundamentals_for_run(tickers: list[str]) -> dict[str, dict]:
     cols = [d[0] for d in con.execute(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name = 'fundamentals' ORDER BY ordinal_position"
+    ).fetchall()]
+    return {dict(zip(cols, r))["ticker"]: dict(zip(cols, r)) for r in rows}
+
+
+# ── ETF profile (fund fundamentals) ────────────────────────────────────────────
+
+def save_etf_profile(ticker: str, fetch_date: str, fields: dict) -> None:
+    """Upsert a row into etf_profile. `fields` is a flat dict of any subset of
+    the etf_profile columns (missing = NULL)."""
+    now = datetime.now(CST)
+    cols = list(fields.keys()) + ["ticker", "fetch_date", "fetched_at"]
+    vals = list(fields.values()) + [ticker, fetch_date, now]
+    placeholders = ", ".join(["?" for _ in vals])
+    col_str = ", ".join(cols)
+    con = _conn()
+    con.execute(
+        f"INSERT OR REPLACE INTO etf_profile ({col_str}) VALUES ({placeholders})",
+        vals,
+    )
+
+
+def get_latest_etf_profile(ticker: str) -> dict | None:
+    """Latest etf_profile row for a ticker (or None)."""
+    con = _conn()
+    row = con.execute(
+        "SELECT * FROM etf_profile WHERE ticker = ? "
+        "ORDER BY fetch_date DESC LIMIT 1",
+        [ticker],
+    ).fetchone()
+    if row is None:
+        return None
+    cols = [d[0] for d in con.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'etf_profile' ORDER BY ordinal_position"
+    ).fetchall()]
+    return dict(zip(cols, row))
+
+
+def get_all_etf_profiles(tickers: list[str]) -> dict[str, dict]:
+    """Returns {ticker: latest_etf_profile_row} for the given tickers."""
+    if not tickers:
+        return {}
+    placeholders = ", ".join(["?" for _ in tickers])
+    con = _conn()
+    rows = con.execute(
+        f"SELECT e.* FROM etf_profile e "
+        f"INNER JOIN ("
+        f"  SELECT ticker, MAX(fetch_date) AS fd "
+        f"  FROM etf_profile WHERE ticker IN ({placeholders}) GROUP BY ticker"
+        f") latest ON e.ticker = latest.ticker AND e.fetch_date = latest.fd",
+        tickers,
+    ).fetchall()
+    if not rows:
+        return {}
+    cols = [d[0] for d in con.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'etf_profile' ORDER BY ordinal_position"
     ).fetchall()]
     return {dict(zip(cols, r))["ticker"]: dict(zip(cols, r)) for r in rows}
 

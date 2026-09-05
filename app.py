@@ -204,6 +204,7 @@ STATUS_OPTIONS = ["", "必買", "買", "等", "研究", "賭", "X"]
 SOURCE_OPTIONS = ["", "高分", "BO", "暴升", "財報升", "streak", "小紅書", "Twitter", "Reddit", "朋友", "其他"]
 
 TICKERS_FILE = Path(__file__).parent / "tickers.txt"
+ETF_FILE = Path(__file__).parent / "etfs.txt"
 
 # ── Value table column groups ──────────────────────────────────────────────────
 # IMPORTANT: Keep column_catalog.py in sync — update it whenever you add,
@@ -635,6 +636,132 @@ _NUMERIC_FILTER_COLS = [
     if c not in _COL_FILTER_EMOJI and c not in _COL_FILTER_TEXT_CAT
     and c not in _COL_FILTER_TEXT_SEARCH and c not in _COL_FILTER_DATES
 ]
+
+# ── ETF screener columns ───────────────────────────────────────────────────────
+# ETFs reuse the generic column-value filter + evaluator; only their column set
+# differs. Each spec entry: (display_name, source_field, source, kind) where
+# source is 't' (tech_indicators row), 'p' (etf_profile row) or None (special),
+# and kind drives display scaling: num/price/pct(raw %)/pct100(fraction→%)/
+# scaleB(→$B)/bool/text.
+_ETF_COL_SPEC: list[tuple[str, str | None, str | None, str]] = [
+    # Overview
+    ("Ticker",        None,               None, "text"),
+    ("Trend Score",   "trend_score",      "t",  "num"),
+    ("Close",         "close",            "t",  "price"),
+    ("Change %",      "daily_pct_change", "t",  "pct"),
+    ("Category",      "category",         "p",  "text"),
+    ("AUM ($B)",      "aum",              "p",  "scaleB"),
+    ("As Of",         "as_of_date",       "t",  "text"),
+    # Performance
+    ("1D %",          "ret_1d",           "t",  "pct"),
+    ("5D %",          "ret_5d",           "t",  "pct"),
+    ("10D %",         "ret_10d",          "t",  "pct"),
+    ("20D %",         "ret_20d",          "t",  "pct"),
+    ("60D %",         "ret_60d",          "t",  "pct"),
+    ("126D %",        "ret_126d",         "t",  "pct"),
+    ("252D %",        "ret_252d",         "t",  "pct"),
+    # Trend
+    ("From SMA20 %",  "pct_from_sma20",   "t",  "pct"),
+    ("From SMA50 %",  "pct_from_sma50",   "t",  "pct"),
+    ("From SMA100 %", "pct_from_sma100",  "t",  "pct"),
+    ("From SMA200 %", "pct_from_sma200",  "t",  "pct"),
+    ("From 52W High %","pct_from_52w_high","t", "pct"),
+    ("From 52W Low %", "pct_from_52w_low", "t", "pct"),
+    ("MA20>50",       "ma20_gt_ma50",     "t",  "bool"),
+    ("MA50>150",      "ma50_gt_ma150",    "t",  "bool"),
+    ("MA150>200",     "ma150_gt_ma200",   "t",  "bool"),
+    # Momentum / relative strength
+    ("RS SPY 20D",    "rs_spy_20d",       "t",  "num"),
+    ("RS SPY 60D",    "rs_spy_60d",       "t",  "num"),
+    ("RS SPY 126D",   "rs_spy_126d",      "t",  "num"),
+    ("Beta SPY 60D",  "beta_spy_60d",     "t",  "num"),
+    ("Corr SPY 60D",  "corr_spy_60d",     "t",  "num"),
+    ("RSI 14",        "rsi14",            "t",  "num"),
+    ("RSI Δ5D",       "rsi_change_5d",    "t",  "num"),
+    ("MACD Hist",     "macd_hist",        "t",  "num"),
+    # Volatility / risk
+    ("ATR %",         "atr_pct",          "t",  "pct"),
+    ("Real Vol 20D %","realized_vol_20d", "t",  "pct"),
+    ("Real Vol 60D %","realized_vol_60d", "t",  "pct"),
+    ("Vol Ratio",     "vol_ratio",        "t",  "num"),
+    ("BB Width",      "bb_width",         "t",  "num"),
+    ("BB Width %ile", "bb_width_percentile","t","pct"),
+    ("Max DD 63D %",  "max_drawdown_63d", "t",  "pct"),
+    ("Max DD 252D %", "max_drawdown_252d","t",  "pct"),
+    # Fund
+    # etf_profile stores these already normalised to percent (see etf_fetcher).
+    ("Expense %",     "expense_ratio",    "p",  "num"),
+    ("Yield %",       "yield_pct",        "p",  "num"),
+    ("YTD Ret %",     "ytd_return",       "p",  "num"),
+    ("3Y Ret %",      "three_year_return","p",  "num"),
+    ("5Y Ret %",      "five_year_return", "p",  "num"),
+    ("Beta 3Y",       "beta_3y",          "p",  "num"),
+    ("Fund Family",   "fund_family",      "p",  "text"),
+    ("NAV",           "nav",              "p",  "price"),
+    ("Avg Volume",    "avg_volume",       "p",  "num"),
+]
+ETF_VALUE_COL_GROUPS: dict[str, list[str]] = {
+    "Overview":   ["Ticker", "Trend Score", "Close", "Change %", "Category", "AUM ($B)", "As Of"],
+    "Performance":["1D %", "5D %", "10D %", "20D %", "60D %", "126D %", "252D %"],
+    "Trend":      ["From SMA20 %", "From SMA50 %", "From SMA100 %", "From SMA200 %",
+                   "From 52W High %", "From 52W Low %",
+                   "MA20>50", "MA50>150", "MA150>200"],
+    "Momentum/RS":["RS SPY 20D", "RS SPY 60D", "RS SPY 126D", "Beta SPY 60D",
+                   "Corr SPY 60D", "RSI 14", "RSI Δ5D", "MACD Hist"],
+    "Volatility/Risk": ["ATR %", "Real Vol 20D %", "Real Vol 60D %", "Vol Ratio",
+                        "BB Width", "BB Width %ile", "Max DD 63D %", "Max DD 252D %"],
+    "Fund":       ["Expense %", "Yield %", "YTD Ret %", "3Y Ret %", "5Y Ret %",
+                   "Beta 3Y", "Fund Family", "NAV", "Avg Volume"],
+}
+ETF_ALL_VALUE_COLS = [c for c, *_ in _ETF_COL_SPEC]
+_ETF_TEXT_COLS = {"Category", "Fund Family"}
+_ETF_BOOL_COLS = {"MA20>50", "MA50>150", "MA150>200"}
+# Not user-filterable: Ticker (identity) and As Of (informational date; the
+# "Latest close date only" checkbox handles freshness).
+_ETF_FILTER_SKIP = {"Ticker", "As Of"}
+ETF_FILTERABLE_COLS = [c for c in ETF_ALL_VALUE_COLS if c not in _ETF_FILTER_SKIP]
+ETF_NUMERIC_FILTER_COLS = [c for c in ETF_FILTERABLE_COLS
+                           if c not in _ETF_TEXT_COLS and c not in _ETF_BOOL_COLS]
+# Let the generic spec-builder treat ETF text/bool columns correctly. Adding
+# names here is harmless to the stock screen (stocks never carry these columns).
+_COL_FILTER_TEXT_SEARCH |= _ETF_TEXT_COLS
+_COL_FILTER_EMOJI |= _ETF_BOOL_COLS
+
+
+def _etf_cond(col: str, op: str, val: float) -> dict:
+    """Build one ETF numeric filter condition (vs a fixed value)."""
+    return {"col": col, "op": op, "numval": val, "mode": "vs value",
+            "col2": None, "factor": 1.0, "offset": 0.0}
+
+
+# Preset ETF filter groups (seeded into prefs['etf_filter_groups'] on first use).
+# Starting points — tune freely in the UI. Each group is a set of AND conditions.
+_ETF_PRESET_GROUPS: dict[str, dict] = {
+    # Strong, broad uptrend that is also beating the market.
+    "ETF Momentum": {"col_filt_conditions": [
+        _etf_cond("Trend Score", ">=", 60),
+        _etf_cond("60D %", ">=", 5),
+        _etf_cond("126D %", ">=", 10),
+        _etf_cond("RS SPY 126D", ">=", 1.05),
+        _etf_cond("From SMA200 %", ">=", 0),
+    ]},
+    # Cheap + income-oriented + not overbought (an ETF "value" proxy — ETFs have
+    # no PE-vs-peer, so low cost + yield + subdued RSI stand in).
+    "ETF Value (low-cost income)": {"col_filt_conditions": [
+        _etf_cond("Expense %", "<=", 0.20),
+        _etf_cond("Yield %", ">=", 2.0),
+        _etf_cond("RSI 14", "<=", 55),
+    ]},
+    # Room to run back toward the 52w high (upside), limited fresh downside
+    # (shallow recent drawdown, still near/above long-term support), trend intact.
+    "ETF Good Risk/Reward": {"col_filt_conditions": [
+        _etf_cond("From 52W High %", "<=", -12),
+        _etf_cond("Max DD 63D %", ">=", -18),
+        _etf_cond("From SMA200 %", ">=", -5),
+        _etf_cond("Trend Score", ">=", 45),
+        _etf_cond("RS SPY 126D", ">=", 0.95),
+    ]},
+}
 
 # Sub-indicator display labels (for column headers)
 SUB_DISPLAY = {
@@ -1554,6 +1681,41 @@ def load_ticker_list() -> list[str]:
     if TICKERS_FILE.exists():
         return [t.strip() for t in TICKERS_FILE.read_text().split(",") if t.strip()]
     return []
+
+
+def load_etf_list() -> list[str]:
+    """ETF universe from etfs.txt (written by ticker_fetcher.py)."""
+    if ETF_FILE.exists():
+        return [t.strip() for t in ETF_FILE.read_text().split(",") if t.strip()]
+    return []
+
+
+def _build_etf_record(ticker: str, tech: dict, prof: dict) -> dict:
+    """Flatten a tech_indicators row + etf_profile row into the ETF value
+    record keyed by ETF display column names (see _ETF_COL_SPEC)."""
+    rec: dict = {}
+    for disp, field, src, kind in _ETF_COL_SPEC:
+        if disp == "Ticker":
+            rec[disp] = ticker
+            continue
+        row = tech if src == "t" else prof
+        v = row.get(field) if row else None
+        if kind == "bool":
+            rec[disp] = "✅" if v is True else ("❌" if v is False else "⚪️")
+        elif v is None:
+            rec[disp] = None
+        elif kind == "scaleB":
+            try: rec[disp] = round(float(v) / 1e9, 2)
+            except (TypeError, ValueError): rec[disp] = None
+        elif kind == "pct100":
+            try: rec[disp] = round(float(v) * 100, 2)
+            except (TypeError, ValueError): rec[disp] = None
+        elif kind in ("price", "pct", "num"):
+            try: rec[disp] = round(float(v), 2)
+            except (TypeError, ValueError): rec[disp] = v
+        else:  # text (also normalises date objects like as_of_date to str)
+            rec[disp] = str(v)
+    return rec
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3012,7 +3174,9 @@ def _queue_filter_group(tab_key: str, group: dict) -> None:
 def _process_pending_ops() -> None:
     """Apply any pending filter/column ops. Must be called before any widgets render."""
     _active_ids = [t["id"] for t in _load_prefs().get("scan_tabs", [{"id": "history"}])]
-    for tab_key in list(set(list(_TAB_FILTER_KEYS.keys()) + _active_ids)):
+    # "etf" is a non-stock filter tab (its own group namespace) — include it so
+    # its queued group-load / clear ops are applied before widgets render.
+    for tab_key in list(set(list(_TAB_FILTER_KEYS.keys()) + _active_ids + ["etf"])):
         # Filter pending ops
         clear_key = f"_pending_filt_clear_{tab_key}"
         group_key = f"_pending_filt_group_{tab_key}"
@@ -3202,7 +3366,16 @@ def _snapshot_filter_group(tab_key: str) -> dict:
     return group
 
 
-def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
+def render_indicator_filter(
+    tab_key: str,
+    *,
+    filterable_cols: list[str] | None = None,
+    numeric_cols: list[str] | None = None,
+    show_indicator_filter: bool = True,
+    show_filter_groups: bool = True,
+    groups_key: str = "filter_groups",
+    default_key: str = "filter_default",
+) -> tuple[dict[str, set[str]], list]:
     """
     Renders per-indicator value filter UI inline.
     Returns (ind_filters, col_filter):
@@ -3210,43 +3383,54 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
       col_filter:  list of (col_name, {"type":..., ...}) condition rows; a column
                    may appear more than once (compared to different values/cols).
     Includes clear/reset buttons, a filter group manager, and column value filter.
+
+    Optional params let a non-stock screen (e.g. the ETF tab) reuse the generic
+    column-value filter with its own column set:
+      filterable_cols  — column picker options (default: stock `_FILTERABLE_COLS`).
+      numeric_cols     — pickable "second column" for column-vs-column numeric
+                         compares (default: stock `_NUMERIC_FILTER_COLS`).
+      show_indicator_filter — render the T1–F6 PASS/FAIL section (stock-only).
+      show_filter_groups    — render the saved-filter-group manager (stock-only).
     """
+    filterable_cols = filterable_cols if filterable_cols is not None else _FILTERABLE_COLS
+    numeric_cols = numeric_cols if numeric_cols is not None else _NUMERIC_FILTER_COLS
     # ── Auto-load custom default group (once per session per tab) ─────────────
     _loaded_key = f"filt_group_loaded_{tab_key}"
-    if _loaded_key not in st.session_state:
+    if show_filter_groups and _loaded_key not in st.session_state:
         prefs = _load_prefs()
-        _migrate_filter_groups_global(prefs)
-        fd = prefs.get("filter_default", {}).get(tab_key)
-        fg = prefs.get("filter_groups", {})
+        if groups_key == "filter_groups":       # legacy migration is stock-only
+            _migrate_filter_groups_global(prefs)
+        fd = prefs.get(default_key, {}).get(tab_key)
+        fg = prefs.get(groups_key, {})
         st.session_state[_loaded_key] = True
         if fd and fd in fg:
             _queue_filter_group(tab_key, fg[fd])
             st.rerun()
 
-    # ── Indicator filter ──────────────────────────────────────────────────────
-    st.markdown("**Filter by Indicator Values**")
-    selected_inds = st.multiselect(
-        "Filter on indicators:",
-        options=MAIN_IND_COLS,
-        key=f"filt_inds_{tab_key}",
-        label_visibility="collapsed",
-        placeholder="Select indicators to filter by value…",
-    )
-
+    # ── Indicator filter (stock T1–F6 PASS/FAIL; N/A for ETFs) ─────────────────
     ind_filters: dict[str, set[str]] = {}
-    if selected_inds:
-        vcols = st.columns(min(len(selected_inds), 5))
-        for i, ind in enumerate(selected_inds):
-            with vcols[i % 5]:
-                vals = st.multiselect(
-                    f"{ind}:",
-                    options=["PASS", "PARTIAL", "FAIL", "NA"],
-                    default=["PASS"],
-                    format_func=lambda v: f"{EMOJI.get(v, v)} {v}",
-                    key=f"filt_vals_{tab_key}_{ind}",
-                )
-                if vals:
-                    ind_filters[ind] = set(vals)
+    if show_indicator_filter:
+        st.markdown("**Filter by Indicator Values**")
+        selected_inds = st.multiselect(
+            "Filter on indicators:",
+            options=MAIN_IND_COLS,
+            key=f"filt_inds_{tab_key}",
+            label_visibility="collapsed",
+            placeholder="Select indicators to filter by value…",
+        )
+        if selected_inds:
+            vcols = st.columns(min(len(selected_inds), 5))
+            for i, ind in enumerate(selected_inds):
+                with vcols[i % 5]:
+                    vals = st.multiselect(
+                        f"{ind}:",
+                        options=["PASS", "PARTIAL", "FAIL", "NA"],
+                        default=["PASS"],
+                        format_func=lambda v: f"{EMOJI.get(v, v)} {v}",
+                        key=f"filt_vals_{tab_key}_{ind}",
+                    )
+                    if vals:
+                        ind_filters[ind] = set(vals)
 
     # ── Column value filter (list of condition rows; a column may repeat) ───────
     st.markdown("**Filter by Column Values**")
@@ -3263,7 +3447,7 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
       with st.container(key=f"colfilt_row_{tab_key}_{rid}"):
         _hc1, _hc2 = st.columns([5, 1])
         with _hc1:
-            col = st.selectbox(f"col_{rid}", options=_FILTERABLE_COLS, index=None,
+            col = st.selectbox(f"col_{rid}", options=filterable_cols, index=None,
                                key=f"col_filt_col_{tab_key}_{rid}",
                                placeholder="Select column…", label_visibility="collapsed")
         with _hc2:
@@ -3322,7 +3506,7 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
                                     label_visibility="collapsed", help="× second column")
                 with nc3:
                     st.selectbox(f"col2_{rid}",
-                                 options=[c for c in _NUMERIC_FILTER_COLS if c != col],
+                                 options=[c for c in numeric_cols if c != col],
                                  key=f"col_filt_col2_{tab_key}_{rid}", index=None,
                                  placeholder="× column…", label_visibility="collapsed")
                 with nc4:
@@ -3348,12 +3532,14 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
     # Build col_filter: list of (col, spec) for all complete rows
     col_filter = _build_col_filter(tab_key)
 
-    # ── Custom filter groups manager ──────────────────────────────────────────
-    with st.expander("Manage filter groups"):
+    # ── Custom filter groups manager (stock tabs only) ────────────────────────
+    if show_filter_groups:
+      with st.expander("Manage filter groups"):
         prefs = _load_prefs()
-        _migrate_filter_groups_global(prefs)
-        fg = prefs.setdefault("filter_groups", {})
-        fd = prefs.get("filter_default", {}).get(tab_key)
+        if groups_key == "filter_groups":       # legacy migration is stock-only
+            _migrate_filter_groups_global(prefs)
+        fg = prefs.setdefault(groups_key, {})
+        fd = prefs.get(default_key, {}).get(tab_key)
         group_names = list(fg.keys())
 
         if fd:
@@ -3399,7 +3585,7 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
                     st.rerun()
             with gg4:
                 if st.button("Set default", key=f"filt_setdef_{tab_key}"):
-                    prefs.setdefault("filter_default", {})[tab_key] = sel_group
+                    prefs.setdefault(default_key, {})[tab_key] = sel_group
                     _save_prefs(prefs)
                     st.success(f"'{sel_group}' set as default")
                     st.rerun()
@@ -3416,15 +3602,15 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
                     new_n = filt_new_name.strip()
                     if new_n and new_n != sel_group:
                         fg[new_n] = fg.pop(sel_group)
-                        if prefs.get("filter_default", {}).get(tab_key) == sel_group:
-                            prefs["filter_default"][tab_key] = new_n
+                        if prefs.get(default_key, {}).get(tab_key) == sel_group:
+                            prefs[default_key][tab_key] = new_n
                         _save_prefs(prefs)
                         st.rerun()
             with rn3:
                 if st.button("Delete", key=f"filt_del_{tab_key}"):
                     fg.pop(sel_group, None)
-                    if prefs.get("filter_default", {}).get(tab_key) == sel_group:
-                        prefs["filter_default"].pop(tab_key, None)
+                    if prefs.get(default_key, {}).get(tab_key) == sel_group:
+                        prefs[default_key].pop(tab_key, None)
                     _save_prefs(prefs)
                     st.rerun()
         else:
@@ -3436,10 +3622,11 @@ def render_indicator_filter(tab_key: str) -> tuple[dict[str, set[str]], list]:
         if st.button("Clear all filters", key=f"filt_clear_{tab_key}"):
             _queue_filter_clear(tab_key)
             st.rerun()
-    with bc2:
-        if st.button("Reset to default", key=f"filt_reset_{tab_key}"):
-            _queue_filter_clear(tab_key)
-            st.rerun()
+    if show_filter_groups:
+        with bc2:
+            if st.button("Reset to default", key=f"filt_reset_{tab_key}"):
+                _queue_filter_clear(tab_key)
+                st.rerun()
 
     return ind_filters, col_filter
 
@@ -5303,6 +5490,227 @@ def _add_scan_tab() -> None:
     _copy_tab_settings("history", new_id)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ETF Screen tab
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Per-tab background-fetch state: {tab_id: {"thread","stop","log":[list],"result"}}
+_ETF_FETCH_STATE: dict[str, dict] = {}
+
+
+def _start_etf_fetch(tab_id: str, tickers: list[str]) -> None:
+    import etf_fetcher
+    stop = threading.Event()
+    log_lines: list[str] = []
+
+    def _log(msg: str) -> None:
+        log_lines.append(str(msg))
+
+    def _run() -> None:
+        try:
+            res = etf_fetcher.fetch_and_store_etfs(tickers, log=_log, stop_event=stop)
+            _ETF_FETCH_STATE[tab_id]["result"] = res
+        except Exception as e:                       # never let the thread die silently
+            _ETF_FETCH_STATE[tab_id]["result"] = {"error": str(e)}
+            _log(f"ERROR: {e}")
+
+    th = threading.Thread(target=_run, name=f"etf-fetch-{tab_id}", daemon=True)
+    _ETF_FETCH_STATE[tab_id] = {"thread": th, "stop": stop, "log": log_lines,
+                                "result": None, "n": len(tickers)}
+    th.start()
+
+
+def render_etf_tab(tab_id: str) -> None:
+    st.caption(
+        "Fetch ETF price + fund data from Yahoo, derive the same technical "
+        "indicators as the stock screener plus SPY relative-strength, and rank "
+        "by a composite **Trend Score** (0–100). Universe list: **etfs.txt** "
+        "(refresh it from the sidebar '🔄 Ticker universe')."
+    )
+
+    # ── Fetch controls ────────────────────────────────────────────────────────
+    _etf_universe = load_etf_list()
+    with st.expander("⏬ Fetch / refresh ETF data", expanded=False):
+        _tk_raw = st.text_input(
+            "Tickers (comma/space separated) — leave blank to fetch the whole "
+            f"etfs.txt universe ({len(_etf_universe)} ETFs)",
+            key=f"etf_fetch_tickers_{tab_id}", placeholder="QQQ, SOXL, VOO, ARKK",
+        )
+        state = _ETF_FETCH_STATE.get(tab_id)
+        running = bool(state and state["thread"].is_alive())
+        fc1, fc2, fc3 = st.columns([1, 1, 3])
+        with fc1:
+            if st.button("Fetch", key=f"etf_fetch_btn_{tab_id}", disabled=running,
+                         type="primary"):
+                _tks = [t.strip().upper() for t in
+                        (_tk_raw or "").replace(",", " ").split() if t.strip()]
+                if not _tks:
+                    _tks = _etf_universe
+                if _tks:
+                    _start_etf_fetch(tab_id, _tks)
+                    st.rerun()
+                else:
+                    st.warning("No tickers to fetch (etfs.txt is empty).")
+        with fc2:
+            if running and st.button("Stop", key=f"etf_stop_{tab_id}"):
+                state["stop"].set()
+        with fc3:
+            if running and st.button("↻ Refresh status", key=f"etf_refresh_{tab_id}"):
+                st.rerun()
+        if state:
+            if running:
+                st.info(f"Fetching {state['n']} ETFs… "
+                        f"{state['log'][-1] if state['log'] else ''}")
+            elif state.get("result"):
+                r = state["result"]
+                if r.get("error"):
+                    st.error(f"Fetch failed: {r['error']}")
+                else:
+                    st.success(f"Done: {r.get('ok', 0)} ok, {r.get('failed', 0)} failed.")
+                    if r.get("errors"):
+                        with st.expander(f"{len(r['errors'])} errors"):
+                            for t, e in list(r["errors"].items())[:50]:
+                                st.caption(f"{t}: {e}")
+
+    # ── Load stored ETF data ──────────────────────────────────────────────────
+    etf_tickers = storage.get_etf_tickers()
+    if not etf_tickers:
+        st.info("No ETF data stored yet. Use **Fetch / refresh ETF data** above "
+                "to populate the screen.")
+        return
+    tech_map = storage.get_tech_for_tickers(etf_tickers)
+    prof_map = storage.get_all_etf_profiles(etf_tickers)
+    records = {t: _build_etf_record(t, tech_map.get(t, {}), prof_map.get(t, {}))
+               for t in etf_tickers}
+
+    # Seed preset ETF filter groups on first use (respects later user deletion:
+    # only seeds when the namespace key is entirely absent).
+    _prefs = _load_prefs()
+    if "etf_filter_groups" not in _prefs:
+        _prefs["etf_filter_groups"] = {k: copy.deepcopy(v)
+                                       for k, v in _ETF_PRESET_GROUPS.items()}
+        _save_prefs(_prefs)
+
+    # ── Filters: generic column-value filter + saved groups (ETF namespace);
+    #    no stock T1–F6 indicator section. ─────────────────────────────────────
+    _, col_filter = render_indicator_filter(
+        tab_id,
+        filterable_cols=ETF_FILTERABLE_COLS,
+        numeric_cols=ETF_NUMERIC_FILTER_COLS,
+        show_indicator_filter=False,
+        show_filter_groups=True,
+        groups_key="etf_filter_groups",
+        default_key="etf_filter_default",
+    )
+    if col_filter:
+        kept = [t for t, rec in records.items()
+                if all(_col_filter_passes(rec, c, s) for c, s in col_filter)]
+    else:
+        kept = list(records.keys())
+
+    # ── Sort + column-group controls ──────────────────────────────────────────
+    sc1, sc2, sc3 = st.columns([2, 1, 3])
+    with sc1:
+        sort_col = st.selectbox(
+            "Sort by", ETF_FILTERABLE_COLS,
+            index=ETF_FILTERABLE_COLS.index("Trend Score"),
+            key=f"etf_sort_col_{tab_id}",
+        )
+    with sc2:
+        sort_desc = st.radio("Order", ["Desc", "Asc"], horizontal=True,
+                             key=f"etf_sort_dir_{tab_id}") == "Desc"
+    with sc3:
+        shown_groups = st.multiselect(
+            "Column groups", list(ETF_VALUE_COL_GROUPS.keys()),
+            default=list(ETF_VALUE_COL_GROUPS.keys()),
+            key=f"etf_groups_{tab_id}",
+        )
+
+    # Latest close date only: hide ETFs not refreshed on the most recent close
+    # date across the fetched universe (mixed-freshness guard; no duplicate rows
+    # exist because tech_indicators is one-row-per-(ticker,date) and the table
+    # already shows each ticker's latest row).
+    latest_only = st.checkbox(
+        "Latest close date only", value=True, key=f"etf_latest_close_{tab_id}",
+        help="Show only ETFs whose latest stored close date equals the most "
+             "recent close date across all fetched ETFs.",
+    )
+    if latest_only and kept:
+        _max_asof = max(
+            (tech_map[t].get("as_of_date") for t in etf_tickers
+             if tech_map.get(t, {}).get("as_of_date") is not None),
+            default=None)
+        if _max_asof is not None:
+            kept = [t for t in kept
+                    if tech_map.get(t, {}).get("as_of_date") == _max_asof]
+
+    # numeric-aware sort with None always last (regardless of direction)
+    _numeric_sort = sort_col not in _ETF_TEXT_COLS and sort_col not in _ETF_BOOL_COLS
+    if _numeric_sort:
+        kept.sort(key=lambda t: (records[t].get(sort_col) is None,
+                                 records[t].get(sort_col) if records[t].get(sort_col) is not None else 0),
+                  reverse=sort_desc)
+        # None must stay last regardless of reverse -> re-append
+        _none = [t for t in kept if records[t].get(sort_col) is None]
+        _val  = [t for t in kept if records[t].get(sort_col) is not None]
+        kept = _val + _none
+    else:
+        kept.sort(key=lambda t: (records[t].get(sort_col) is None,
+                                 str(records[t].get(sort_col) or "")), reverse=sort_desc)
+
+    # ── Build display DataFrame ───────────────────────────────────────────────
+    display_cols = ["Ticker"]
+    for g in ETF_VALUE_COL_GROUPS:
+        if g in shown_groups:
+            for c in ETF_VALUE_COL_GROUPS[g]:
+                if c != "Ticker" and c not in display_cols:
+                    display_cols.append(c)
+    df = pd.DataFrame([records[t] for t in kept], columns=display_cols)
+    df.insert(0, "#", range(1, len(df) + 1))
+    st.caption(f"Showing **{len(df)}** / {len(etf_tickers)} ETFs"
+               + (f" (filtered from {len(etf_tickers)})" if col_filter else ""))
+    st.dataframe(df, hide_index=True, width="stretch",
+                 height=min(700, 40 + 35 * min(len(df), 18)))
+
+    # ── Detail drill-down (top holdings + sector weights) ─────────────────────
+    with st.expander("🔎 ETF detail (holdings + sector weights)"):
+        pick = st.selectbox("ETF", kept, key=f"etf_detail_pick_{tab_id}")
+        if pick:
+            p = prof_map.get(pick, {})
+            st.markdown(f"**{p.get('long_name') or pick}** — "
+                        f"{p.get('category') or 'N/A'} · {p.get('fund_family') or 'N/A'}")
+            if p.get("description"):
+                st.caption(p["description"])
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                st.markdown("**Top holdings**")
+                try:
+                    hold = json.loads(p.get("top_holdings_json") or "[]")
+                except Exception:
+                    hold = []
+                if hold:
+                    hdf = pd.DataFrame(hold)
+                    if "pct" in hdf.columns:
+                        hdf["pct"] = (hdf["pct"] * 100).round(2)
+                    st.dataframe(hdf, hide_index=True, width="stretch")
+                else:
+                    st.caption("No holdings data.")
+            with dc2:
+                st.markdown("**Sector weights**")
+                try:
+                    sw = json.loads(p.get("sector_weightings_json") or "{}")
+                except Exception:
+                    sw = {}
+                if sw:
+                    swdf = pd.DataFrame(
+                        [{"Sector": k.replace("_", " ").title(),
+                          "Weight %": round((v or 0) * 100, 2)} for k, v in sw.items()]
+                    ).sort_values("Weight %", ascending=False)
+                    st.dataframe(swdf, hide_index=True, width="stretch")
+                else:
+                    st.caption("No sector data.")
+
+
 # ── Dynamic tabs ──────────────────────────────────────────────────────────────
 _scan_tabs_list = _get_scan_tabs()
 
@@ -5316,11 +5724,13 @@ with _plus_col_r:
         st.rerun()
 
 _all_tab_labels = [f"📊 {t['name']}" for t in _scan_tabs_list] + [
+    "🧺 ETF Screen",
     "🤖 AI Analysis", "📡 Event Scanner", "🔀 Swing Cycle Analysis",
     "🧪 Strategy Backtester", "📤 Export Data", "📖 Column Reference",
 ]
 _all_tab_widgets = st.tabs(_all_tab_labels)
-_scan_tab_widgets = _all_tab_widgets[:-6]
+_scan_tab_widgets = _all_tab_widgets[:-7]
+tab_etf      = _all_tab_widgets[-7]
 tab_ai       = _all_tab_widgets[-6]
 tab_event    = _all_tab_widgets[-5]
 tab_swing    = _all_tab_widgets[-4]
@@ -5337,6 +5747,14 @@ for _scan_tab_widget, _scan_tab_cfg in zip(_scan_tab_widgets, _scan_tabs_list):
     with _scan_tab_widget:
         st.markdown(f"### 📊 {_scan_tab_cfg['name']}")
         render_scan_tab(_scan_tab_cfg["id"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ETF Screen
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_etf:
+    st.markdown("### 🧺 ETF Screen")
+    render_etf_tab("etf")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: AI Analysis
