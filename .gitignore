@@ -49,3 +49,9 @@ CRWV_*.md
 *.duckdb.tmp
 *.db
 *.sqlite
+
+# Daily close newsletter output
+reports/
+
+# Newsletter recipient list (personal addresses)
+daily_email/recipients.json

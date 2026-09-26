@@ -517,6 +517,10 @@ COLUMNS = [
     _c("Vol Ratio",     "ETF Screen (Technical)", _YFD, _SC, "computed", "vol_ratio",          "float",  "Realized vol 20D / 60D (>1 = volatility expanding)"),
     _c("BB Width",      "ETF Screen (Technical)", _YFD, _SC, "computed", "bb_width",           "float",  "Bollinger band width as % of the middle band"),
     _c("BB Width %ile", "ETF Screen (Technical)", _YFD, _SC, "computed", "bb_width_percentile","float%", "Percentile rank of current BB width over the trailing 1y"),
+    _c("Cust Px%",      "ETF Screen (Technical)", _PHD, _SC, "computed", "price_history", "float%", "ETF spot price % change over the user-defined date range (Custom Period)"),
+    _c("Cust Vol%",     "ETF Screen (Technical)", _PHD, _SC, "computed", "price_history", "float%", "ETF spot volume % change over the user-defined date range (Custom Period)"),
+    _c("Cust Avg Px%",  "ETF Screen (Technical)", _PHD, _SC, "computed", "price_history", "float%", "ETF rolling-avg daily price % change over the user-defined date range"),
+    _c("Cust Avg Vol%", "ETF Screen (Technical)", _PHD, _SC, "computed", "price_history", "float%", "ETF rolling-avg daily volume % change over the user-defined date range"),
 
     # ── ETF Screen — fund profile (etf_profile) ────────────────────────────────
     _c("Category",    "ETF Screen (Fund)", _QS, _SC, "raw", "category",          "str",    "Morningstar-style fund category (e.g. Large Growth)"),

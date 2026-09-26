@@ -13,6 +13,7 @@ import logging
 import os
 import resource
 import subprocess
+import sys
 import threading
 import concurrent.futures
 import time
@@ -103,6 +104,24 @@ def _load_prefs() -> dict:
 
 def _save_prefs(prefs: dict) -> None:
     _PREFS_PATH.write_text(json.dumps(prefs, indent=2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily newsletter control (daily_email/)
+# ─────────────────────────────────────────────────────────────────────────────
+def _newsletter_ctl():
+    """Import daily_email/newsletter_control.py lazily.
+
+    daily_email/ is deliberately NOT a package: daily_close.py does a top-level
+    `import news_fetcher`, which only resolves with that directory itself on
+    sys.path. So put it on the path the same way daily_close.py does, rather
+    than adding an __init__.py that would break the scheduled job.
+    """
+    d = str(Path(__file__).parent / "daily_email")
+    if d not in sys.path:
+        sys.path.append(d)
+    import newsletter_control
+    return newsletter_control
 
 import pandas as pd
 import streamlit as st
@@ -699,6 +718,12 @@ _ETF_COL_SPEC: list[tuple[str, str | None, str | None, str]] = [
     ("Fund Family",   "fund_family",      "p",  "text"),
     ("NAV",           "nav",              "p",  "price"),
     ("Avg Volume",    "avg_volume",       "p",  "num"),
+    # Custom period (src "r" = injected from get_custom_period_returns over the
+    # user-chosen date range; needs price_history, stored by etf_fetcher).
+    ("Cust Px%",      "Cust Px%",         "r",  "num"),
+    ("Cust Vol%",     "Cust Vol%",        "r",  "num"),
+    ("Cust Avg Px%",  "Cust Avg Px%",     "r",  "num"),
+    ("Cust Avg Vol%", "Cust Avg Vol%",    "r",  "num"),
 ]
 ETF_VALUE_COL_GROUPS: dict[str, list[str]] = {
     "Overview":   ["Ticker", "Trend Score", "Close", "Change %", "Category", "AUM ($B)", "As Of"],
@@ -712,6 +737,7 @@ ETF_VALUE_COL_GROUPS: dict[str, list[str]] = {
                         "BB Width", "BB Width %ile", "Max DD 63D %", "Max DD 252D %"],
     "Fund":       ["Expense %", "Yield %", "YTD Ret %", "3Y Ret %", "5Y Ret %",
                    "Beta 3Y", "Fund Family", "NAV", "Avg Volume"],
+    "Custom Period": ["Cust Px%", "Cust Vol%", "Cust Avg Px%", "Cust Avg Vol%"],
 }
 ETF_ALL_VALUE_COLS = [c for c, *_ in _ETF_COL_SPEC]
 _ETF_TEXT_COLS = {"Category", "Fund Family"}
@@ -1690,15 +1716,22 @@ def load_etf_list() -> list[str]:
     return []
 
 
-def _build_etf_record(ticker: str, tech: dict, prof: dict) -> dict:
+def _build_etf_record(ticker: str, tech: dict, prof: dict,
+                      returns: dict | None = None) -> dict:
     """Flatten a tech_indicators row + etf_profile row into the ETF value
-    record keyed by ETF display column names (see _ETF_COL_SPEC)."""
+    record keyed by ETF display column names (see _ETF_COL_SPEC).
+
+    `returns`: optional {col: value} of custom-period returns (Cust Px% etc.)
+    computed from price_history over the user-chosen date range."""
     rec: dict = {}
     for disp, field, src, kind in _ETF_COL_SPEC:
         if disp == "Ticker":
             rec[disp] = ticker
             continue
-        row = tech if src == "t" else prof
+        if src == "r":                       # custom-period returns (injected)
+            row = returns
+        else:
+            row = tech if src == "t" else prof
         v = row.get(field) if row else None
         if kind == "bool":
             rec[disp] = "✅" if v is True else ("❌" if v is False else "⚪️")
@@ -4171,6 +4204,125 @@ def _render_index_dashboard():
 
 _render_index_dashboard()
 
+
+def _nl_rerun() -> None:
+    """Rerun just the newsletter fragment; scope="fragment" raises when the
+    fragment is executing as part of a full-page run, so fall back to that."""
+    try:
+        st.rerun(scope="fragment")
+    except st.errors.StreamlitAPIException:
+        st.rerun()
+
+
+@st.fragment(run_every=10)
+def _render_newsletter_panel() -> None:
+    """Sidebar control for the daily close newsletter (daily_email/).
+
+    A fragment so a manual run's progress and the schedule badge refresh on
+    their own without rerunning the whole page. All state is read from disk /
+    launchctl each tick, so a run launched from another tab or by launchd shows
+    up here too.
+    """
+    try:
+        nc = _newsletter_ctl()
+    except Exception as e:
+        st.error(f"Newsletter control unavailable: {e}")
+        return
+
+    sched = nc.schedule_state()
+    hlth = nc.health()
+    run = nc.manual_run_state()
+    last_session, last_at = nc.last_sent()
+
+    # ── Status ────────────────────────────────────────────────────────────────
+    if sched["on"]:
+        nxt = nc.next_fire_dt()
+        st.success("Schedule **ON**" + (f" · next {nxt:%a %H:%M} ET" if nxt else ""))
+    else:
+        st.warning("Schedule **OFF**" + ("" if sched["installed"] else " (not installed)"))
+    if sched["installed"] and not sched["in_sync"]:
+        st.caption("⚠️ Installed plist differs from the repo copy — "
+                   "press Start to reinstall it.")
+    if sched["pid"]:
+        st.info(f"launchd run in progress (pid {sched['pid']}).")
+
+    if last_session:
+        st.caption(f"Last sent: **{last_session}**"
+                   + (f" at {last_at.astimezone(CST):%d/%m %H:%M} CST" if last_at else ""))
+    else:
+        st.caption("Nothing sent yet.")
+    if hlth["missing"]:
+        st.error(f"Session **{hlth['missing']}** has not been sent.")
+    if hlth["last_outcome"]:
+        _icon = {"sent": "✅", "skipped": "⏭️", "error": "❌"}.get(hlth["last_outcome"], "•")
+        st.caption(f"Last run: {_icon} {hlth['last_outcome']}"
+                   + (f" — {hlth['last_detail']}" if hlth["last_detail"] else ""))
+
+    # ── Schedule on/off ───────────────────────────────────────────────────────
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("▶ Start", key="nl_start", width="stretch",
+                     disabled=sched["on"] and sched["in_sync"]):
+            ok, msg = nc.start_schedule()
+            st.session_state["_nl_msg"] = ("success" if ok else "error", msg)
+            _nl_rerun()
+    with c2:
+        if st.button("⏹ Stop", key="nl_stop", width="stretch",
+                     disabled=not sched["on"]):
+            ok, msg = nc.stop_schedule()
+            st.session_state["_nl_msg"] = ("success" if ok else "error", msg)
+            _nl_rerun()
+
+    # ── Manual run ────────────────────────────────────────────────────────────
+    if run.get("running"):
+        _el = int(run.get("elapsed_s") or 0)
+        st.info(f"Sending{' (forced)' if run.get('force') else ''}… "
+                f"{_el // 60}m {_el % 60:02d}s")
+        _tail = nc.log_tail(nc.MANUAL_LOG, 8)
+        if _tail:
+            st.code("\n".join(_tail), language=None)
+        if st.button("✖ Cancel run", key="nl_cancel", width="stretch"):
+            ok, msg = nc.cancel_manual_run()
+            st.session_state["_nl_msg"] = ("success" if ok else "error", msg)
+            _nl_rerun()
+    else:
+        _force = st.checkbox(
+            "Resend even if already sent (--force)", key="nl_force",
+            help="Without this, a run for a session already in "
+                 "sent_sessions.txt is skipped.",
+        )
+        if st.button("📨 Send newsletter now", key="nl_send", type="primary",
+                     width="stretch", disabled=bool(sched["pid"])):
+            # The subprocess cannot open DuckDB while this app holds it, so
+            # refresh the $10B+ universe cache on its behalf first.
+            try:
+                nc.refresh_universe_cache(storage._conn())
+            except Exception as e:
+                _scan_logger.warning("newsletter universe cache refresh failed: %s", e)
+            ok, msg = nc.start_manual_run(force=_force, email=True)
+            st.session_state["_nl_msg"] = ("success" if ok else "error", msg)
+            _nl_rerun()
+        if nc.MANUAL_LOG.exists():
+            with st.popover("Last manual run log", width="stretch"):
+                st.code("\n".join(nc.log_tail(nc.MANUAL_LOG, 40)), language=None)
+
+    _m = st.session_state.pop("_nl_msg", None)
+    if _m:
+        (st.success if _m[0] == "success" else st.error)(_m[1])
+
+    # ── Recipients ────────────────────────────────────────────────────────────
+    addrs, src = nc.get_recipients()
+    with st.popover(f"Recipients ({len(addrs)})", width="stretch"):
+        st.caption(f"Source: {src}")
+        _txt = st.text_area("One address per line", value="\n".join(addrs),
+                            key="nl_recipients_txt", height=120)
+        if st.button("Save recipients", key="nl_recipients_save"):
+            ok, err = nc.set_recipients(_txt.splitlines())
+            st.session_state["_nl_msg"] = (
+                ("success", "Recipients saved.") if ok else ("error", err))
+            _nl_rerun()
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("📊 Market Scan")
@@ -4264,6 +4416,10 @@ with st.sidebar:
                     if d["removed"]:
                         st.caption(f"➖ {', '.join(d['removed'][:15])}"
                                    f"{' …' if len(d['removed']) > 15 else ''}")
+
+    # ── Daily close newsletter (daily_email/) ─────────────────────────────────
+    with st.expander("📰 Daily newsletter"):
+        _render_newsletter_panel()
 
     st.markdown("""
 **Indicators**  
@@ -5506,9 +5662,16 @@ def _start_etf_fetch(tab_id: str, tickers: list[str]) -> None:
     def _log(msg: str) -> None:
         log_lines.append(str(msg))
 
+    def _progress(done: int, total: int) -> None:
+        _st = _ETF_FETCH_STATE.get(tab_id)
+        if _st is not None:
+            _st["done"] = done
+            _st["total"] = total
+
     def _run() -> None:
         try:
-            res = etf_fetcher.fetch_and_store_etfs(tickers, log=_log, stop_event=stop)
+            res = etf_fetcher.fetch_and_store_etfs(
+                tickers, log=_log, stop_event=stop, progress=_progress)
             _ETF_FETCH_STATE[tab_id]["result"] = res
         except Exception as e:                       # never let the thread die silently
             _ETF_FETCH_STATE[tab_id]["result"] = {"error": str(e)}
@@ -5516,8 +5679,38 @@ def _start_etf_fetch(tab_id: str, tickers: list[str]) -> None:
 
     th = threading.Thread(target=_run, name=f"etf-fetch-{tab_id}", daemon=True)
     _ETF_FETCH_STATE[tab_id] = {"thread": th, "stop": stop, "log": log_lines,
-                                "result": None, "n": len(tickers)}
+                                "result": None, "n": len(tickers),
+                                "done": 0, "total": len(tickers)}
     th.start()
+
+
+@st.fragment(run_every=2)
+def _render_etf_fetch_progress(tab_id: str) -> None:
+    """Live progress bar for a running/finished ETF fetch (auto-refresh 2 s)."""
+    state = _ETF_FETCH_STATE.get(tab_id)
+    if not state:
+        return
+    running = state["thread"].is_alive()
+    total = state.get("total") or state.get("n") or 0
+    done  = state.get("done", 0)
+    if running:
+        frac = (done / total) if total else 0.0
+        last = state["log"][-1] if state.get("log") else ""
+        st.progress(frac, text=f"Fetching ETFs… {done}/{total}"
+                               + (f" · {last}" if last else ""))
+    else:
+        r = state.get("result")
+        if r is None:
+            return
+        if r.get("error"):
+            st.error(f"Fetch failed: {r['error']}")
+        else:
+            st.progress(1.0, text=f"Done: {r.get('ok', 0)} ok, "
+                                  f"{r.get('failed', 0)} failed.")
+            if r.get("errors"):
+                with st.expander(f"{len(r['errors'])} errors"):
+                    for t, e in list(r["errors"].items())[:50]:
+                        st.caption(f"{t}: {e}")
 
 
 def render_etf_tab(tab_id: str) -> None:
@@ -5558,19 +5751,7 @@ def render_etf_tab(tab_id: str) -> None:
             if running and st.button("↻ Refresh status", key=f"etf_refresh_{tab_id}"):
                 st.rerun()
         if state:
-            if running:
-                st.info(f"Fetching {state['n']} ETFs… "
-                        f"{state['log'][-1] if state['log'] else ''}")
-            elif state.get("result"):
-                r = state["result"]
-                if r.get("error"):
-                    st.error(f"Fetch failed: {r['error']}")
-                else:
-                    st.success(f"Done: {r.get('ok', 0)} ok, {r.get('failed', 0)} failed.")
-                    if r.get("errors"):
-                        with st.expander(f"{len(r['errors'])} errors"):
-                            for t, e in list(r["errors"].items())[:50]:
-                                st.caption(f"{t}: {e}")
+            _render_etf_fetch_progress(tab_id)
 
     # ── Load stored ETF data ──────────────────────────────────────────────────
     etf_tickers = storage.get_etf_tickers()
@@ -5580,7 +5761,29 @@ def render_etf_tab(tab_id: str) -> None:
         return
     tech_map = storage.get_tech_for_tickers(etf_tickers)
     prof_map = storage.get_all_etf_profiles(etf_tickers)
-    records = {t: _build_etf_record(t, tech_map.get(t, {}), prof_map.get(t, {}))
+
+    # ── Custom period range → Cust Px%/Vol%/Avg columns (from price_history) ───
+    from datetime import date as _date
+    cp1, cp2 = st.columns(2)
+    with cp1:
+        _etf_cust_start = st.date_input(
+            "Custom Period Start (blank = Jan 1 this year)", value=None,
+            format="DD/MM/YYYY", key=f"etf_cust_start_{tab_id}")
+    with cp2:
+        _etf_cust_end = st.date_input(
+            "Custom Period End (blank = today)", value=None,
+            format="DD/MM/YYYY", key=f"etf_cust_end_{tab_id}")
+    _cust_s = (_etf_cust_start.isoformat() if _etf_cust_start
+               else _date(_date.today().year, 1, 1).isoformat())
+    _cust_e = (_etf_cust_end.isoformat() if _etf_cust_end
+               else _date.today().isoformat())
+    # Direct (uncached) read — matches the tab's fresh tech_map/prof_map reads
+    # and stays correct after an ETF fetch (which doesn't bump DATA_VERSION).
+    _etf_cust_returns = storage.get_custom_period_returns(
+        etf_tickers, _cust_s, _cust_e)
+
+    records = {t: _build_etf_record(t, tech_map.get(t, {}), prof_map.get(t, {}),
+                                    _etf_cust_returns.get(t))
                for t in etf_tickers}
 
     # Seed preset ETF filter groups on first use (respects later user deletion:

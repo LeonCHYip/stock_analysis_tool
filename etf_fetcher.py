@@ -36,7 +36,7 @@ from market_calendar import (
     nyse_close_passed_today, get_last_trading_day_before_today, et_today,
 )
 from technical_fetcher import (
-    _compute_all_indicators, compute_benchmark_rs, _safe,
+    _compute_all_indicators, compute_benchmark_rs, _safe, _extract_price_rows,
 )
 
 BENCHMARK = "SPY"
@@ -264,8 +264,12 @@ def _download_batch(tickers: list[str], start: str, end: str, log) -> pd.DataFra
 
 
 def fetch_and_store_etfs(tickers: list[str], log=print,
-                         stop_event: "threading.Event | None" = None) -> dict:
+                         stop_event: "threading.Event | None" = None,
+                         progress=None) -> dict:
     """Fetch, compute and store the screener dataset for `tickers`.
+
+    `progress`, if given, is called as ``progress(done, total)`` after each
+    ticker is processed so callers can render a progress bar.
 
     Returns a summary dict {ok, failed, errors}. Safe to run in a background
     thread; closes its thread-local curl handle on exit (see yf_session)."""
@@ -273,6 +277,17 @@ def fetch_and_store_etfs(tickers: list[str], log=print,
     results = {"ok": 0, "failed": 0, "errors": {}}
     if not tickers:
         return results
+    total = len(tickers)
+    done = 0
+
+    def _tick() -> None:
+        nonlocal done
+        done += 1
+        if progress is not None:
+            try:
+                progress(done, total)
+            except Exception:
+                pass  # progress reporting must never break the fetch
 
     today_et = et_today()
     today_str = today_et.isoformat()
@@ -308,6 +323,7 @@ def fetch_and_store_etfs(tickers: list[str], log=print,
                 for t in batch:
                     results["failed"] += 1
                     results["errors"][t] = f"download failed: {e}"
+                    _tick()
                 continue
 
             is_multi = isinstance(raw.columns, pd.MultiIndex)
@@ -338,6 +354,14 @@ def fetch_and_store_etfs(tickers: list[str], log=print,
                     storage.save_tech_indicators(
                         ticker, as_of, fields, row_is_final, asset_type="etf")
 
+                    # Raw OHLCV → price_history (powers custom-period returns in
+                    # the ETF screen, same as the stock screener). Full re-upload
+                    # each fetch; INSERT OR REPLACE keeps it idempotent.
+                    try:
+                        storage.save_price_history(ticker, _extract_price_rows(df))
+                    except Exception as e:
+                        log(f"  [etf] {ticker}: price_history save failed: {e}")
+
                     # Fund profile (per-ticker; rate-limited like stock fundamentals).
                     try:
                         prof = _extract_profile(ticker)
@@ -350,6 +374,8 @@ def fetch_and_store_etfs(tickers: list[str], log=print,
                     results["failed"] += 1
                     results["errors"][ticker] = str(e)
                     log(f"  [etf] {ticker}: {e}")
+                finally:
+                    _tick()
 
         log(f"  [etf] done: {results['ok']} ok, {results['failed']} failed.")
         return results

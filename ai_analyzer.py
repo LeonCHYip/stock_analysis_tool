@@ -24,7 +24,7 @@ else:
 # AI Synthesis Logic
 # ─────────────────────────────────────────────────────────────────────────────
 
-def synthesize_analysis(ticker, model="gemini-2.5-flash"):
+def synthesize_analysis(ticker, model="gemini-3.8-flash"):
     """Use Gemini to generate a fully grounded 4-part investment report with comparative data."""
     if not client:
         return "Error: Gemini API key not configured or client initialization failed."
@@ -241,7 +241,7 @@ def main():
     print(f"--- Deep-Dive Analysis for {ticker} (Fully Search-Grounded) ---")
     
     # Switched to standard flash for highly reliable tool usage
-    model = "gemini-3.1-pro-preview" 
+    model = "gemini-3.8-flash" 
     print(f"[1/1] Researching and synthesizing investment report with AI ({model})...")
     report = synthesize_analysis(ticker, model)
     
