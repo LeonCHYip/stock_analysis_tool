@@ -362,13 +362,26 @@ def _cli_main() -> int:
         hours = int(spec.get("hours", 48))
         limit = int(spec.get("limit", 6))
         deadline = float(spec.get("body_deadline", 180))
+        # bodies_for narrows the expensive phase. Headlines are cheap (one RSS
+        # call per ticker); article bodies are not, and they all share ONE pool
+        # under a single wall-clock deadline. Widening the ticker list without
+        # narrowing the body list just means more articles competing for the
+        # same seconds, so tickers that only feed a sector summary ask for
+        # headlines and skip the fetch.
+        movers = spec.get("movers", [])
+        bodies_for = spec.get("bodies_for")
+        want_bodies = set(bodies_for) if bodies_for is not None else {
+            m["ticker"] for m in movers}
+
         out, every = {}, []
-        for m in spec.get("movers", []):
+        for m in movers:
             arts = gather_meta(m["ticker"], m.get("name"), hours=hours, max_articles=limit)
             out[m["ticker"]] = arts
-            every.extend(arts)
+            if m["ticker"] in want_bodies:
+                every.extend(arts)
         filled = fill_bodies(every, deadline_s=deadline)
-        sys.stderr.write(f"bodies: {filled}/{len(every)}\n")
+        sys.stderr.write(f"bodies: {filled}/{len(every)} "
+                         f"({len(want_bodies)}/{len(movers)} tickers)\n")
         out = {t: [{k: v for k, v in a.items() if k != "published"} for a in arts]
                for t, arts in out.items()}
         sys.stdout.write(_json.dumps(out))

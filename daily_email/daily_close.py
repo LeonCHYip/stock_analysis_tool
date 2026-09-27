@@ -83,6 +83,12 @@ SENT_LOG = REPORTS_DIR / "sent_sessions.txt"
 # silent about the runs that failed hardest. The Streamlit sidebar reads this to
 # decide whether to tell the user the newsletter died.
 RUN_STATE = REPORTS_DIR / "run_state.json"
+# Rolling store of the SOXL sector narrative, newest last. The narrative has to
+# read coherently against previous days, and nothing else in this file survives
+# a run, so the previous sessions are fed back into the prompt from here.
+NARRATIVE_STORE = REPORTS_DIR / "soxl_narrative.json"
+NARRATIVE_KEEP = 10          # sessions retained on disk
+NARRATIVE_CONTEXT = 3        # sessions fed into the prompt
 
 CST = ZoneInfo("America/Chicago")
 ET = ZoneInfo("America/New_York")  # repo convention: displayed timestamps are CST
@@ -120,6 +126,23 @@ SOXL_RSI_SELL_THRESHOLD = 70.2
 LARGE_CAP_MIN = 10e9
 MOVERS_N = 10
 SOXX_MOVERS_N = 5
+# Sub-segment for each constituent, so the sector narrative can say "memory"
+# rather than listing tickers. Hand-maintained alongside soxx_holdings.txt;
+# anything missing falls back to "other".
+SOXX_SEGMENTS = {
+    "MU": "memory", "RMBS": "memory",
+    "TSM": "foundry", "UMC": "foundry", "ASX": "foundry/packaging",
+    "GFS": "foundry",
+    "NVDA": "GPU/accelerator", "AMD": "GPU/accelerator", "ALAB": "AI interconnect",
+    "CRDO": "AI interconnect", "MRVL": "AI interconnect", "AVGO": "AI interconnect",
+    "INTC": "CPU", "ARM": "CPU IP", "QCOM": "mobile SoC",
+    "AMAT": "equipment", "KLAC": "equipment", "LRCX": "equipment",
+    "ASML": "equipment", "TER": "equipment", "NVMI": "equipment",
+    "ENTG": "materials",
+    "TXN": "analog/MCU", "ADI": "analog/MCU", "NXPI": "analog/MCU",
+    "MCHP": "analog/MCU", "ON": "analog/power", "STM": "analog/MCU",
+    "MPWR": "analog/power", "SWKS": "RF", "MTSI": "RF",
+}
 CHUNK = 200
 RETRY_CHUNK = 50
 RETRY_BACKOFF_S = 15
@@ -192,13 +215,63 @@ def _read_universe_cache() -> dict[str, dict]:
         return {}
 
 
-def _write_universe_cache(universe: dict[str, dict]) -> None:
+def _write_universe_cache(universe: dict[str, dict],
+                          soxx_meta: dict[str, dict] | None = None) -> None:
+    """Persist the universe, preserving the SOXX block when not re-supplied."""
     try:
+        if soxx_meta is None:
+            soxx_meta = _read_soxx_meta_cache()
         REPORTS_DIR.mkdir(exist_ok=True)
         UNIVERSE_CACHE.write_text(json.dumps(
-            {"as_of": mc.et_today().isoformat(), "universe": universe}), encoding="utf-8")
+            {"as_of": mc.et_today().isoformat(), "universe": universe,
+             "soxx_meta": soxx_meta}), encoding="utf-8")
     except Exception as exc:
         log(f"WARN: could not write universe cache ({type(exc).__name__}: {exc}).")
+
+
+def _read_soxx_meta_cache() -> dict[str, dict]:
+    try:
+        return json.loads(UNIVERSE_CACHE.read_text(encoding="utf-8")).get("soxx_meta") or {}
+    except Exception:
+        return {}
+
+
+def load_soxx_meta(con, tickers: list[str]) -> dict[str, dict]:
+    """name / sector / industry for the constituents, with NO market-cap screen.
+
+    load_large_cap_universe() only covers $10B+ names, so ASX, UMC, NVMI and
+    MTSI came back with an empty name -- which made the Google query fall back
+    to a bare ticker, and printed "n/a / n/a" into the reason prompt. Cached
+    alongside the universe so a locked DB still has it.
+    """
+    if not tickers:
+        return {}
+    if con is None:
+        return _read_soxx_meta_cache()
+    try:
+        rows = con.execute("""
+            WITH latest AS (
+                SELECT ticker, max(fetch_date) AS fd FROM fundamentals
+                WHERE ticker IN (SELECT unnest(?)) GROUP BY ticker
+            )
+            SELECT f.ticker,
+                   COALESCE(TRY(json_extract_string(f.raw_info_json, '$.longName')),
+                            TRY(json_extract_string(f.raw_info_json, '$.shortName'))) AS name,
+                   TRY(json_extract_string(f.raw_info_json, '$.sector'))    AS sector,
+                   TRY(json_extract_string(f.raw_info_json, '$.industry'))  AS industry
+            FROM fundamentals f
+            JOIN latest l ON f.ticker = l.ticker AND f.fetch_date = l.fd
+        """, [tickers]).fetchall()
+    except Exception as exc:
+        log(f"WARN: SOXX metadata query failed ({type(exc).__name__}: {exc}).")
+        return _read_soxx_meta_cache()
+
+    meta = {r[0]: {"name": r[1] or "", "sector": r[2] or "", "industry": r[3] or ""}
+            for r in rows}
+    missing = [t for t in tickers if t not in meta]
+    if missing:
+        log(f"  soxx meta: no fundamentals row for {', '.join(missing)}")
+    return meta
 
 
 def load_large_cap_universe(con) -> dict[str, dict]:
@@ -219,7 +292,12 @@ def load_large_cap_universe(con) -> dict[str, dict]:
                f.market_cap,
                TRY(json_extract_string(f.raw_info_json, '$.sector'))    AS sector,
                TRY(json_extract_string(f.raw_info_json, '$.industry'))  AS industry,
-               TRY(json_extract_string(f.raw_info_json, '$.shortName')) AS name
+               -- fundamental_fetcher.py:698 stores longName, never shortName,
+               -- so the old '$.shortName' lookup returned NULL for all 936 rows.
+               -- Every news query was therefore falling back to a bare ticker
+               -- instead of the company name.
+               COALESCE(TRY(json_extract_string(f.raw_info_json, '$.longName')),
+                        TRY(json_extract_string(f.raw_info_json, '$.shortName'))) AS name
         FROM fundamentals f
         JOIN latest l ON f.ticker = l.ticker AND f.fetch_date = l.fd
         WHERE f.market_cap >= ?
@@ -631,6 +709,88 @@ def fetch_soxl_rsi(session: str | None = None,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multi-horizon returns (5d / 3m / 1y, price and volume)
+# ─────────────────────────────────────────────────────────────────────────────
+# Bar offsets follow storage.compute_returns_for_tickers (storage.py:2589-2608):
+# N+1 rows back, so "5d" spans five completed sessions.
+HZ_PRICE = (("px_5d", 6), ("px_3m", 64), ("px_1y", 253))
+# Volume is averaged over the window and compared with the preceding window of
+# equal length. A single day's volume 3 months ago is noise, not a baseline.
+HZ_VOL = (("vol_5d", 5), ("vol_3m", 63), ("vol_1y", 252))
+
+
+def fetch_multi_horizon(tickers: list[str]) -> dict[str, dict]:
+    """5d/3m/1y price and volume change for the handful of rendered movers.
+
+    Straight from Yahoo rather than from price_history, for the same reason the
+    rest of this file takes prices from the network: open_db() returns None
+    whenever the Streamlit app is running, which is the common case, and the
+    universe cache carries no price data -- a DB-sourced column would render
+    blank most days. One batched download for ~30 tickers costs a few seconds.
+
+    period="3y", not "2y": the 1-year volume comparison needs 504 bars (252
+    current + 252 prior) and two calendar years returns only ~501 trading days,
+    which silently nulled every vol_1y.
+    """
+    if not tickers:
+        return {}
+    uniq = sorted(set(tickers))
+    try:
+        with YF_DL_LOCK:
+            # group_by="ticker" matters: the default groups by FIELD, giving a
+            # MultiIndex of (Close, AAPL) so df[ticker] raises and every
+            # horizon silently comes back None.
+            df = yf.download(uniq, period="3y", group_by="ticker", progress=False,
+                             auto_adjust=False, threads=False, session=YF_SESSION)
+    except Exception as exc:
+        log(f"WARN: multi-horizon download failed ({type(exc).__name__}: {exc}) -- "
+            f"5d/3m/1y omitted.")
+        return {}
+
+    multi = isinstance(df.columns, pd.MultiIndex)
+    out: dict[str, dict] = {}
+    for t in uniq:
+        try:
+            sub = df[t] if multi else df
+        except (KeyError, TypeError):
+            continue
+        if sub is None or getattr(sub, "empty", True) or "Close" not in sub.columns:
+            continue
+
+        close = sub["Close"].dropna()
+        vol = sub["Volume"].dropna() if "Volume" in sub.columns else None
+        rec: dict[str, float | None] = {}
+
+        for key, back in HZ_PRICE:
+            # A recent listing (ALAB, CRDO) simply has no bar that far back.
+            if len(close) < back:
+                rec[key] = None
+                continue
+            now, then = _safe(close.iloc[-1]), _safe(close.iloc[-back])
+            rec[key] = _safe((now / then - 1.0) * 100.0) if (now and then) else None
+
+        for key, win in HZ_VOL:
+            if vol is None or len(vol) < win * 2:
+                rec[key] = None
+                continue
+            cur = _safe(vol.iloc[-win:].mean())
+            prior = _safe(vol.iloc[-win * 2:-win].mean())
+            rec[key] = _safe((cur / prior - 1.0) * 100.0) if (cur and prior) else None
+
+        out[t] = rec
+
+    n_full = sum(1 for r in out.values() if r.get("px_1y") is not None)
+    log(f"  horizons: {len(out)}/{len(uniq)} tickers resolved ({n_full} with a full year)")
+    return out
+
+
+def attach_horizons(movers: list[dict], horizons: dict[str, dict]) -> None:
+    """Copy the horizon figures onto each mover dict, in place."""
+    for m in movers:
+        m.update(horizons.get(m["ticker"], {}))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # News + AI reasons
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -638,7 +798,8 @@ NEWS_TIMEOUT_S = 420
 BODY_DEADLINE_S = 200
 
 
-def attach_news(movers: list[dict], hours: int = 48, limit: int = 6) -> None:
+def attach_news(movers: list[dict], hours: int = 48, limit: int = 6,
+                bodies_for: set[str] | None = None) -> None:
     """Attach recent articles (headline + body where retrievable) to each mover.
 
     Runs news_fetcher as a SUBPROCESS. Yahoo's feed requires yfinance's
@@ -656,6 +817,8 @@ def attach_news(movers: list[dict], hours: int = 48, limit: int = 6) -> None:
     # newsletter its reasons entirely.
     spec = {"movers": [{"ticker": m["ticker"], "name": m.get("name")} for m in movers],
             "hours": hours, "limit": limit, "body_deadline": BODY_DEADLINE_S}
+    if bodies_for is not None:
+        spec["bodies_for"] = sorted(bodies_for)
     try:
         proc = subprocess.run(
             [sys.executable, str(HERE / "news_fetcher.py")],
@@ -730,6 +893,65 @@ REASON_DEADLINE_S = 360
 REASON_BACKOFFS = [5, 15, 30, 60, 60]
 
 
+def _gemini_json(prompt: str, *, label: str, model: str | None = None,
+                 temperature: float = 0.2,
+                 deadline_s: float = REASON_DEADLINE_S) -> dict:
+    """One Gemini call returning parsed JSON, with model fallback and backoff.
+
+    Shared by the per-mover reasons and the SOXL sector narrative. 503 "high
+    demand" is common and short-lived, so each model is retried with backoff
+    before falling through to the next one -- switching models immediately just
+    spends the whole chain during one transient spike. A non-transient error
+    (a 400) drops that model for good rather than burning retries on it.
+
+    Raises on failure; callers decide whether that degrades a section or the run.
+    """
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    cfg = types.GenerateContentConfig(response_mime_type="application/json",
+                                      temperature=temperature)
+
+    candidates = [model] if model else list(REASON_MODELS)
+    resp, last_exc, started, round_n = None, None, time.time(), 0
+
+    while resp is None and time.time() - started < deadline_s:
+        for candidate in candidates:
+            try:
+                resp = client.models.generate_content(
+                    model=candidate, contents=prompt, config=cfg)
+                log(f"  {label}: model {candidate}"
+                    f"{f' (round {round_n + 1})' if round_n else ''}")
+                break
+            except Exception as exc:
+                last_exc = exc
+                if not any(c in str(exc) for c in ("503", "429", "UNAVAILABLE")):
+                    log(f"  {label}: {candidate} rejected the request "
+                        f"({type(exc).__name__}) -- not retrying this model")
+                    candidates = [c for c in candidates if c != candidate]
+                    break
+        if resp is not None or not candidates:
+            break
+        wait = REASON_BACKOFFS[min(round_n, len(REASON_BACKOFFS) - 1)]
+        elapsed = time.time() - started
+        if elapsed + wait >= deadline_s:
+            log(f"  {label}: all models busy and the {deadline_s:.0f}s budget is "
+                f"spent -- giving up")
+            break
+        log(f"  {label}: all {len(candidates)} model(s) busy "
+            f"({elapsed:.0f}s elapsed), waiting {wait}s")
+        time.sleep(wait)
+        round_n += 1
+
+    if resp is None:
+        raise last_exc or RuntimeError("no model available")
+
+    data = json.loads((resp.text or "").strip())
+    if not isinstance(data, dict):
+        raise ValueError("response was not a JSON object")
+    return data
+
+
 def generate_reasons(movers: list[dict], model: str | None = None) -> dict[str, list[str]]:
     """One batched Gemini call for all movers -> 1-3 reasons each.
 
@@ -765,53 +987,8 @@ def generate_reasons(movers: list[dict], model: str | None = None) -> dict[str, 
         f"~{len(payload)//4:,} tokens) for {len(with_news)} movers")
 
     try:
-        from google import genai
-        from google.genai import types
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
-        cfg = types.GenerateContentConfig(response_mime_type="application/json",
-                                          temperature=0.2)
-        prompt = _REASON_PROMPT.format(payload=payload)
-
-        # 503 "high demand" is common and short-lived, so each model is retried
-        # with backoff before falling through to the next one. Switching models
-        # immediately just spends the whole chain during one transient spike.
-        candidates = [model] if model else REASON_MODELS
-        resp, last_exc, started, round_n = None, None, time.time(), 0
-
-        while resp is None and time.time() - started < REASON_DEADLINE_S:
-            for candidate in candidates:
-                try:
-                    resp = client.models.generate_content(
-                        model=candidate, contents=prompt, config=cfg)
-                    log(f"  reasons: model {candidate}"
-                        f"{f' (round {round_n + 1})' if round_n else ''}")
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    if not any(c in str(exc) for c in ("503", "429", "UNAVAILABLE")):
-                        log(f"  reasons: {candidate} rejected the request "
-                            f"({type(exc).__name__}) -- not retrying this model")
-                        candidates = [c for c in candidates if c != candidate]
-                        break
-            if resp is not None or not candidates:
-                break
-            wait = REASON_BACKOFFS[min(round_n, len(REASON_BACKOFFS) - 1)]
-            elapsed = time.time() - started
-            if elapsed + wait >= REASON_DEADLINE_S:
-                log(f"  reasons: all models busy and the {REASON_DEADLINE_S}s budget is "
-                    f"spent -- giving up")
-                break
-            log(f"  reasons: all {len(candidates)} model(s) busy "
-                f"({elapsed:.0f}s elapsed), waiting {wait}s")
-            time.sleep(wait)
-            round_n += 1
-
-        if resp is None:
-            raise last_exc or RuntimeError("no model available")
-
-        data = json.loads((resp.text or "").strip())
-        if not isinstance(data, dict):
-            raise ValueError("response was not a JSON object")
+        data = _gemini_json(_REASON_PROMPT.format(payload=payload),
+                            label="reasons", model=model)
 
         reasons: dict[str, list[str]] = {}
         for k, v in data.items():
@@ -830,14 +1007,195 @@ def generate_reasons(movers: list[dict], model: str | None = None) -> dict[str, 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SOXL sector narrative
+# ─────────────────────────────────────────────────────────────────────────────
+_NARRATIVE_PROMPT = """You are writing the semiconductor section of a daily
+market-close briefing for one reader who reads it every trading day.
+
+Below: today's SOXL move and RSI, every SOXX constituent's move grouped by
+sub-segment, the news published about them in the last 48 hours, and the
+narrative you wrote on the PREVIOUS sessions.
+
+Write 2 to 4 short themes (max 30 words each) about what is actually driving the
+sector today -- memory pricing, foundry utilisation, AI accelerator demand,
+analog/MCU inventory, equipment capex, and so on.
+
+CRITICAL RULES:
+- Name the sub-segment and the driver. "Memory: contract DRAM pricing firmed for
+  a third session on HBM allocation" -- not "chip stocks rose".
+- Use ONLY what the articles say. Never invent numbers, deals or analyst actions.
+- CONTINUITY: you are given previous sessions. Where today extends, reverses or
+  breaks one of those threads, say so explicitly ("a third session of...",
+  "reversing yesterday's..."). Where it does not, do NOT manufacture a link.
+- Do not simply restate the price moves. The move is the fact; you supply why.
+- If the articles genuinely do not explain the sector's day, return fewer themes,
+  or an empty list. No hedging filler.
+
+Return ONLY a JSON object: {{"themes": ["...", "..."]}}
+No markdown, no commentary.
+
+{payload}"""
+
+
+def load_narratives() -> list[dict]:
+    """Stored narratives, oldest first. Never raises."""
+    try:
+        blob = json.loads(NARRATIVE_STORE.read_text(encoding="utf-8"))
+        return [n for n in (blob.get("narratives") or []) if n.get("session")]
+    except Exception:
+        return []
+
+
+def save_narrative(session: str, themes: list[str]) -> None:
+    """Upsert this session's narrative, keeping the last NARRATIVE_KEEP.
+
+    Refuses to overwrite a stored narrative with an empty one, mirroring the
+    archive's no-clobber rule: a later --no-news or Gemini-failed rerun of the
+    same session must not wipe a good entry.
+    """
+    if not themes:
+        return
+    try:
+        entries = [n for n in load_narratives() if n.get("session") != session]
+        entries.append({"session": session,
+                        "written_at": datetime.now(CST).isoformat(timespec="seconds"),
+                        "themes": themes})
+        entries.sort(key=lambda n: n["session"])
+        REPORTS_DIR.mkdir(exist_ok=True)
+        tmp = NARRATIVE_STORE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"narratives": entries[-NARRATIVE_KEEP:]}, indent=2),
+                       encoding="utf-8")
+        tmp.replace(NARRATIVE_STORE)
+    except Exception as exc:
+        log(f"WARN: could not store the SOXL narrative ({type(exc).__name__}: {exc}).")
+
+
+def generate_soxl_narrative(session: str, soxl: dict | None, rsi: float | None,
+                            constituents: list[dict]) -> dict:
+    """The sector read. Returns {"themes": [...], "prior_sessions": [...]}.
+
+    Degrades to an empty theme list on any failure -- the narrative is the one
+    part of the email that is nice-to-have, and it must never block a send.
+    """
+    empty = {"themes": [], "prior_sessions": []}
+    if not config.GEMINI_API_KEY:
+        return empty
+
+    prior = [n for n in load_narratives() if n["session"] < session][-NARRATIVE_CONTEXT:]
+
+    lines = []
+    if soxl:
+        lines.append(f'SOXL closed {soxl["close"]:,.2f}, {soxl["pct_change"]:+.2f}%'
+                     + (f", RSI(14) {rsi:.1f}." if rsi is not None else "."))
+
+    by_seg: dict[str, list[dict]] = {}
+    for c in constituents:
+        by_seg.setdefault(SOXX_SEGMENTS.get(c["ticker"], "other"), []).append(c)
+    lines.append("\nCONSTITUENT MOVES BY SEGMENT:")
+    for seg in sorted(by_seg):
+        moves = ", ".join(f'{c["ticker"]} {c["pct_change"]:+.2f}%'
+                          for c in sorted(by_seg[seg],
+                                          key=lambda r: r["pct_change"], reverse=True))
+        lines.append(f"- {seg}: {moves}")
+
+    n_articles = 0
+    lines.append("\nNEWS:")
+    for c in constituents:
+        arts = c.get("news") or []
+        if not arts:
+            continue
+        lines.append(f'\n### {c["ticker"]} '
+                     f'({SOXX_SEGMENTS.get(c["ticker"], "other")}, '
+                     f'{c["pct_change"]:+.2f}%)')
+        for h in arts:
+            n_articles += 1
+            lines.append(f'- HEADLINE: {h["title"]} ({h["publisher"]}, {h["age"]})')
+            if h.get("body"):
+                lines.append(f'  TEXT: {h["body"]}')
+
+    if not n_articles:
+        log("  narrative: no constituent articles -- skipping.")
+        return empty
+
+    if prior:
+        lines.append("\nYOUR PREVIOUS SESSIONS (oldest first):")
+        for n in prior:
+            for t in n.get("themes") or []:
+                lines.append(f'- [{n["session"]}] {t}')
+    else:
+        lines.append("\nNo previous narrative is available; do not claim continuity.")
+
+    payload = "\n".join(lines)
+    log(f"  narrative: sending {n_articles} articles across "
+        f"{len(constituents)} constituents (~{len(payload)//4:,} tokens), "
+        f"{len(prior)} prior session(s)")
+
+    try:
+        data = _gemini_json(_NARRATIVE_PROMPT.format(payload=payload),
+                            label="narrative", temperature=0.3)
+        themes = [t.strip() for t in (data.get("themes") or [])
+                  if isinstance(t, str) and t.strip()][:4]
+        log(f"  narrative: {len(themes)} theme(s)")
+        return {"themes": themes, "prior_sessions": [n["session"] for n in prior]}
+    except Exception as exc:
+        log(f"WARN: SOXL narrative failed ({type(exc).__name__}: {exc}).")
+        return empty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Rendering
 # ─────────────────────────────────────────────────────────────────────────────
-# Gmail strips <style> blocks and ignores flex/grid, so everything below is
-# inline-styled <table> markup with no external CSS or images.
+# Inline-styled <table> markup, no images, no flex/grid.
+#
+# The styles that repeat -- the font stack above all -- live in ONE <style>
+# block instead of on every element. Gmail has supported an embedded <style> in
+# <head> since 2016 on web and in both mobile apps; the older belief that it
+# strips them (which this file used to assert) cost 69 KB of duplicated
+# style="" attributes out of a 119 KB report, and Gmail clips an HTML body at
+# roughly 102 KB -- so the tail of the newsletter was being cut off.
+#
+# The one thing kept inline is the red/green on a percentage (_pct_html): an
+# unstyled table is still readable, but a table where losses are not red is
+# actively misleading, so that colour must survive even a client that drops the
+# block entirely.
 
 FONT = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
 GREEN, RED, GREY, INK, MUTED = "#0a7f3f", "#c0392b", "#8a8f98", "#1a1d21", "#6b7280"
 BORDER = "#e5e7eb"
+
+_CSS = (
+    "body{margin:0;padding:0;background:#f6f7f9}"
+    f"body,td,th,div,span,a,h2{{{FONT}}}"
+    f".w{{max-width:680px;margin:0 auto;padding:18px;background:#fff;color:{INK}}}"
+    ".hd{font-size:21px;font-weight:700}"
+    f".sb{{font-size:13px;color:{MUTED};margin-top:2px}}"
+    f"h2{{font-size:17px;color:{INK};margin:26px 0 4px;padding-bottom:6px;"
+    f"border-bottom:2px solid {INK}}}"
+    f".s2{{font-size:12px;color:{MUTED};margin:2px 0 10px}}"
+    "table{border-collapse:collapse;width:100%}"
+    ".nr{max-width:560px}"
+    f".q{{padding:7px 10px;border-bottom:1px solid {BORDER}}}"
+    ".r{text-align:right}"
+    f".b{{font-weight:600;color:{INK}}}"
+    f".d{{font-size:11px;font-weight:400;color:{MUTED}}}"
+    f".mv{{padding:11px 10px;border-bottom:1px solid {BORDER}}}"
+    f".mt{{font-size:14px;font-weight:700;color:{INK}}}"
+    ".mp{font-size:14px}"
+    f".mm{{font-size:12px;color:{MUTED}}}"
+    f".mn{{font-size:11.5px;color:{MUTED};margin-top:2px}}"
+    f".hz{{font-size:11.5px;color:{INK};margin-top:3px}}"
+    f".rs{{font-size:12.5px;color:{INK};margin-top:4px}}"
+    f".rn{{color:{MUTED}}}"
+    f".em{{font-size:12px;color:{GREY};margin-top:5px;font-style:italic}}"
+    ".a{font-size:11.5px;margin-top:3px}"
+    ".a a{color:#1a56db;text-decoration:none}"
+    f".src{{color:{MUTED}}}"
+    ".lbl{font-size:13px;font-weight:600;margin:14px 0 4px}"
+    f".nd{{font-size:12px;color:{GREY}}}"
+    f".fn{{font-size:11px;color:{MUTED};margin-top:8px}}"
+    f".ft{{font-size:11px;color:{MUTED};margin-top:26px;padding-top:10px;"
+    f"border-top:1px solid {BORDER}}}"
+)
 
 
 def _esc(s) -> str:
@@ -846,6 +1204,7 @@ def _esc(s) -> str:
 
 
 def _pct_html(v: float | None) -> str:
+    # Colour stays inline on purpose -- see the note at the top of this section.
     if v is None:
         return f'<span style="color:{GREY}">n/a</span>'
     color = GREEN if v > 0 else (RED if v < 0 else GREY)
@@ -869,10 +1228,8 @@ def _millify(v: float | None) -> str:
 
 
 def _h2(text: str, sub: str = "") -> str:
-    s = (f'<div style="{FONT};font-size:12px;color:{MUTED};margin:2px 0 10px">{_esc(sub)}</div>'
-         if sub else "")
-    return (f'<h2 style="{FONT};font-size:17px;color:{INK};margin:26px 0 4px;'
-            f'padding-bottom:6px;border-bottom:2px solid {INK}">{_esc(text)}</h2>{s}')
+    s = f'<div class="s2">{_esc(sub)}</div>' if sub else ""
+    return f'<h2>{_esc(text)}</h2>{s}'
 
 
 def _sort_board(pairs: list[tuple[str, str]], quotes: dict[str, dict]
@@ -887,21 +1244,16 @@ def _quote_table(rows: list[tuple[str, str, dict | None]]) -> str:
     cells = []
     for tkr, desc, rec in rows:
         if rec is None:
-            price, pct = '<span style="color:%s">no data</span>' % GREY, ""
+            price, pct = f'<span style="color:{GREY}">no data</span>', ""
         else:
             price, pct = _fmt_price(rec["close"]), _pct_html(rec["pct_change"])
         cells.append(
-            f'<tr>'
-            f'<td style="{FONT};padding:7px 10px;border-bottom:1px solid {BORDER};'
-            f'font-weight:600;color:{INK}">{_esc(tkr)}'
-            f'<div style="font-size:11px;font-weight:400;color:{MUTED}">{_esc(desc)}</div></td>'
-            f'<td style="{FONT};padding:7px 10px;border-bottom:1px solid {BORDER};'
-            f'text-align:right;color:{INK}">{price}</td>'
-            f'<td style="{FONT};padding:7px 10px;border-bottom:1px solid {BORDER};'
-            f'text-align:right">{pct}</td></tr>'
+            f'<tr><td class="q b">{_esc(tkr)}<div class="d">{_esc(desc)}</div></td>'
+            f'<td class="q r" style="color:{INK}">{price}</td>'
+            f'<td class="q r">{pct}</td></tr>'
         )
-    return ('<table cellpadding="0" cellspacing="0" border="0" width="100%" '
-            f'style="border-collapse:collapse;max-width:560px">{"".join(cells)}</table>')
+    return ('<table cellpadding="0" cellspacing="0" border="0" class="nr">'
+            f'{"".join(cells)}</table>')
 
 
 def empty_note(mover: dict) -> str:
@@ -914,85 +1266,107 @@ def empty_note(mover: dict) -> str:
     return "articles found, but none explained the move"
 
 
-def _mover_rows(movers: list[dict], reasons: dict[str, list[str]]) -> str:
+def _trio(vals: list[float | None]) -> str:
+    """Render 5d/3m/1y as one slash-joined group, em-dash for missing history."""
+    return " / ".join("&mdash;" if v is None else f"{v:+.0f}%" for v in vals)
+
+
+def _horizon_html(m: dict) -> str:
+    """The compact 5d/3m/1y line. Omitted entirely when nothing resolved, rather
+    than printing a row of em-dashes."""
+    px = [m.get("px_5d"), m.get("px_3m"), m.get("px_1y")]
+    vol = [m.get("vol_5d"), m.get("vol_3m"), m.get("vol_1y")]
+    if all(v is None for v in px + vol):
+        return ""
+    return (f'<div class="hz"><span class="src">Px 5d/3m/1y</span> {_trio(px)}'
+            f'<span class="src"> &middot; Vol</span> {_trio(vol)}</div>')
+
+
+def _horizon_text(m: dict) -> str:
+    """Plain-text twin of _horizon_html."""
+    px = [m.get("px_5d"), m.get("px_3m"), m.get("px_1y")]
+    vol = [m.get("vol_5d"), m.get("vol_3m"), m.get("vol_1y")]
+    if all(v is None for v in px + vol):
+        return ""
+    fmt = lambda vs: " / ".join("--" if v is None else f"{v:+.0f}%" for v in vs)
+    return f"Px 5d/3m/1y {fmt(px)}  |  Vol {fmt(vol)}"
+
+
+def _narrative_html(ctx: dict) -> str:
+    nar = ctx.get("narrative") or {}
+    themes = nar.get("themes") or []
+    if not themes:
+        return ""
+    items = "".join(f'<div class="rs"><span class="rn">&bull;</span> {_esc(t)}</div>'
+                    for t in themes)
+    n_prior = len(nar.get("prior_sessions") or [])
+    prior_note = (f' and the previous {n_prior} session'
+                  f'{"s" if n_prior != 1 else ""} of this section') if n_prior else ""
+    return (f'<div class="lbl" style="margin-top:16px">Sector read</div>{items}'
+            f'<div class="fn">Synthesised by Gemini from the constituent '
+            f'headlines below{prior_note}.</div>')
+
+
+def _narrative_text(ctx: dict) -> list[str]:
+    nar = ctx.get("narrative") or {}
+    themes = nar.get("themes") or []
+    if not themes:
+        return []
+    return ["", "  Sector read", "  " + "-" * 44] + [f"  * {t}" for t in themes]
+
+
+def _mover_rows(movers: list[dict], reasons: dict[str, list[str]],
+                max_articles: int = 6) -> str:
     out = []
     for m in movers:
         reason_list = reasons.get(m["ticker"]) or []
         if reason_list:
             reason_html = "".join(
-                f'<div style="{FONT};font-size:12.5px;color:{INK};margin-top:4px">'
-                f'<span style="color:{MUTED}">{i}.</span> {_esc(r)}</div>'
+                f'<div class="rs"><span class="rn">{i}.</span> {_esc(r)}</div>'
                 for i, r in enumerate(reason_list, 1))
         else:
-            reason_html = (f'<div style="{FONT};font-size:12px;color:{GREY};margin-top:5px;'
-                           f'font-style:italic">{_esc(empty_note(m))}</div>')
+            reason_html = f'<div class="em">{_esc(empty_note(m))}</div>'
         news_html = "".join(
-            f'<div style="{FONT};font-size:11.5px;margin-top:3px">'
-            f'<a href="{_esc(h["link"])}" style="color:#1a56db;text-decoration:none">{_esc(h["title"])}</a>'
-            f'<span style="color:{MUTED}"> &middot; {_esc(h["publisher"])} &middot; {_esc(h["age"])}</span></div>'
-            for h in m.get("news", [])
+            f'<div class="a"><a href="{_esc(h["link"])}">{_esc(h["title"])}</a>'
+            f'<span class="src"> &middot; {_esc(h["publisher"])} &middot; {_esc(h["age"])}</span></div>'
+            for h in (m.get("news") or [])[:max_articles]
         )
+        cap = m.get("market_cap")
         out.append(
-            f'<tr><td style="padding:11px 10px;border-bottom:1px solid {BORDER}">'
-            f'<div style="{FONT}">'
-            f'<span style="font-size:14px;font-weight:700;color:{INK}">{_esc(m["ticker"])}</span> '
-            f'<span style="font-size:14px">{_pct_html(m["pct_change"])}</span> '
-            f'<span style="font-size:12px;color:{MUTED}">&middot; {_fmt_price(m["close"])} '
-            f'&middot; {_millify(m.get("market_cap"))}</span></div>'
-            f'<div style="{FONT};font-size:11.5px;color:{MUTED};margin-top:2px">'
-            f'{_esc(m.get("name") or "")}{" &middot; " if m.get("name") else ""}'
+            f'<tr><td class="mv">'
+            f'<div><span class="mt">{_esc(m["ticker"])}</span> '
+            f'<span class="mp">{_pct_html(m["pct_change"])}</span> '
+            f'<span class="mm">&middot; {_fmt_price(m["close"])}'
+            + (f' &middot; {_millify(cap)}' if cap else "") +
+            f'</span></div>'
+            f'<div class="mn">{_esc(m.get("name") or "")}'
+            f'{" &middot; " if m.get("name") else ""}'
             f'{_esc(m.get("sector") or "n/a")} &rsaquo; {_esc(m.get("industry") or "n/a")}</div>'
-            f'{reason_html}{news_html}</td></tr>'
+            f'{_horizon_html(m)}{reason_html}{news_html}</td></tr>'
         )
-    return ('<table cellpadding="0" cellspacing="0" border="0" width="100%" '
-            f'style="border-collapse:collapse">{"".join(out)}</table>')
-
-
-def _summary_table(movers: list[dict]) -> str:
-    head = "".join(
-        f'<th style="{FONT};font-size:11px;color:{MUTED};text-transform:uppercase;'
-        f'letter-spacing:.04em;text-align:{al};padding:6px 8px;'
-        f'border-bottom:2px solid {BORDER};font-weight:600">{h}</th>'
-        for h, al in (("Ticker", "left"), ("Chg", "right"), ("Sector", "left"), ("Cap", "right")))
-    rows = []
-    for m in movers:
-        rows.append(
-            f'<tr>'
-            f'<td style="{FONT};font-size:12.5px;font-weight:700;color:{INK};'
-            f'padding:6px 8px;border-bottom:1px solid {BORDER}">{_esc(m["ticker"])}</td>'
-            f'<td style="{FONT};font-size:12.5px;text-align:right;'
-            f'padding:6px 8px;border-bottom:1px solid {BORDER}">{_pct_html(m["pct_change"])}</td>'
-            f'<td style="{FONT};font-size:11.5px;color:{MUTED};'
-            f'padding:6px 8px;border-bottom:1px solid {BORDER}">{_esc(m.get("sector") or "n/a")}</td>'
-            f'<td style="{FONT};font-size:12px;color:{INK};text-align:right;'
-            f'padding:6px 8px;border-bottom:1px solid {BORDER}">{_millify(m.get("market_cap"))}</td>'
-            f'</tr>')
-    return ('<table cellpadding="0" cellspacing="0" border="0" width="100%" '
-            f'style="border-collapse:collapse;max-width:560px">'
-            f'<tr>{head}</tr>{"".join(rows)}</table>')
+    return ('<table cellpadding="0" cellspacing="0" border="0">'
+            f'{"".join(out)}</table>')
 
 
 def render_html(ctx: dict) -> str:
     eq_asof = ctx["equity_asof"]
+    n_art = ctx.get("render_articles", 6)
     # A full document (not a bare fragment) so the archived file renders its
-    # unicode correctly in a browser. Gmail discards <head> harmlessly.
+    # unicode correctly in a browser.
     p = ['<!doctype html><html><head><meta charset="utf-8">'
          '<meta name="viewport" content="width=device-width,initial-scale=1">'
-         f'<title>Market Close {_esc(ctx["headline_date"])}</title></head>'
-         '<body style="margin:0;padding:0;background:#f6f7f9">',
-         f'<div style="{FONT};max-width:680px;margin:0 auto;padding:18px;'
-         f'background:#ffffff;color:{INK}">']
-    p.append(f'<div style="font-size:21px;font-weight:700">Market Close</div>'
-             f'<div style="font-size:13px;color:{MUTED};margin-top:2px">'
-             f'{_esc(ctx["headline_date"])} &middot; generated '
+         f'<title>Market Close {_esc(ctx["headline_date"])}</title>'
+         f'<style>{_CSS}</style></head><body><div class="w">']
+    p.append(f'<div class="hd">Market Close</div>'
+             f'<div class="sb">{_esc(ctx["headline_date"])} &middot; generated '
              f'{_esc(ctx["generated_at"])}</div>')
 
     # 1. Index board
     p.append(_h2("1. Index Board", f"US session close · {eq_asof}"))
     p.append(_quote_table(_sort_board(INDEX_EQUITIES, ctx["quotes"])))
     if ctx["alt_rows"]:
-        p.append(f'<div style="{FONT};font-size:12px;color:{MUTED};margin:16px 0 6px">'
-                 f'Commodities &amp; crypto &middot; trade outside NYSE hours '
+        p.append('<div class="s2" style="margin:16px 0 6px">'
+                 'Commodities &amp; crypto &middot; trade outside NYSE hours '
                  f'&middot; as of {_esc(ctx["alt_asof"])}</div>')
         p.append(_quote_table(_sort_board(INDEX_ALT, ctx["quotes"])))
 
@@ -1008,45 +1382,33 @@ def render_html(ctx: dict) -> str:
         else:
             tone, band = INK, f"neutral ({SOXL_RSI_BUY_THRESHOLD:g}-{SOXL_RSI_SELL_THRESHOLD:g})"
         rsi_html = (f'<span style="font-size:22px;font-weight:700;color:{tone}">{rsi:.1f}</span>'
-                    f'<span style="font-size:12px;color:{MUTED}"> RSI(14) &middot; {band}</span>')
+                    f'<span class="mm"> RSI(14) &middot; {band}</span>')
     soxl = ctx["quotes"].get("SOXL")
     soxl_line = (f'<span style="font-size:15px;font-weight:600">{_fmt_price(soxl["close"])}</span> '
                  f'{_pct_html(soxl["pct_change"])}' if soxl else
                  f'<span style="color:{GREY}">no data</span>')
     p.append(_h2("2. SOXL", f"as of {_esc(rsi_date or eq_asof)}"))
-    p.append(f'<div style="{FONT};margin-bottom:6px">{soxl_line}</div>'
-             f'<div style="{FONT}">{rsi_html}</div>')
+    p.append(f'<div style="margin-bottom:6px">{soxl_line}</div><div>{rsi_html}</div>')
+    p.append(_narrative_html(ctx))
 
-    for title, rows in (("Top 5 constituent gainers", ctx["soxx_up"]),
-                        ("Top 5 constituent losers", ctx["soxx_down"])):
-        p.append(f'<div style="{FONT};font-size:13px;font-weight:600;margin:14px 0 4px">'
-                 f'{_esc(title)}</div>')
-        if rows:
-            p.append(_quote_table([(r["ticker"], r.get("name") or "", r) for r in rows]))
-        else:
-            p.append(f'<div style="{FONT};font-size:12px;color:{GREY}">no data</div>')
-    p.append(f'<div style="{FONT};font-size:11px;color:{MUTED};margin-top:8px">'
-             f'Constituents from soxx_holdings.txt ({ctx["holdings_n"]} names, '
-             f'as-of {_esc(ctx["holdings_asof"])}). SOXL is swap-based and holds no '
-             f'equities; SOXX is used as the constituent proxy.</div>')
+    for title, rows in ((f"Top {SOXX_MOVERS_N} constituent gainers", ctx["soxx_up"]),
+                        (f"Top {SOXX_MOVERS_N} constituent losers", ctx["soxx_down"])):
+        p.append(f'<div class="lbl">{_esc(title)}</div>')
+        p.append(_mover_rows(rows, ctx["reasons"], n_art) if rows
+                 else '<div class="nd">no data</div>')
+    p.append(f'<div class="fn">Constituents from soxx_holdings.txt '
+             f'({ctx["holdings_n"]} names, as-of {_esc(ctx["holdings_asof"])}). '
+             f'SOXL is swap-based and holds no equities; SOXX is used as the '
+             f'constituent proxy.</div>')
 
     # 3. Movers
     p.append(_h2(f"3. Top {MOVERS_N} Winners — $10B+ cap",
                  f'{ctx["universe_n"]} stocks screened · ETFs excluded · {eq_asof}'))
-    p.append(_mover_rows(ctx["winners"], ctx["reasons"]))
+    p.append(_mover_rows(ctx["winners"], ctx["reasons"], n_art))
     p.append(_h2(f"Top {MOVERS_N} Losers — $10B+ cap", f"{eq_asof}"))
-    p.append(_mover_rows(ctx["losers"], ctx["reasons"]))
+    p.append(_mover_rows(ctx["losers"], ctx["reasons"], n_art))
 
-    # At-a-glance recap of both mover lists.
-    p.append(_h2("At a Glance", f"top {MOVERS_N} movers each way \u00b7 {eq_asof}"))
-    for label, rows in (("Winners", ctx["winners"]), ("Losers", ctx["losers"])):
-        p.append(f'<div style="{FONT};font-size:13px;font-weight:600;margin:14px 0 5px">'
-                 f'{_esc(label)}</div>')
-        p.append(_summary_table(rows) if rows
-                 else f'<div style="{FONT};font-size:12px;color:{GREY}">no data</div>')
-
-    p.append(f'<div style="{FONT};font-size:11px;color:{MUTED};margin-top:26px;'
-             f'padding-top:10px;border-top:1px solid {BORDER}">'
+    p.append(f'<div class="ft">'
              f'Prices from Yahoo Finance. Sector, industry and market cap from the local '
              f'stock_analysis_v2 database'
              + (f' ({ctx["unavailable_n"]} screened tickers had no Yahoo data today '
@@ -1054,9 +1416,42 @@ def render_html(ctx: dict) -> str:
                 if ctx.get("unavailable_n") else "")
              + f'. Headlines from Google News (last 48h)'
              f'{"; one-line reasons synthesised by Gemini from those headlines only" if ctx["reasons"] else ""}. '
+             f'5d/3m/1y price is a spot change; volume compares the window average '
+             f'against the preceding window. '
              f'Informational only &mdash; not investment advice.</div></div>'
              f'</body></html>')
     return "".join(p)
+
+
+# Gmail clips at roughly 102 KB, showing "[Message clipped]" and hiding
+# everything past the cut -- which is what was happening to the old 119 KB
+# report. Article links are ~75% of the bytes and their count swings with the
+# news day, so rather than hope a fixed cap fits, drop articles-per-mover until
+# the message does.
+#
+# The budget counts the HTML *and* the plain-text alternative, because the
+# threshold is generally described as applying to the whole message rather than
+# to the HTML part alone -- and this is not something the code can measure from
+# here. If a real send at the full six articles turns out NOT to be clipped,
+# raising MSG_BUDGET_BYTES is the one knob to turn.
+MSG_BUDGET_BYTES = 95_000
+TEXT_ARTICLES = 2
+
+
+def render_within_budget(ctx: dict) -> tuple[str, str]:
+    """Render both parts, trimming articles per mover until they fit."""
+    html = text = ""
+    for cap in (6, 5, 4, 3, 2, 1):
+        ctx["render_articles"] = cap
+        html, text = render_html(ctx), render_text(ctx)
+        size = len(html.encode()) + len(text.encode())
+        if size <= MSG_BUDGET_BYTES:
+            log(f"  render: {size:,} bytes at {cap} article(s) per mover "
+                f"(budget {MSG_BUDGET_BYTES:,})")
+            return html, text
+    log(f"WARN: message is {len(html.encode()) + len(text.encode()):,} bytes even "
+        f"at one article per mover -- Gmail will probably clip it.")
+    return html, text
 
 
 def render_text(ctx: dict) -> str:
@@ -1075,28 +1470,37 @@ def render_text(ctx: dict) -> str:
     L += ["", "2. SOXL", "-" * 46]
     L.append(f'close {_fmt_price(soxl["close"])}  {soxl["pct_change"]:+.2f}%' if soxl else "no data")
     L.append(f'RSI(14) {ctx["soxl_rsi"]:.1f}' if ctx["soxl_rsi"] is not None else "RSI(14) unavailable")
-    for title, rows in (("Top 5 gainers", ctx["soxx_up"]), ("Top 5 losers", ctx["soxx_down"])):
-        L.append(f"  {title}: " + (", ".join(f'{r["ticker"]} {r["pct_change"]:+.2f}%'
-                                             for r in rows) if rows else "no data"))
+    for line in _narrative_text(ctx):
+        L.append(line)
+
+    def _mover_block(movers: list[dict]) -> None:
+        for m in movers:
+            L.append(f'{m["ticker"]:<7}{m["pct_change"]:+7.2f}%  {_fmt_price(m["close"]):>10}  '
+                     f'{m.get("sector") or "n/a"} / {m.get("industry") or "n/a"}')
+            hz = _horizon_text(m)
+            if hz:
+                L.append(f'         {hz}')
+            for i, r in enumerate(ctx["reasons"].get(m["ticker"]) or [], 1):
+                L.append(f'         {i}. {r}')
+            # Deliberately thinner than the HTML part: this alternative is a
+            # fallback almost nobody reads, but it still counts against the
+            # message size Gmail clips on.
+            for h in (m.get("news") or [])[:TEXT_ARTICLES]:
+                L.append(f'         - {h["title"]} ({h["publisher"]}, {h["age"]})'
+                         f' {h["link"]}')
+
+    for title, rows in ((f"Top {SOXX_MOVERS_N} constituent gainers", ctx["soxx_up"]),
+                        (f"Top {SOXX_MOVERS_N} constituent losers", ctx["soxx_down"])):
+        L += ["", f"  {title}", "  " + "-" * 44]
+        if rows:
+            _mover_block(rows)
+        else:
+            L.append("  no data")
 
     for title, movers in ((f"3. TOP {MOVERS_N} WINNERS ($10B+)", ctx["winners"]),
                           (f"TOP {MOVERS_N} LOSERS ($10B+)", ctx["losers"])):
         L += ["", title, "-" * 46]
-        for m in movers:
-            L.append(f'{m["ticker"]:<7}{m["pct_change"]:+7.2f}%  {_fmt_price(m["close"]):>10}  '
-                     f'{m.get("sector") or "n/a"} / {m.get("industry") or "n/a"}')
-            for i, r in enumerate(ctx["reasons"].get(m["ticker"]) or [], 1):
-                L.append(f'         {i}. {r}')
-            for h in m.get("news", []):
-                L.append(f'         - {h["title"]} ({h["publisher"]}, {h["age"]})')
-                L.append(f'           {h["link"]}')
-    L += ["", "AT A GLANCE", "-" * 46]
-    for label, rows in (("Winners", ctx["winners"]), ("Losers", ctx["losers"])):
-        L += [f"{label}:", f'{"Ticker":<8}{"Chg":>8}  {"Cap":>9}  Sector']
-        for m in rows:
-            L.append(f'{m["ticker"]:<8}{m["pct_change"]:+7.2f}%  '
-                     f'{_millify(m.get("market_cap")):>9}  {m.get("sector") or "n/a"}')
-        L.append("")
+        _mover_block(movers)
 
     if ctx.get("unavailable_n"):
         L += ["", f'Note: {ctx["unavailable_n"]} of {ctx["universe_n"]} screened tickers had no '
@@ -1177,6 +1581,9 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
     try:
         universe = load_large_cap_universe(con)
         holdings = load_soxx_holdings(con)
+        soxx_meta = load_soxx_meta(con, holdings)
+        if con is not None and soxx_meta:
+            _write_universe_cache(universe, soxx_meta)
     finally:
         if con is not None:
             try:
@@ -1197,11 +1604,15 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
             except Exception:
                 pass
 
-    # SOXX constituents
+    # SOXX constituents. Metadata comes from soxx_meta first (no market-cap
+    # screen) and the $10B+ universe second, so sub-$10B names like NVMI still
+    # get a real company name for the news query and the reason prompt.
     soxx_rows = []
     for t, rec in soxx_quotes.items():
         rec = dict(rec)
-        rec["name"] = (universe.get(t) or {}).get("name", "")
+        meta = soxx_meta.get(t) or universe.get(t) or {}
+        for k in ("name", "sector", "industry"):
+            rec[k] = meta.get(k) or ""
         soxx_rows.append(rec)
     soxx_rows.sort(key=lambda r: r["pct_change"], reverse=True)
     soxx_up = soxx_rows[:SOXX_MOVERS_N]
@@ -1228,15 +1639,47 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
     winners, losers = candidates[:MOVERS_N], list(reversed(candidates[-MOVERS_N:]))
     log(f"  movers: {len(candidates)} ranked -> top {len(winners)} / bottom {len(losers)}")
 
+    # SOXL's own RSI is needed before the narrative, so it is fetched here
+    # rather than in main() after this function returns, as it used to be.
+    soxl = quotes.get("SOXL") or {}
+    soxl_rsi, soxl_rsi_date = fetch_soxl_rsi(equity_asof, soxl.get("close"))
+
+    # 5d/3m/1y for everything that gets rendered, in one download.
+    rendered = winners + losers + soxx_up + soxx_down
+    attach_horizons(rendered, fetch_multi_horizon([m["ticker"] for m in rendered]))
+
+    # ── News + AI ────────────────────────────────────────────────────────────
+    # ONE subprocess for the union of the large-cap movers and every SOXX
+    # constituent. news_fetcher shares a single body-fetch pool across all
+    # tickers under one deadline, which is the whole reason it finishes in
+    # time; a second subprocess would forfeit that and pay another yfinance
+    # import besides. Bodies are limited to the names that get written up --
+    # the rest supply headlines for the sector read only.
     reasons: dict[str, list[str]] = {}
+    narrative = {"themes": [], "prior_sessions": []}
+    summarised = winners + losers + soxx_up + soxx_down
     if skip_news:
         log("news: skipped (--no-news)")
-        for m in winners + losers:
-            m["news"] = []
+        for m in summarised + soxx_rows:
+            m.setdefault("news", [])
     else:
         log("fetching news headlines")
-        attach_news(winners + losers, hours=news_hours, limit=max_articles)
-        reasons = generate_reasons(winners + losers)
+        by_ticker: dict[str, dict] = {}
+        for m in summarised + soxx_rows:          # summarised first: it wins ties
+            by_ticker.setdefault(m["ticker"], m)
+        news_targets = list(by_ticker.values())
+        attach_news(news_targets, hours=news_hours, limit=max_articles,
+                    bodies_for={m["ticker"] for m in summarised})
+        # attach_news mutates the deduped representative; fan the result back
+        # out to the other dicts holding the same ticker.
+        for m in summarised + soxx_rows:
+            if m is not by_ticker[m["ticker"]]:
+                m["news"] = by_ticker[m["ticker"]].get("news", [])
+
+        reasons = generate_reasons(summarised)
+        narrative = generate_soxl_narrative(equity_asof, quotes.get("SOXL"),
+                                            soxl_rsi, soxx_rows)
+        save_narrative(equity_asof, narrative.get("themes") or [])
 
     spy, qqq = quotes.get("SPY"), quotes.get("QQQ")
     bits = [f'{n} {q["pct_change"]:+.2f}%' for n, q in (("SPY", spy), ("QQQ", qqq)) if q]
@@ -1252,8 +1695,8 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
         "alt_asof": alt_asof,
         "headline_date": headline_date,
         "generated_at": datetime.now(CST).strftime("%Y-%m-%d %H:%M CST"),
-        "soxl_rsi": None, "soxl_rsi_date": None,
-        "soxx_up": soxx_up, "soxx_down": soxx_down,
+        "soxl_rsi": soxl_rsi, "soxl_rsi_date": soxl_rsi_date,
+        "soxx_up": soxx_up, "soxx_down": soxx_down, "narrative": narrative,
         "holdings_n": len(holdings), "holdings_asof": holdings_asof(),
         "winners": winners, "losers": losers, "reasons": reasons,
         "universe_n": len(universe),
@@ -1422,11 +1865,7 @@ def main() -> int:
     ctx = build_report(quotes, equity_asof, alt_asof,
                        news_hours=args.news_hours, skip_news=args.no_news,
                        max_articles=args.articles)
-    _soxl = ctx["quotes"].get("SOXL") or {}
-    rsi, rsi_date = fetch_soxl_rsi(ctx["equity_asof"], _soxl.get("close"))
-    ctx["soxl_rsi"], ctx["soxl_rsi_date"] = rsi, rsi_date
-
-    html_body, text_body = render_html(ctx), render_text(ctx)
+    html_body, text_body = render_within_budget(ctx)
 
     REPORTS_DIR.mkdir(exist_ok=True)
     out = REPORTS_DIR / f"{session}_close.html"

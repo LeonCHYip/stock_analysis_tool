@@ -64,3 +64,6 @@ study/**/*.log
 # ...except hand-written inputs that cannot be regenerated.
 !study/fomc/labels.csv
 !study/soxl_drop/catalysts.csv
+
+# Local one-off debug/repro scripts
+scripts/

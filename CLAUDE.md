@@ -270,6 +270,45 @@ detached `Popen` (`start_new_session=True`, wrapped in `caffeinate -i`) whose pi
 Because the app holds the only writable DuckDB connection, it refreshes `universe_cache.json`
 through its own connection before spawning the subprocess.
 
+**Gmail clips an HTML body at ~102 KB**, showing "[Message clipped]" and hiding the rest.
+The report used to be 119–122 KB — already clipped — because every element carried its own
+`style=""`, with the font stack repeated 362 times (69 KB of 119 KB). Those styles now live in
+one `<style>` block in `<head>`: Gmail has supported that since 2016, and the older comment in
+`daily_close.py` claiming it strips them was wrong. Only the red/green on a percentage
+(`_pct_html`) stays inline — an unstyled table is readable, one where losses aren't red is
+misleading. The "At a Glance" recap was deleted too; it restated the same 20 movers for 20 KB.
+Article links are ~75% of the remaining bytes and their count swings with the news day, so
+`render_html_within_budget()` re-renders with fewer articles per mover until the document fits
+`HTML_BUDGET_BYTES` (95 KB). Check the `render:` log line to see whether a day was trimmed.
+
+**News covers the union of the large-cap movers and all 30 SOXX constituents in ONE
+subprocess.** Not two: `news_fetcher.fill_bodies()` shares a single body-fetch pool across every
+ticker under one wall-clock deadline, which is the only reason it finishes in time, and a second
+subprocess would also pay another yfinance import. The spec's `bodies_for` list narrows the
+expensive phase — bodies are fetched only for the ~30 tickers that get written up (20 large caps
++ the SOXX top/bottom 5); the rest contribute headlines to the sector narrative only. The SOXX
+top-5/bottom-5 now render through `_mover_rows` like the large caps, so they carry reasons and
+links. `load_soxx_meta()` fetches name/sector/industry for constituents with **no market-cap
+screen** — `load_large_cap_universe()` only covers $10B+ names, so NVMI, ASX, UMC and MTSI used
+to come back nameless, which degraded their news query to a bare ticker.
+
+**The SOXL "Sector read" is day-over-day stateful.** `reports/soxl_narrative.json` keeps the last
+10 sessions and the previous 3 are fed into the prompt, so it can say "a third session of…"
+instead of restarting each day. Writes are atomic and **refuse to overwrite a stored narrative
+with an empty one**, so a later `--no-news` or Gemini-failed rerun of the same session cannot wipe
+a good entry; same session re-runs upsert rather than append. The model-fallback/backoff loop is
+shared with the reasons call via `_gemini_json()`.
+
+**5d/3m/1y price and volume come from one `yf.download(..., period="3y")`, not the DB.**
+`tech_indicators.ret_5d/ret_60d/ret_252d` and `storage.compute_returns_for_tickers()` already
+exist but are unusable here: both need DuckDB, and the lock is the *common* case, so the columns
+would render blank most days — and `compute_returns_for_tickers`' volume figures are spot (today
+vs one day 3 months ago), which is noise. Price is a spot change at N+1 bars back; **volume
+compares the window average against the preceding window** (`avg(vol[-63:]) / avg(vol[-126:-63])`).
+`period="3y"` not `"2y"`: the 1-year volume comparison needs 504 bars and two calendar years
+returns ~501, which silently nulled every `vol_1y`. `group_by="ticker"` is required — the default
+groups by field, so `df[ticker]` raises and every horizon comes back `None`.
+
 **Daily % change comes from the quote endpoint, never the daily bars.**
 `v7/finance/quote`'s `regularMarketChangePercent` carries the exchange's own previous close.
 yfinance's historical array publishes a session's bar with a NULL close for hours and has been

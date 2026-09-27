@@ -4528,6 +4528,10 @@ F6 P/B ≤ Peer Median
     """)
 
     st.divider()
+    st.markdown("**📧 Daily Newsletter**")
+    _render_newsletter_panel()
+
+    st.divider()
     st.markdown("**🤖 AI Analysis**")
     ai_sidebar_input = st.text_area(
         "Tickers (comma-separated)",
@@ -4547,10 +4551,6 @@ F6 P/B ≤ Peer Median
             else:
                 st.session_state["ai_confirm_pending"] = {"tickers": ai_tickers}
                 st.rerun()
-
-    st.divider()
-    st.markdown("**📧 Daily Newsletter**")
-    _render_newsletter_panel()
 
 # ── Handle Run buttons ────────────────────────────────────────────────────────
 
