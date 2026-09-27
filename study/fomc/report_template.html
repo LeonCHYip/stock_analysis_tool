@@ -1,0 +1,574 @@
+<title>SOXL and MU on Fed Days</title>
+<meta name="description" content="How SOXL and MU traded before, during and after every FOMC decision since 2016, with a 3-year focus and scenarios for the 16 Sep 2026 decision.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+:root {
+  color-scheme: light;
+  --ground: #eef2f1;
+  --surface: #fbfcfc;
+  --ink: #0e1514;
+  --ink-2: #45524f;
+  --muted: #71807c;
+  --rule: #d9e1df;
+  --axis: #bac6c3;
+  --accent: #0d6b5e;
+  --s1: #2a78d6;
+  --s2: #eb6834;
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --hawk: #d03b3b;
+  --dove: #2a78d6;
+  --neutral: #8a9592;
+  --up: #006300;
+  --down: #b3261e;
+  --mid: #e7ecea;
+  --chip: #e1e8e6;
+  --tip-bg: #0e1514;
+  --tip-ink: #f1f5f4;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --ground: #0a0f0e; --surface: #121a18; --ink: #ecf2f0; --ink-2: #a9b7b3; --muted: #82908c; --rule: #22302c;
+    --axis: #384743; --accent: #4fc2ae; --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --hawk: #e66767; --dove: #3987e5; --neutral: #7d8985; --up: #3dbb3d; --down: #f07a73; --mid: #1f2a27;
+    --chip: #1e2926; --tip-bg: #ecf2f0; --tip-ink: #0e1514;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ground: #0a0f0e; --surface: #121a18; --ink: #ecf2f0; --ink-2: #a9b7b3; --muted: #82908c; --rule: #22302c;
+  --axis: #384743; --accent: #4fc2ae; --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --hawk: #e66767; --dove: #3987e5; --neutral: #7d8985; --up: #3dbb3d; --down: #f07a73; --mid: #1f2a27;
+  --chip: #1e2926; --tip-bg: #ecf2f0; --tip-ink: #0e1514;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--ground); color: var(--ink); font: 16px/1.6 var(--f-body); }
+.wrap { max-width: 1140px; margin: 0 auto; padding-inline: 20px; padding-block: 44px 96px; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; }
+h1 { font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.04; font-weight: 700; max-width: 17ch; }
+h2 { font-size: clamp(1.5rem, 3vw, 2rem); line-height: 1.15; font-weight: 600; }
+h3 { font-size: 1.1rem; font-weight: 600; }
+p { margin: 0; max-width: 70ch; }
+.eyebrow, .label { font-family: var(--f-mono); font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.mono { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+.up { color: var(--up); } .down { color: var(--down); } .muted { color: var(--muted); }
+
+.mast { display: grid; gap: 18px; }
+.lede { font-size: 1.12rem; color: var(--ink-2); max-width: 66ch; }
+.lede strong { color: var(--ink); }
+.clock { display: grid; grid-template-columns: auto 1fr; gap: 4px 18px; align-items: baseline; padding: 14px 16px; border: 1px solid var(--accent); border-radius: 4px; background: color-mix(in oklab, var(--accent) 6%, var(--surface)); max-width: 760px; }
+.clock .when { font-family: var(--f-mono); font-size: 0.8rem; color: var(--accent); letter-spacing: 0.06em; text-transform: uppercase; }
+.clock p { font-size: 0.93rem; color: var(--ink-2); }
+@media (max-width: 620px) { .clock { grid-template-columns: 1fr; } }
+
+.figs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 36px; border-top: 2px solid var(--ink); }
+.fig { padding: 16px 20px 4px 0; display: grid; gap: 6px; align-content: start; }
+.fig + .fig { padding-left: 20px; border-left: 1px solid var(--rule); }
+.fig .big { font-family: var(--f-display); font-weight: 600; font-size: clamp(1.9rem, 4vw, 2.6rem); line-height: 1; font-variant-numeric: tabular-nums; }
+.fig p { font-size: 0.92rem; color: var(--ink-2); }
+@media (max-width: 760px) { .figs { grid-template-columns: 1fr; } .fig + .fig { padding-left: 0; border-left: 0; border-top: 1px solid var(--rule); } }
+
+section { margin-top: 72px; display: grid; gap: 16px; }
+.sec-head { display: grid; gap: 8px; }
+.sec-head p { color: var(--ink-2); }
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 18px 18px 14px; }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.ctl { display: inline-flex; gap: 8px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--axis); border-radius: 4px; overflow: hidden; flex-wrap: wrap; }
+.seg button { font: 500 0.82rem var(--f-body); color: var(--ink-2); background: var(--surface); border: 0; padding: 6px 11px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--axis); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+.seg button:hover:not([aria-pressed="true"]) { background: var(--mid); }
+select { font: 500 0.82rem var(--f-body); color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 5px 8px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.84rem; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+.chart { width: 100%; position: relative; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart text { font-family: var(--f-mono); font-size: 11px; fill: var(--muted); }
+.grid line { stroke: var(--rule); stroke-width: 1; }
+.baseline { stroke: var(--axis); stroke-width: 1; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+
+.tbl-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+th, td { padding: 7px 9px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--f-mono); font-weight: 500; font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+td.n, th.n { text-align: right; white-space: nowrap; font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+th.n { font-family: var(--f-mono); }
+th.grp { text-align: center; border-bottom: 1px solid var(--axis); }
+tr.sub td { background: var(--mid); font-family: var(--f-mono); font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); padding-block: 5px; }
+tr.foot td { font-weight: 600; }
+td.say { min-width: 300px; max-width: 440px; font-size: 0.82rem; color: var(--ink-2); }
+td.say .ev { display: block; font-family: var(--f-mono); font-size: 0.7rem; color: var(--muted); margin-top: 3px; }
+.chip { display: inline-block; font-family: var(--f-mono); font-size: 0.7rem; padding: 1px 7px; border-radius: 3px; background: var(--chip); color: var(--ink-2); white-space: nowrap; }
+.chip.hawkish { background: color-mix(in oklab, var(--hawk) 16%, var(--surface)); color: var(--down); }
+.chip.dovish { background: color-mix(in oklab, var(--dove) 16%, var(--surface)); color: var(--accent); }
+:root .chip.dovish { color: color-mix(in oklab, var(--dove) 70%, var(--ink)); }
+.chip.flip { background: color-mix(in oklab, var(--hawk) 16%, var(--surface)); color: var(--down); }
+.chip.hold { background: color-mix(in oklab, var(--accent) 16%, var(--surface)); color: var(--accent); }
+
+.note { font-size: 0.9rem; color: var(--ink-2); border-left: 3px solid var(--axis); padding: 2px 0 2px 14px; max-width: 74ch; }
+.profile { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); border-top: 1px solid var(--rule); }
+.profile div { padding: 10px 14px 10px 0; border-bottom: 1px solid var(--rule); }
+.profile .v { font-family: var(--f-mono); font-size: 1.02rem; }
+.profile .pc { font-size: 0.76rem; color: var(--muted); }
+
+.scen { display: grid; grid-template-columns: 1fr; gap: 16px; }
+.card-body { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 10px 22px; align-items: start; }
+@media (max-width: 860px) { .card-body { grid-template-columns: 1fr; } }
+#grp-table td:first-child { min-width: 230px; }
+.card { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 18px; display: grid; gap: 10px; align-content: start; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.card-head h3 { font-size: 1.25rem; }
+.prob { font-family: var(--f-display); font-weight: 600; font-size: 1.6rem; font-variant-numeric: tabular-nums; }
+.prob small { font-family: var(--f-mono); font-size: 0.7rem; color: var(--muted); font-weight: 400; display: block; text-align: right; }
+.card p { font-size: 0.9rem; color: var(--ink-2); }
+.card .stats { width: 100%; font-size: 0.8rem; }
+.card .stats th, .card .stats td { padding: 4px 6px; }
+.card .read { color: var(--ink); }
+.bar-prob { height: 6px; border-radius: 3px; background: var(--mid); overflow: hidden; }
+.bar-prob i { display: block; height: 100%; background: var(--accent); }
+
+ol.method, ul.src { margin: 0; padding-left: 20px; display: grid; gap: 8px; max-width: 78ch; color: var(--ink-2); font-size: 0.92rem; }
+ul.src { font-size: 0.86rem; }
+ul.common { margin: 0; padding-left: 20px; display: grid; gap: 8px; max-width: 80ch; color: var(--ink-2); }
+.tip { position: fixed; z-index: 10; pointer-events: none; background: var(--tip-bg); color: var(--tip-ink); font: 0.78rem/1.45 var(--f-mono); padding: 7px 9px; border-radius: 4px; max-width: 320px; box-shadow: 0 4px 16px rgb(0 0 0 / 0.18); }
+footer { margin-top: 80px; padding-top: 18px; border-top: 1px solid var(--rule); font-size: 0.82rem; color: var(--muted); }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow">FOMC event study · 84 scheduled decisions, Jan 2016 – Jul 2026 · focus on the 24 since Sep 2023</div>
+    <h1>What Fed days do to SOXL and MU</h1>
+    <p class="lede">The Fed almost never surprises on the decision itself, so markets trade the guidance. Fed days make SOXL jumpier, and most of the extra movement lands after the 2pm statement. <strong>But the direction has been a coin flip,</strong> and over the past three years the day's move usually reversed within a week. The pattern that matters most for tomorrow: <strong>after the 19 hikes since 2016, SOXL's median next month was −8.5%</strong>, compared with +5.1% after all meetings. MU barely noticed.</p>
+    <div class="clock">
+      <span class="when">Wed 16 Sep 2026 · 2:00pm ET</span>
+      <p>Decision, statement and dot plot, then Chair Warsh's press conference at 2:30pm. Futures price a 25bp hike to 3.75–4.00% at over 90%, and a second hike in December at about 75%. MU reports fiscal Q4 on Wed 30 Sep, ten sessions later.</p>
+    </div>
+  </header>
+
+  <div class="figs">
+    <div class="fig">
+      <span class="label">Announcement window</span>
+      <div class="big" id="fig-intra">2.3×</div>
+      <p id="fig-intra-p">SOXL's typical move from 1:30pm to the close on Fed days, compared with other days, over 23 meetings since Nov 2023. The average move was about zero: bigger swings, no direction.</p>
+    </div>
+    <div class="fig">
+      <span class="label">After a hike, next 21 days</span>
+      <div class="big">−8.5%</div>
+      <p>SOXL's median across 19 hikes (8 of 19 were higher a month later). Every meeting: +5.1%. MU after hikes: +2.3%, higher 58% of the time.</p>
+    </div>
+    <div class="fig">
+      <span class="label">Fed-day move vs next 5 days</span>
+      <div class="big">−0.40</div>
+      <p>Rank correlation for SOXL over the last 24 meetings: big Fed-day moves tended to reverse. July 2024 went +19% then −41%; July 2026 went −16% then +44%. Since 2016 the pattern is weaker (−0.14).</p>
+    </div>
+  </div>
+
+  <section id="path">
+    <div class="sec-head">
+      <span class="eyebrow">1 · The shape of a Fed week</span>
+      <h2>Price path from ten days before to a month after</h2>
+      <p>Cumulative return measured from the close before the Fed day (day −1 = 0%). The dashed line is what an average ten-day-to-a-month window did on any day in the same period. If Fed meetings didn't matter, the lines would hug it.</p>
+    </div>
+    <div class="controls">
+      <div class="ctl"><span class="label">Asset</span><div class="seg" id="p-asset"></div></div>
+      <div class="ctl"><span class="label">Window</span><div class="seg" id="p-win"></div></div>
+      <div class="ctl"><span class="label">Stat</span><div class="seg" id="p-stat"></div></div>
+    </div>
+    <div class="legend" id="p-legend"></div>
+    <div class="panel"><div class="chart" id="p-chart"></div></div>
+    <div class="panel tbl-wrap"><table id="drift"></table></div>
+    <p class="note">“Beats random” is how often the Fed-meeting average beat the averages from 10,000 random draws of the same number of ordinary days. Near 50% is noise; above 95% or below 5% would be notable. Nothing clears that bar over ten years. In the past three years, the day <em>before</em> the Fed was weak for SOXL: −2.3% on average, lower than 97% of random draws. That's only 24 meetings, so treat it as a curiosity.</p>
+  </section>
+
+  <section id="tape">
+    <div class="sec-head">
+      <span class="eyebrow">2 · Meeting by meeting</span>
+      <h2>The last 24 decisions, hour by hour</h2>
+      <p>“Into 1:30pm” runs from the prior close to 1:30pm, before the statement. “1:30 → close” captures the 2pm statement and the press conference. The 2-year Treasury move is the market's own verdict on how hawkish the Fed sounded. Hourly bars start in October 2023, so the September 2023 meeting shows daily data only.</p>
+    </div>
+    <div class="panel tbl-wrap"><table id="tape-table"></table></div>
+    <div class="two">
+      <div class="panel">
+        <div class="controls" style="margin-bottom:8px">
+          <div class="ctl"><span class="label">Asset</span><div class="seg" id="sc-asset"></div></div>
+          <div class="ctl"><span class="label">Window</span><div class="seg" id="sc-win"></div></div>
+        </div>
+        <div class="legend"><span><i class="dot" style="background:var(--hawk)"></i>2y up 4bp+ (hawkish)</span><span><i class="dot" style="background:var(--neutral)"></i>Neutral</span><span><i class="dot" style="background:var(--dove)"></i>2y down 4bp+ (dovish)</span></div>
+        <div class="chart" id="scatter"></div>
+      </div>
+      <div class="note" id="scatter-note" style="align-self:center"></div>
+    </div>
+  </section>
+
+  <section id="factors">
+    <div class="sec-head">
+      <span class="eyebrow">3 · What moved the reaction</span>
+      <h2>Decision, tone, setup and earnings</h2>
+      <p>Each meeting split by one condition at a time. Among technical factors (trend, momentum, volatility) and fundamental ones (inflation, jobs, real rates, earnings timing), the clearest splits are the decision itself and how the market read it. Everything else is weak or changes sign between the ten-year and three-year samples.</p>
+    </div>
+    <div class="panel tbl-wrap"><table id="grp-table"></table></div>
+    <div class="sec-head" style="margin-top:12px">
+      <h3>How much each factor lined up with what came next</h3>
+      <p>Spearman rank correlation. ±0.2 is weak, and with 24 meetings anything under about ±0.4 could be chance. Over ten years, no macro or technical factor on the eve of a meeting reached ±0.25.</p>
+    </div>
+    <div class="controls">
+      <div class="ctl"><label class="label" for="c-out">Outcome</label><select id="c-out"></select></div>
+    </div>
+    <div class="legend"><span><i class="sw" style="background:var(--s1);height:10px;width:12px"></i>Since 2016 (84 meetings)</span><span><i class="sw" style="background:var(--s2);height:10px;width:12px"></i>Since Sep 2023 (24 meetings)</span></div>
+    <div class="panel"><div class="chart" id="corr"></div></div>
+  </section>
+
+  <section id="hikes">
+    <div class="sec-head">
+      <span class="eyebrow">4 · Rate hikes</span>
+      <h2>All 19 hikes since 2016</h2>
+      <p>Every hike was priced in beforehand. What differed was the backdrop. In 2016–17, hikes came during a semis boom and were mostly shrugged off (3 of 4 were higher a month later). In 2018 and 2022, hikes landed in falling markets, and the month after was usually worse. The first hike of a cycle (March 2022) rallied on the day and was down 29% a month later.</p>
+    </div>
+    <div class="panel tbl-wrap"><table id="hike-table"></table></div>
+  </section>
+
+  <section id="tomorrow">
+    <div class="sec-head">
+      <span class="eyebrow">5 · Tomorrow</span>
+      <h2>The setup going into 16 September 2026</h2>
+      <p>Measured at Monday's close (14 Sep), after SOXL's −17% day on AI-pacing warnings. Percentiles rank tomorrow against the eve of all 84 scheduled meetings since 2016.</p>
+    </div>
+    <div class="profile" id="profile"></div>
+    <p class="note">Macro backdrop: August CPI rose 0.4% (3.4% y/y), and core CPI accelerated to 0.3% m/m. August payrolls came in at +162k against 53k expected, with unemployment at 4.1%. Warsh told Jackson Hole on 28 Aug that inflation is too high and rates may need to rise. The 2-year yield is 4.63%, 88bp above the top of the funds range, so the market already expects more than one hike. The FOMC has held at 3.50–3.75% since December. July's hold had three dissents in favour of a hike.</p>
+
+    <div class="sec-head" style="margin-top:18px">
+      <h2>Four ways tomorrow can go</h2>
+      <p>The hike-versus-hold split follows futures pricing. How the hike gets <em>read</em> is my judgement, based on the dot-plot debate and the reported vote count. The history under each scenario is the closest set of past meetings, using the 2-year yield move to classify tone. Samples are small, so read them as base rates, not forecasts.</p>
+    </div>
+    <div class="scen" id="scen"></div>
+
+    <div class="sec-head" style="margin-top:18px"><h3>True in every scenario</h3></div>
+    <ul class="common" id="common">
+      <li><strong>Expect a big intraday swing.</strong> SOXL's 1:30pm-to-close move on Fed days has been about 2.3× a normal afternoon, and its 20-day volatility is already at the 80th percentile of past meetings. A 5%+ swing after 2pm would be ordinary.</li>
+      <li><strong>Don't trust the first hour.</strong> Over the past three years, SOXL's Fed-day move tended to reverse over the following week (rank correlation −0.40).</li>
+      <li><strong>SOXL is entering washed out.</strong> After SOXL fell 10% or more into a meeting (13 cases), the next five days were higher 69% of the time (median +7.1%). The following month was usually weaker (median −5.7%). Tomorrow's 10-day slide is −9.2%, right at that line.</li>
+      <li><strong>MU is a different animal.</strong> It sits 48% above its 200-day average and only 24% below its high, and its moves after hikes have been far milder than SOXL's. Earnings on 30 Sep will probably matter more for MU's month than the Fed.</li>
+      <li><strong>The semis story can drown out the Fed.</strong> In the past three years, the biggest Fed-week moves came with chip news: NVDA +13% on 31 Jul 2024, and the −16% chip rout on 29 Jul 2026. Yesterday's AI-pacing selloff is that kind of driver.</li>
+    </ul>
+  </section>
+
+  <section id="method">
+    <div class="sec-head"><span class="eyebrow">Method &amp; caveats</span><h2>How this was measured</h2></div>
+    <ol class="method">
+      <li><strong>Meetings.</strong> Decision dates come from the Fed's FOMC calendar. Rate moves come from FRED's upper target (DFEDTARU), which changes the day after the decision. The two March 2020 emergency cuts are excluded from all statistics.</li>
+      <li><strong>Prices.</strong> Yahoo daily bars (split/dividend adjusted) from 2015 for SOXL, MU, SOXX, QQQ and TLT, plus rate and dollar proxies. For the announcement window, Yahoo 60-minute bars from October 2023: the 12:30 bar's close stands in for 1:30pm, and the 15:30 bar's close is the 4pm close.</li>
+      <li><strong>Surprise.</strong> The decision matched pre-meeting pricing at every scheduled meeting in the sample except September 2024 (50bp against split pricing). Tone is measured by the daily change in the 2-year Treasury yield (FRED DGS2): +4bp or more counts as hawkish, −4bp or less as dovish. That move also absorbs other same-day news (CPI on 12 Jun 2024, the NYCB plunge on 31 Jan 2024). The three-year table also shows a hand-labelled read of each meeting from news coverage.</li>
+      <li><strong>Factors on the eve.</strong> RSI(14), distance from the 50/200-day averages, 10-day return, 20-day volatility, 1-year drawdown and VIX. Macro data uses only what was published before the meeting (CPI lagged 45 days, core PCE 60 days, unemployment 35 days). The real rate is the upper target minus core CPI y/y. MU/NVDA earnings timing comes from Yahoo earnings dates.</li>
+      <li><strong>Limits.</strong> 84 meetings over ten years, 24 in the three-year focus. Returns over 21 days overlap between meetings eight weeks apart only slightly, but market regimes (2018, 2022, 2025–26) dominate the long-horizon numbers. No trading costs.</li>
+      <li><strong>Scenario probabilities</strong> are judgement, anchored on futures pricing for hike vs hold. This is a historical study, not investment advice.</li>
+    </ol>
+    <h3 style="margin-top:12px">Sources</h3>
+    <ul class="src">
+      <li><a href="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm">Federal Reserve: FOMC meeting calendars</a></li>
+      <li><a href="https://www.cnbc.com/2026/09/14/counting-the-votes-warsh-faces-tough-battle-as-fed-girds-for-expected-rate-hike.html">CNBC: Counting the votes, Warsh faces a tough battle as the Fed girds for an expected rate hike (14 Sep 2026)</a></li>
+      <li><a href="https://finance.yahoo.com/economy/policy/articles/fomc-september-2026-odds-rate-163505675.html">Yahoo Finance: FOMC September 2026 odds of a rate hike surge over 60%</a></li>
+      <li><a href="https://www.cnbc.com/2026/08/28/kevin-warsh-jackson-hole-fed-inflation-rate-hike.html">CNBC: Warsh sharpens inflation warning at Jackson Hole (28 Aug 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/09/11/cpi-inflation-report-august-2026.html">CNBC: CPI inflation report, August 2026</a></li>
+      <li><a href="https://www.cnbc.com/2026/09/04/jobs-report-august-2026.html">CNBC: U.S. payrolls rose 162,000 in August</a></li>
+      <li><a href="https://www.cnbc.com/2026/07/29/fed-rate-decision-july-2026.html">CNBC: Divided Fed holds interest rates steady (29 Jul 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/06/17/fed-interest-rate-decision-june-2026.html">CNBC: Fed holds rates steady at Warsh's first meeting (17 Jun 2026)</a></li>
+      <li><a href="https://www.stocktitan.net/articles/fed-rate-decision-june-17-2026">StockTitan: Fed holds rates June 2026; dot plot flips to a hike</a></li>
+      <li><a href="https://www.bloomberg.com/news/articles/2026-04-29/fed-dissents-why-4-officials-voted-against-fomc-decision">Bloomberg: Why 4 officials voted against the FOMC decision (29 Apr 2026)</a></li>
+      <li><a href="https://www.kiplinger.com/investing/live/march-fed-meeting-2026-live-updates-and-commentary">Kiplinger: March 2026 Fed meeting live updates</a></li>
+      <li><a href="https://www.cnbc.com/2026/01/28/fed-rate-decision-january-2026.html">CNBC: Fed holds key rate steady (28 Jan 2026)</a></li>
+      <li><a href="https://investors.micron.com/news/press-release/2026/Micron-Technology-to-Report-Fiscal-Fourth-Quarter-Results-on-September-30-2026/default.aspx">Micron: fiscal Q4 results on 30 Sep 2026</a></li>
+      <li><a href="https://fred.stlouisfed.org/">FRED: DFEDTARU, DGS2, DGS10, CPIAUCSL, CPILFESL, PCEPILFE, UNRATE</a></li>
+      <li>Meetings from 2023 to 2025 were labelled from widely reported coverage at the time (for example the December 2023 “pivot” dots, and December 2024's hawkish cut).</li>
+    </ul>
+  </section>
+  <footer>Built from <span class="mono">study/fomc/</span>: fetch.py → meetings.py → analyze.py → scenarios.py → report.py. Prices through the 14 Sep 2026 close.</footer>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const $ = (s) => document.querySelector(s);
+const MINUS = "−";
+const pct = (v, d = 1, sign = true) => (v == null || Number.isNaN(v)) ? "—" : ((v > 0 && sign) ? "+" : v < 0 ? MINUS : "") + Math.abs(v).toFixed(d) + "%";
+const bp = (v) => v == null ? "—" : (v > 0 ? "+" : v < 0 ? MINUS : "±") + Math.abs(v).toFixed(0) + "bp";
+const num = (v, d = 2) => v == null ? "—" : (v > 0 ? "+" : v < 0 ? MINUS : "") + Math.abs(v).toFixed(d);
+const cls = (v) => v == null ? "" : v > 0 ? "up" : v < 0 ? "down" : "";
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmtDate = (s) => new Date(s + "T12:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+const tip = $("#tip");
+function showTip(e, html) {
+  tip.innerHTML = html; tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 14;
+  tip.style.left = Math.max(8, x) + "px"; tip.style.top = Math.max(8, y) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+function seg(id, options, get, set) {
+  const el = document.getElementById(id);
+  el.innerHTML = options.map(([v, l]) => `<button type="button" data-v="${v}">${l}</button>`).join("");
+  const sync = () => el.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === String(get()))));
+  el.addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; set(b.dataset.v); sync(); });
+  sync();
+}
+function niceTicks(lo, hi, n = 5) {
+  const span = hi - lo || 1, raw = span / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => span / s <= n + 1);
+  const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+}
+const S = { p: { asset: "SOXL", win: "3y", stat: "median" }, sc: { asset: "SOXL", win: "3y" }, cout: "SOXL_post21" };
+const MTG = DATA.meetings;
+const SCHED = MTG.filter((m) => m.scheduled);
+const DECLAB = (m) => m.decision === "hold" ? "Hold" : (m.decision === "hike" ? "Hike " : "Cut ") + Math.abs(m.move_bp) + "bp";
+const range = (u) => `${(u - 0.25).toFixed(2)}–${u.toFixed(2)}%`;
+
+/* ---------- 1 · path ---------- */
+const PGROUPS = [["all", "All meetings", "--ink"], ["hike", "Hikes", "--s2"], ["cut", "Cuts", "--s1"], ["hold", "Holds", "--s3"], ["baseline", "Any day", "--neutral"]];
+function renderPath() {
+  const { asset, win, stat } = S.p;
+  const el = $("#p-chart");
+  const ks = [...Array(32).keys()].map((i) => i - 10);
+  const series = PGROUPS.map(([g, label, color]) => {
+    const rows = DATA.paths.filter((r) => r.asset === asset && r.window === win && r.group === g);
+    if (!rows.length) return null;
+    const n = g === "baseline" ? null : rows.find((r) => r.k === 0)?.count;
+    return { g, label: n ? `${label} (${n})` : label, color, dash: g === "baseline", values: ks.map((k) => rows.find((r) => r.k === k)?.[stat] ?? null) };
+  }).filter(Boolean);
+  $("#p-legend").innerHTML = series.map((s) => `<span><i class="sw" style="background:var(${s.color})${s.dash ? ";opacity:.7" : ""}"></i>${s.label}</span>`).join("");
+  const W = Math.max(320, el.clientWidth || 800), H = 360, narrow = W < 620;
+  const m = { t: 14, r: narrow ? 14 : 118, b: 36, l: 46 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const all = series.flatMap((s) => s.values).filter((v) => v != null);
+  let lo = Math.min(0, ...all), hi = Math.max(0, ...all); const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const X = (k) => m.l + ((k + 10) / 31) * iw, Y = (v) => m.t + (1 - (v - lo) / (hi - lo)) * ih;
+  let svg = `<g class="grid">${niceTicks(lo, hi).map((v) => `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}"/>`).join("")}</g>`;
+  svg += niceTicks(lo, hi).map((v) => `<text x="${m.l - 8}" y="${Y(v) + 4}" text-anchor="end">${pct(v, Math.abs(hi - lo) < 8 ? 1 : 0)}</text>`).join("");
+  svg += `<line class="baseline" x1="${m.l}" x2="${W - m.r}" y1="${Y(0)}" y2="${Y(0)}"/>`;
+  svg += `<rect x="${X(-1)}" y="${m.t}" width="${X(0) - X(-1)}" height="${ih}" style="fill:var(--accent);opacity:.08"/>`;
+  svg += `<text x="${(X(-1) + X(0)) / 2}" y="${m.t + 12}" text-anchor="middle" style="fill:var(--accent)">Fed day</text>`;
+  [-10, -5, 0, 5, 10, 15, 21].forEach((k) => { svg += `<text x="${X(k)}" y="${H - m.b + 18}" text-anchor="middle">${k === 0 ? "0" : (k > 0 ? "+" : MINUS) + Math.abs(k)}d</text>`; });
+  svg += series.map((s) => `<path d="${s.values.map((v, i) => v == null ? "" : (i && s.values[i - 1] != null ? "L" : "M") + X(ks[i]).toFixed(1) + "," + Y(v).toFixed(1)).join("")}" style="fill:none;stroke:var(${s.color});stroke-width:${s.g === "all" ? 2.6 : 2};${s.dash ? "stroke-dasharray:5 4;" : ""}stroke-linejoin:round"/>`).join("");
+  if (!narrow) {
+    const items = series.map((s) => ({ s, y: Y(s.values[s.values.length - 1]) })).sort((a, b) => a.y - b.y);
+    for (let i = 1; i < items.length; i++) if (items[i].y - items[i - 1].y < 15) items[i].y = items[i - 1].y + 15;
+    items.forEach(({ s, y }) => { svg += `<text x="${X(21) + 8}" y="${y + 4}" style="fill:var(--ink);font-size:11.5px">${pct(s.values[s.values.length - 1])} <tspan style="fill:var(--muted)">${esc(s.label.split(" (")[0])}</tspan></text>`; });
+  }
+  svg += `<g class="hov" style="display:none"><line y1="${m.t}" y2="${H - m.b}" style="stroke:var(--axis)"/></g><rect class="hit" x="${m.l}" y="${m.t}" width="${iw}" height="${ih}" style="fill:transparent"/>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${asset} path around Fed decisions">${svg}</svg>`;
+  const sv = el.querySelector("svg"), hov = sv.querySelector(".hov"), line = hov.querySelector("line");
+  sv.querySelector(".hit").addEventListener("pointermove", (e) => {
+    const bb = sv.getBoundingClientRect(), px = (e.clientX - bb.left) * (W / bb.width);
+    const k = Math.max(-10, Math.min(21, Math.round(((px - m.l) / iw) * 31 - 10)));
+    hov.style.display = ""; line.setAttribute("x1", X(k)); line.setAttribute("x2", X(k));
+    const i = k + 10;
+    showTip(e, `<b>${k === -1 ? "Close before Fed day" : k === 0 ? "Fed day close" : (k > 0 ? "+" : MINUS) + Math.abs(k) + " sessions"}</b><br>` + series.map((s) => `<span style="color:var(${s.color})">■</span> ${esc(s.label)}: ${pct(s.values[i])}`).join("<br>"));
+  });
+  sv.querySelector(".hit").addEventListener("pointerleave", () => { hov.style.display = "none"; hideTip(); });
+  renderDrift();
+}
+const DM = [["pre10", "10 days before"], ["pre5", "5 days before"], ["day_before", "Day before"], ["fomc_day", "Fed day"], ["post1", "Day after"], ["post5", "Next 5 days"], ["post10", "Next 10 days"], ["post21", "Next 21 days"]];
+function renderDrift() {
+  const { asset, win } = S.p;
+  const rows = DATA.drift.filter((r) => r.asset === asset && r.window === win);
+  const body = DM.map(([k, l]) => {
+    const r = rows.find((x) => x.measure === k);
+    const b = r.boot_pct, flag = b >= 95 || b <= 5;
+    return `<tr${k === "fomc_day" ? ' style="font-weight:600"' : ""}><td>${l}</td><td class="n ${cls(r.mean)}">${pct(r.mean, 2)}</td><td class="n">${pct(r.median, 2)}</td><td class="n">${pct(r.hit, 0, false)}</td><td class="n muted">${pct(r.base_mean, 2)}</td><td class="n muted">${pct(r.base_hit, 0, false)}</td><td class="n">${flag ? `<span class="chip flip">${b.toFixed(0)}%</span>` : b.toFixed(0) + "%"}</td></tr>`;
+  }).join("");
+  const abs = rows.find((x) => x.measure === "abs_day_vs_normal"), c5 = rows.find((x) => x.measure === "corr_day_vs_next5");
+  $("#drift").innerHTML = `<thead><tr><th>${asset} · ${win === "3y" ? "24 meetings since Sep 2023" : "84 meetings since 2016"}</th><th class="n">Fed avg</th><th class="n">Fed median</th><th class="n">Fed % up</th><th class="n">Any-day avg</th><th class="n">Any-day % up</th><th class="n">Beats random</th></tr></thead><tbody>${body}
+    <tr class="sub"><td colspan="7">Typical Fed-day move is ${abs.mean.toFixed(2)}× a normal day · rank correlation of Fed-day move with the next 5 days: ${num(c5.mean)}</td></tr></tbody>`;
+}
+
+/* ---------- 2 · tape ---------- */
+function toneChip(m) {
+  if (m.d2y_bp == null) return `<span class="chip">n/a</span>`;
+  return `<span class="chip ${m.tone_mkt}">${bp(m.d2y_bp)} ${m.tone_mkt}</span>`;
+}
+function renderTape() {
+  const rows = MTG.filter((m) => m.window3y && m.scheduled).slice().reverse();
+  const c = (v) => `<td class="n ${cls(v)}">${pct(v)}</td>`;
+  const body = rows.map((m) => `<tr>
+    <td class="mono" style="white-space:nowrap">${m.date}${m.sep ? ' <span class="muted" title="Summary of Economic Projections">SEP</span>' : ""}</td>
+    <td style="white-space:nowrap">${DECLAB(m)}<br><span class="muted mono" style="font-size:.72rem">${range(m.upper_after)}</span></td>
+    <td>${toneChip(m)}<br><span class="muted" style="font-size:.72rem">news: ${esc(m.tone_hand)}</span></td>
+    ${c(m.SOXL_pre5)}${c(m.SOXL_morning)}${c(m.SOXL_reaction)}<td class="n ${cls(m.SOXL_fomc_day)}" style="font-weight:600">${pct(m.SOXL_fomc_day)}</td>${c(m.SOXL_post1)}${c(m.SOXL_post5)}${c(m.SOXL_post21)}
+    ${c(m.MU_reaction)}${c(m.MU_fomc_day)}${c(m.MU_post5)}${c(m.MU_post21)}
+    <td class="say">${esc(m.summary)}${m.same_day_events ? `<span class="ev">Same day: ${esc(m.same_day_events)}</span>` : ""}</td></tr>`).join("");
+  $("#tape-table").innerHTML = `<thead>
+    <tr><th colspan="3"></th><th colspan="7" class="grp">SOXL</th><th colspan="4" class="grp">MU</th><th></th></tr>
+    <tr><th>Fed day</th><th>Decision</th><th>2y yield move</th><th class="n">5d into</th><th class="n">Into 1:30pm</th><th class="n">1:30 → close</th><th class="n">Fed day</th><th class="n">Next day</th><th class="n">+5d</th><th class="n">+21d</th>
+    <th class="n">1:30 → close</th><th class="n">Fed day</th><th class="n">+5d</th><th class="n">+21d</th><th>What the Fed did</th></tr></thead><tbody>${body}</tbody>`;
+}
+
+function renderScatter() {
+  const { asset, win } = S.sc;
+  const pts = SCHED.filter((m) => win === "10y" || m.window3y).map((m) => ({ m, x: m[`${asset}_fomc_day`], y: m[`${asset}_post5`] })).filter((p) => p.x != null && p.y != null);
+  const el = $("#scatter");
+  const W = Math.max(300, el.clientWidth || 500), H = 330, m = { t: 12, r: 14, b: 40, l: 48 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+  const xl = Math.min(-2, ...xs) * 1.1, xh = Math.max(2, ...xs) * 1.1, yl = Math.min(-5, ...ys) * 1.1, yh = Math.max(5, ...ys) * 1.1;
+  const X = (v) => m.l + ((v - xl) / (xh - xl)) * iw, Y = (v) => m.t + (1 - (v - yl) / (yh - yl)) * ih;
+  let s = `<g class="grid">${niceTicks(yl, yh).map((v) => `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}"/>`).join("")}</g>`;
+  s += niceTicks(yl, yh).map((v) => `<text x="${m.l - 6}" y="${Y(v) + 4}" text-anchor="end">${pct(v, 0)}</text>`).join("");
+  s += niceTicks(xl, xh, 6).map((v) => `<text x="${X(v)}" y="${H - m.b + 16}" text-anchor="middle">${pct(v, 0)}</text>`).join("");
+  s += `<line class="baseline" x1="${X(0)}" x2="${X(0)}" y1="${m.t}" y2="${H - m.b}"/><line class="baseline" x1="${m.l}" x2="${W - m.r}" y1="${Y(0)}" y2="${Y(0)}"/>`;
+  s += `<text x="${m.l + iw / 2}" y="${H - 4}" text-anchor="middle">Fed-day return →</text><text x="${m.l + 4}" y="${m.t + 10}">↑ next 5 days</text>`;
+  s += pts.map((p, i) => `<circle data-i="${i}" cx="${X(p.x)}" cy="${Y(p.y)}" r="${win === "3y" ? 6 : 5}" style="fill:var(--${p.m.tone_mkt === "hawkish" ? "hawk" : p.m.tone_mkt === "dovish" ? "dove" : "neutral"});stroke:var(--surface);stroke-width:2;opacity:.9"/>`).join("");
+  pts.filter((p) => Math.abs(p.x) >= 9 || Math.abs(p.y) >= 35).forEach((p) => { s += `<text x="${X(p.x) + 8}" y="${Y(p.y) + 4}" style="font-size:10px">${p.m.date.slice(0, 7)}</text>`; });
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Fed-day return vs next five days">${s}</svg>`;
+  el.querySelectorAll("circle").forEach((c) => {
+    c.addEventListener("pointermove", (e) => { const p = pts[+c.dataset.i]; showTip(e, `<b>${fmtDate(p.m.date)}</b> · ${DECLAB(p.m)}<br>2y ${bp(p.m.d2y_bp)} (${p.m.tone_mkt})<br>Fed day ${pct(p.x)} · next 5d ${pct(p.y)}`); });
+    c.addEventListener("pointerleave", hideTip);
+  });
+  const r = DATA.drift.find((d) => d.asset === asset && d.window === win && d.measure === "corr_day_vs_next5");
+  const opp = pts.filter((p) => Math.abs(p.x) >= 3 && Math.sign(p.x) !== Math.sign(p.y));
+  const big = pts.filter((p) => Math.abs(p.x) >= 3);
+  $("#scatter-note").innerHTML = `<strong>Reversal check, ${asset}, ${win === "3y" ? "since Sep 2023" : "since 2016"}.</strong> Rank correlation between the Fed-day move and the following five days: <strong>${num(r.mean)}</strong> across ${r.n} meetings. On days when ${asset} moved 3% or more, the next week went the other way ${opp.length} of ${big.length} times. Points in the top-left and bottom-right quadrants are reversals.`;
+}
+
+/* ---------- 3 · factors ---------- */
+const GF = [
+  ["decision", { hike: "Hike", cut: "Cut", hold: "Hold" }],
+  ["tone_mkt", { hawkish: "Market read hawkish (2y +4bp or more)", neutral: "Market read neutral", dovish: "Market read dovish (2y −4bp or more)" }],
+  ["tone_hand", { hawkish: "News read hawkish", neutral: "News read neutral", dovish: "News read dovish" }],
+  ["phase", { "Hiking": "Cycle: hiking", "Hold after hikes": "Cycle: on hold after hikes", "Cutting": "Cycle: cutting", "Hold after cuts": "Cycle: on hold after cuts", "Zero rates": "Cycle: zero rates" }],
+  ["sep", { True: "Dot-plot meeting (SEP)", False: "No projections" }],
+  ["soxl_above200", { True: "SOXL above its 200-day average", False: "SOXL below its 200-day average" }],
+  ["soxl_pre10_up", { True: "SOXL up over the prior 10 days", False: "SOXL down over the prior 10 days" }],
+  ["vix_gt20", { True: "VIX above 20 on the eve", False: "VIX 20 or below" }],
+  ["mu_earn_near", { True: "MU earnings within 5 sessions", False: "No MU earnings within 5 sessions" }],
+];
+function renderGroups() {
+  const G = DATA.groups;
+  const get = (w, f, l) => G.find((g) => g.window === w && g.factor === f && g.level === l);
+  const cell = (r, k, fm = pct) => r ? `<td class="n ${k.endsWith("hit") || k === "n" ? "" : cls(r[k])}">${k === "n" ? r.n : fm(r[k])}</td>` : `<td class="n muted">—</td>`;
+  let body = "";
+  const all10 = get("10y", "all", "All meetings"), all3 = get("3y", "all", "All meetings");
+  const row = (label, a, b, cls_ = "") => `<tr class="${cls_}"><td>${label}</td>${cell(a, "n")}${cell(a, "SOXL_fomc_day_mean")}${cell(a, "SOXL_post5_mean")}${cell(a, "SOXL_post21_med")}${cell(a, "SOXL_post21_hit", (v) => pct(v, 0, false))}${cell(a, "MU_post21_med")}
+      ${cell(b, "n")}${cell(b, "SOXL_fomc_day_mean")}${cell(b, "SOXL_post5_mean")}${cell(b, "SOXL_post21_med")}${cell(b, "MU_post21_med")}</tr>`;
+  body += row("All scheduled meetings", all10, all3, "foot");
+  GF.forEach(([f, labels]) => {
+    body += `<tr class="sub"><td colspan="11">${{ decision: "Decision", tone_mkt: "Surprise, market read", tone_hand: "Surprise, news read (3-year only)", phase: "Rate cycle", sep: "Meeting type", soxl_above200: "Trend", soxl_pre10_up: "Momentum into the meeting", vix_gt20: "Fear gauge", mu_earn_near: "Earnings timing" }[f]}</td></tr>`;
+    Object.entries(labels).forEach(([l, lab]) => {
+      const a = get("10y", f, l), b = get("3y", f, l);
+      if (!a && !b) return;
+      body += row(lab, a, b);
+    });
+  });
+  $("#grp-table").innerHTML = `<thead><tr><th rowspan="2" style="vertical-align:bottom">Condition</th><th colspan="6" class="grp">Since 2016</th><th colspan="5" class="grp">Since Sep 2023</th></tr>
+    <tr><th class="n">n</th><th class="n">SOXL day avg</th><th class="n">SOXL +5d avg</th><th class="n">SOXL +21d med</th><th class="n">SOXL up 21d</th><th class="n">MU +21d med</th><th class="n">n</th><th class="n">SOXL day avg</th><th class="n">SOXL +5d avg</th><th class="n">SOXL +21d med</th><th class="n">MU +21d med</th></tr></thead><tbody>${body}</tbody>`;
+}
+const FLAB = { d2y_bp: "2-year yield move on the day", d10y_bp: "10-year yield move on the day", dxy_day: "Dollar move on the day", move_bp: "Size of rate move", SOXL_pre10: "SOXL 10-day return into meeting", SOXL_rsi14: "SOXL RSI(14) on the eve", SOXL_vs200: "SOXL vs 200-day average", SOXL_vol20: "SOXL 20-day volatility", SOXL_dd252: "SOXL distance from 1-year high", MU_pre10: "MU 10-day return into meeting", MU_rsi14: "MU RSI(14) on the eve", MU_vs200: "MU vs 200-day average", vix_prev: "VIX on the eve", core_cpi_yoy: "Core CPI y/y", core_pce_yoy: "Core PCE y/y", real_rate: "Real policy rate", unrate_3m_chg: "Unemployment, 3-month change", slope_10y2y: "10y–2y curve slope", upper_after: "Fed funds level" };
+const OUTS = [["SOXL_fomc_day", "SOXL Fed-day return"], ["SOXL_post5", "SOXL next 5 days"], ["SOXL_post21", "SOXL next 21 days"], ["MU_fomc_day", "MU Fed-day return"], ["MU_post5", "MU next 5 days"], ["MU_post21", "MU next 21 days"]];
+function renderCorr() {
+  const o = S.cout, el = $("#corr");
+  const rows = Object.keys(FLAB).map((f) => ({ f, a: DATA.corr.find((c) => c.window === "10y" && c.outcome === o && c.factor === f), b: DATA.corr.find((c) => c.window === "3y" && c.outcome === o && c.factor === f) }))
+    .filter((r) => r.a || r.b).sort((x, y) => Math.max(Math.abs(y.a?.rho ?? 0), Math.abs(y.b?.rho ?? 0)) - Math.max(Math.abs(x.a?.rho ?? 0), Math.abs(x.b?.rho ?? 0)));
+  const W = Math.max(320, el.clientWidth || 800), narrow = W < 640, rowH = 30, m = { t: 22, r: 16, b: 10, l: narrow ? 150 : 240 };
+  const H = m.t + m.b + rows.length * rowH, iw = W - m.l - m.r;
+  const X = (v) => m.l + ((v + 0.6) / 1.2) * iw;
+  let s = [-0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6].map((v) => `<line x1="${X(v)}" x2="${X(v)}" y1="${m.t - 4}" y2="${H - m.b}" style="stroke:var(${v === 0 ? "--axis" : "--rule"})"/><text x="${X(v)}" y="${m.t - 8}" text-anchor="middle">${num(v, 1)}</text>`).join("");
+  rows.forEach((r, i) => {
+    const y = m.t + i * rowH;
+    s += `<text x="${m.l - 10}" y="${y + rowH / 2 + 4}" text-anchor="end" style="fill:var(--ink-2);font-family:var(--f-body);font-size:${narrow ? 10.5 : 12}px">${esc(narrow ? FLAB[r.f].replace("on the eve", "").replace("into meeting", "") : FLAB[r.f])}</text>`;
+    [[r.a, "--s1", 5], [r.b, "--s2", 15]].forEach(([c, col, off]) => {
+      if (!c || c.rho == null) return;
+      const x0 = X(0), x1 = X(Math.max(-0.6, Math.min(0.6, c.rho)));
+      s += `<rect x="${Math.min(x0, x1)}" y="${y + off - 4}" width="${Math.max(1, Math.abs(x1 - x0))}" height="9" rx="2" style="fill:var(${col})"><title>${c.window === "10y" ? "Since 2016" : "Since Sep 2023"}: rho ${num(c.rho)} (n ${c.n})</title></rect>`;
+    });
+  });
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Factor correlations">${s}</svg>`;
+}
+
+/* ---------- 4 · hikes ---------- */
+function renderHikes() {
+  const H = DATA.hikes;
+  const c = (v) => `<td class="n ${cls(v)}">${pct(v)}</td>`;
+  const med = (k) => { const a = H.map((h) => h[k]).filter((v) => v != null).sort((x, y) => x - y); const i = a.length >> 1; return a.length % 2 ? a[i] : (a[i - 1] + a[i]) / 2; };
+  const body = H.slice().reverse().map((h) => `<tr><td class="mono">${h.date}</td><td class="n">+${h.move_bp}bp</td><td><span class="chip ${h.tone_mkt}">${bp(h.d2y_bp)} ${h.tone_mkt}</span></td>
+    ${c(h.SOXL_vs200)}<td class="n">${pct(h.SOXL_dd252, 0)}</td>${c(h.SOXL_pre10)}<td class="n ${cls(h.SOXL_fomc_day)}" style="font-weight:600">${pct(h.SOXL_fomc_day)}</td>${c(h.SOXL_post5)}${c(h.SOXL_post21)}${c(h.MU_fomc_day)}${c(h.MU_post21)}</tr>`).join("");
+  $("#hike-table").innerHTML = `<thead><tr><th>Fed day</th><th class="n">Size</th><th>2y move</th><th class="n">SOXL vs 200d</th><th class="n">SOXL from high</th><th class="n">SOXL 10d into</th><th class="n">SOXL day</th><th class="n">SOXL +5d</th><th class="n">SOXL +21d</th><th class="n">MU day</th><th class="n">MU +21d</th></tr></thead>
+    <tbody>${body}<tr class="foot"><td>Median of 19</td><td></td><td></td><td></td><td></td><td></td>${c(med("SOXL_fomc_day"))}${c(med("SOXL_post5"))}${c(med("SOXL_post21"))}${c(med("MU_fomc_day"))}${c(med("MU_post21"))}</tr></tbody>`;
+}
+
+/* ---------- 5 · tomorrow ---------- */
+function renderTomorrow() {
+  const c = DATA.current;
+  const ord = (p) => `${Math.round(p)}th percentile`;
+  const prof = [
+    ["SOXL, last 10 sessions", pct(c.SOXL_pre10), ord(c.SOXL_pre10_pctile)], ["SOXL vs 200-day avg", pct(c.SOXL_vs200), ord(c.SOXL_vs200_pctile)],
+    ["SOXL from 1-year high", pct(c.SOXL_dd252, 0), ord(c.SOXL_dd252_pctile)], ["SOXL RSI(14)", c.SOXL_rsi14.toFixed(0), ord(c.SOXL_rsi14_pctile)],
+    ["SOXL 20-day volatility", pct(c.SOXL_vol20, 0, false), ord(c.SOXL_vol20_pctile)], ["MU vs 200-day avg", pct(c.MU_vs200), ord(c.MU_vs200_pctile)],
+    ["MU from 1-year high", pct(c.MU_dd252, 0), "RSI " + c.MU_rsi14.toFixed(0)], ["VIX", c.vix.toFixed(1), ""],
+    ["2-year Treasury", c.dgs2.toFixed(2) + "%", `${bp(c.dgs2_chg_20d_bp)} in 20 sessions`], ["Fed funds (upper)", c.upper.toFixed(2) + "%", "held since Dec 2025"],
+  ];
+  $("#profile").innerHTML = prof.map(([k, v, p]) => `<div><div class="label">${k}</div><div class="v">${v}</div><div class="pc">${p}</div></div>`).join("");
+
+  const B = (name) => DATA.buckets.find((b) => b.bucket === name);
+  const SC = [
+    { t: "Hike, more to come", p: 35, look: "25bp hike to 3.75–4.00%. The dots or Warsh point to at least one more hike this year and a higher 2027 path. Dissents, if any, come from the dovish side. The 2-year yield rises 4bp or more.",
+      b: ["Hikes · hawkish", "All · hawkish", "Slide · hawkish"],
+      read: "The worst case for SOXL in the base rates: hawkish-read meetings were followed by a flat-to-down month, and none of the four hawkish meetings entered after a slide was higher 21 days later. MU's month after hawkish hikes was still mildly positive." },
+    { t: "Hike as priced", p: 40, look: "25bp hike. The dots roughly match futures (one more in December), and Warsh stays data-dependent. The 2-year moves less than 4bp either way.",
+      b: ["Hikes · neutral", "All · neutral", "SOXL down 10%+ into meeting"],
+      read: "History leans “sell the news on the day, steady within a week”: neutral hikes had a weak Fed day but a positive next five days, and still drifted lower over the month." },
+    { t: "One and done", p: 17, look: "25bp hike, but the statement or dots signal a pause, or several members dissent for no hike. The 2-year falls 4bp or more as December odds drop.",
+      b: ["Hikes · dovish", "All · dovish", "Slide · dovish"],
+      read: "Relief rally likely at 2pm. Dovish hikes rose on the day, but the month after was still down more often than not, and recent Fed-day moves have tended to reverse within a week." },
+    { t: "No hike", p: 8, look: "A hold against more than 90% pricing: a genuine surprise, and a sign Warsh lacks the votes. The 2-year drops sharply. Long yields could rise if the market doubts the Fed's inflation resolve.",
+      b: ["All · dovish", "Below 200 · dovish"],
+      read: "No clean precedent: the Fed hasn't skipped a move priced this firmly at any meeting in the sample. Dovish-read meetings lifted SOXL most on the day. But with SOXL below its 200-day average, the dovish reads (10 cases) had a weak month. A hold driven by division rather than data may not be bullish for long." },
+  ];
+  const statRow = (b) => {
+    if (!b) return "";
+    const rng = b.SOXL_post21_p10 != null ? `${pct(b.SOXL_post21_p10, 0)} to ${pct(b.SOXL_post21_p90, 0)}` : "n &lt; 5";
+    return `<tr><td>${esc(b.bucket)} <span class="muted">(${b.n})</span></td><td class="n ${cls(b.SOXL_fomc_day_med)}">${pct(b.SOXL_fomc_day_med)}</td><td class="n ${cls(b.SOXL_post5_med)}">${pct(b.SOXL_post5_med)}</td><td class="n ${cls(b.SOXL_post21_med)}">${pct(b.SOXL_post21_med)}</td><td class="n muted">${rng}</td><td class="n ${cls(b.MU_post21_med)}">${pct(b.MU_post21_med)}</td></tr>`;
+  };
+  $("#scen").innerHTML = SC.map((s) => `<article class="card">
+    <div class="card-head"><h3>${s.t}</h3><div class="prob">${s.p}%<small>my estimate</small></div></div>
+    <div class="bar-prob"><i style="width:${s.p}%"></i></div>
+    <div class="card-body"><p>${s.look}</p>
+    <div class="tbl-wrap"><table class="stats"><thead><tr><th>Closest history (n)</th><th class="n">SOXL day</th><th class="n">+5d</th><th class="n">+21d</th><th class="n">21d range, 10–90%</th><th class="n">MU +21d</th></tr></thead>
+    <tbody>${s.b.map((n) => statRow(B(n))).join("")}</tbody></table></div></div>
+    <p class="read">${s.read}</p></article>`).join("");
+}
+
+/* ---------- wiring ---------- */
+seg("p-asset", [["SOXL", "SOXL"], ["MU", "MU"], ["QQQ", "QQQ"]], () => S.p.asset, (v) => { S.p.asset = v; renderPath(); });
+seg("p-win", [["3y", "Since Sep 2023"], ["10y", "Since 2016"]], () => S.p.win, (v) => { S.p.win = v; renderPath(); });
+seg("p-stat", [["median", "Median"], ["mean", "Average"]], () => S.p.stat, (v) => { S.p.stat = v; renderPath(); });
+seg("sc-asset", [["SOXL", "SOXL"], ["MU", "MU"]], () => S.sc.asset, (v) => { S.sc.asset = v; renderScatter(); });
+seg("sc-win", [["3y", "Since Sep 2023"], ["10y", "Since 2016"]], () => S.sc.win, (v) => { S.sc.win = v; renderScatter(); });
+const cSel = $("#c-out");
+cSel.innerHTML = OUTS.map(([v, l]) => `<option value="${v}" ${v === S.cout ? "selected" : ""}>${l}</option>`).join("");
+cSel.addEventListener("change", () => { S.cout = cSel.value; renderCorr(); });
+
+const intra = DATA.intraday;
+const fi = intra.find((r) => r.sample === "fomc" && r.asset === "SOXL"), oi = intra.find((r) => r.sample === "other_days" && r.asset === "SOXL");
+if (fi && oi) {
+  $("#fig-intra").textContent = (fi.abs_reaction_med / oi.abs_reaction_med).toFixed(1) + "×";
+  $("#fig-intra-p").textContent = `SOXL's median move from 1:30pm to the close on Fed days (${pct(fi.abs_reaction_med, 1, false)}) versus other days (${pct(oi.abs_reaction_med, 1, false)}), over ${fi.n} meetings since Nov 2023. The average was ${pct(fi.reaction_mean, 2)}: bigger swings, no direction.`;
+}
+function renderCharts() { renderPath(); renderScatter(); renderCorr(); }
+renderCharts(); renderTape(); renderGroups(); renderHikes(); renderTomorrow();
+let rz; addEventListener("resize", () => { cancelAnimationFrame(rz); rz = requestAnimationFrame(renderCharts); });
+</script>

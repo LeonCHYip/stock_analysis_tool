@@ -17,6 +17,9 @@ uv run python main.py --tickers AAPL,MSFT,NVDA
 
 # Fetch daily earnings from Finviz (run manually or on a schedule)
 uv run python earnings_fetcher.py --daily --lookback 30
+
+# Daily market close newsletter (archives HTML; --email sends it)
+uv run python daily_email/daily_close.py --email
 ```
 
 Environment: Python 3.12+, managed by **uv**. Run `uv sync` if dependencies are missing.
@@ -37,6 +40,14 @@ app.py  (Streamlit UI)
    ├── ai_analyzer.py         ← Google Gemini AI deep-dive analysis
    ├── column_catalog.py      ← Authoritative UI column reference
    └── market_calendar.py     ← NYSE trading calendar utilities
+
+daily_email/    ← Daily market-close newsletter (standalone CLI, not a UI tab)
+   ├── daily_close.py     ← Entry point: builds, archives and emails the report
+   ├── news_fetcher.py    ← Google News RSS headlines (48h window)
+   ├── mailer.py          ← Gmail SMTP sender
+   ├── soxx_holdings.txt  ← Hand-maintained SOXX constituent list
+   ├── com.leon.dailyclose.plist ← launchd job (weekdays 16:45 ET)
+   └── reports/           ← Archived HTML + logs + universe cache (gitignored)
 
 main.py         ← Legacy CLI entry point (uses data_fetcher.py + db.py)
 data_fetcher.py ← Original yfinance technical+fundamental fetch (legacy)
@@ -65,6 +76,10 @@ config.py       ← Loads .env; exposes FMP_API_KEY (currently unused)
 | `column_catalog.py` | Authoritative column reference used to render the "Column Reference" tab in the UI. **Must be kept in sync** whenever columns are added/renamed in `app.py`. |
 | `market_calendar.py` | NYSE calendar via `pandas_market_calendars`. `et_today()` always returns Eastern-timezone date regardless of user's local clock. |
 | `vpn_switcher.py` | Mullvad CLI wrapper. Used in bulk scan batches to rotate IP between yfinance request groups to reduce rate-limiting. Optional — gracefully skips if `mullvad` not in PATH. |
+| `daily_email/daily_close.py` | Daily post-close email newsletter: index board (incl. gold/crypto), SOXL RSI + constituent movers, and top-10/bottom-10 $10B+ movers with sector, industry, AI reason and 48h news. Fetches **all prices live from yfinance** and opens DuckDB **read-only** for market cap/sector/industry only. Reads shared `config.py` / `market_calendar.py` from the repo root via a `sys.path` append. Scheduled by `daily_email/com.leon.dailyclose.plist`. |
+| `daily_email/news_fetcher.py` | Google News RSS search with the `when:<N>h` recency operator. Never raises — a failed fetch returns `[]`. |
+| `daily_email/mailer.py` | Gmail SMTP (`smtp.gmail.com:465`) multipart HTML+text sender. Needs a Google **App Password**, not the account password. `recipients()` reads `recipients.json`, falling back to `NEWSLETTER_TO`. |
+| `daily_email/newsletter_control.py` | Start/stop the launchd schedule, report its health, edit recipients, and launch detached manual runs. Drives the sidebar panel; no Streamlit import. |
 | `db.py` | Legacy SQLite schema and query helpers. **Not actively used** — kept as historical reference and because `main.py` still imports it. |
 | `data_fetcher.py` | Original combined tech+fundamental fetcher using `yfinance`. Still used by `main.py` CLI and as a fallback in `app.py` for single-ticker technical fetches. |
 
@@ -135,10 +150,17 @@ Scoring: `PASS=1, PARTIAL=0.5, FAIL/NA=0` → total score 0–10 used for scan r
 Create a `.env` file in the project root:
 
 ```
-GEMINI_API_KEY=your_key_here   # required for AI analysis tab
+GEMINI_API_KEY=your_key_here   # AI analysis tab; also the newsletter's "why it moved" lines
 # GOOGLE_API_KEY=...           # alternative to GEMINI_API_KEY
 # FMP_API_KEY=...              # Financial Modeling Prep — currently unused
+
+# Daily close newsletter (daily_close.py)
+GMAIL_USER=you@gmail.com
+GMAIL_APP_PASSWORD=xxxxxxxxxxxxxxxx   # 16-char Google App Password, requires 2FA
+NEWSLETTER_TO=you@gmail.com
 ```
+
+See `.env.example` for a copy-paste template.
 
 ---
 
@@ -185,6 +207,94 @@ The fundamental fetcher retries with delays `[5, 10, 20]` seconds on 401/rate-li
 BMO (before market open) earnings: 1D change = close(earnings_day) vs close(prior_day).
 AMC (after market close) earnings: 1D change = close(next_day) vs close(earnings_day).
 The fetcher re-processes dates where `one_day_change IS NULL` on subsequent runs to catch AMC next-day prices.
+
+### Daily Close Newsletter
+`daily_close.py` deliberately does **not** read prices from DuckDB: `price_history` contains no
+ETFs, the `asset_type='etf'` rows in `tech_indicators` lag the stock rows by days, and
+`GC=F`/`BTC-USD`/`ETH-USD` are absent entirely. All quotes come from yfinance at run time.
+
+**DuckDB locking:** `read_only=True` does *not* bypass DuckDB's file lock — a running Streamlit app
+holds a writable connection for its whole lifetime and every other connection is refused. The
+newsletter therefore caches the $10B+ universe (ticker → market cap/sector/industry) to
+`daily_email/reports/universe_cache.json` whenever the DB is readable, and falls back to that cache when it is
+locked. It never calls `storage._conn()`, which would stall 60 s behind a lock that is never
+released.
+
+`daily_email/soxx_holdings.txt` is **hand-maintained** — every free full-holdings source is blocked (iShares
+serves HTML, stockanalysis.com 403s, yfinance caps at 10 names). Refresh it after each quarterly
+rebalance; the script logs a `DRIFT` warning when SOXX's yfinance top-10 contains a name the file
+lacks.
+
+**The NYSE calendar and Yahoo's data disagree.** `last_completed_trading_day()` can report a
+session closed hours before Yahoo publishes its bars (2026-09-22: still a day stale at 21:00 ET).
+Sending on the calendar alone mails the PREVIOUS session under today's heading. Three guards:
+a staleness check (refuses to send when the newest bar predates the last completed session), a
+duplicate check (`reports/sent_sessions.txt` records every emailed session), and a no-clobber
+check (never overwrite an archived report with a smaller one). `--force` bypasses all three.
+The duplicate check runs *before* the ~5 s `probe_session()` board fetch, so the four attempts
+per day that have nothing to do cost no HTTP at all — which is why the launchd job fires
+**five times per weekday** (16:45, 17:30, 18:30, 20:00, plus 08:00 next morning as catch-up)
+rather than once. Exactly one newsletter goes out per session regardless.
+
+**Catch-up is by session, not by date (changed Sep 2026).** There used to be a fourth gate that
+refused to send unless the last completed session was *today* (ET). It silently destroyed any
+session the Mac slept through: the run that fires on wake sees yesterday's session and bailed,
+and the 08:00 "catch-up" slot could never work, because at 08:00 the last completed session is
+always the previous day. 2026-09-25 was lost exactly this way (hibernated Friday 04:47 at 1%
+battery, woke Saturday 11:25). The gate is gone — any completed session not in
+`sent_sessions.txt` is sent whenever a run next fires, and running before today's close is still
+a no-op because `last_completed_trading_day()` returns yesterday until 16:00 ET and yesterday is
+already in the sent log. **A missed session therefore needs no `--force`**; reserve that flag for
+deliberately re-sending one that *was* already emailed.
+
+**`reports/run_state.json`** records how the last run ended (`sent` / `skipped` / `error`, plus
+session, detail and exit code), written on every exit path and from the `__main__` guard when
+`main()` raises. It exists because the exit code cannot carry this — a gate skip and a successful
+send both return 0 — and because an unhandled exception never reaches `_flush_log()`, leaving the
+log showing the *previous* run. The Streamlit sidebar reads it to decide whether to report that
+the newsletter died. Log stamps are `MM-DD HH:MM:SS` in **CST** while the plist schedules in ET.
+
+**Recipients: `daily_email/recipients.json` wins over `NEWSLETTER_TO`.** `mailer.recipients()`
+reads the JSON file when it holds any addresses and falls back to `.env` otherwise, so a fresh
+clone behaves as it always did. The file is gitignored (personal addresses), written atomically
+(temp + replace, since a launchd run may read it mid-write) and edited from the sidebar. All
+recipients go on one `To` header — one message, one SMTP transaction; `sent_sessions.txt` stays
+per-session, not per-address.
+
+**Start/stop and manual sends live in the Streamlit sidebar** ("📧 Daily Newsletter"), backed by
+`daily_email/newsletter_control.py`. Stop does `launchctl bootout` **and** `disable` — `bootout`
+alone is undone at the next login, since `~/Library/LaunchAgents` is bootstrapped again. Note the
+installed plist is a *copy*; the panel shows 🟠 when it drifts from the repo's. A manual run is a
+detached `Popen` (`start_new_session=True`, wrapped in `caffeinate -i`) whose pid is recorded in
+`reports/manual_run.json`, so an in-flight run survives a Streamlit rerun, reconnect or restart.
+Because the app holds the only writable DuckDB connection, it refreshes `universe_cache.json`
+through its own connection before spawning the subprocess.
+
+**Daily % change comes from the quote endpoint, never the daily bars.**
+`v7/finance/quote`'s `regularMarketChangePercent` carries the exchange's own previous close.
+yfinance's historical array publishes a session's bar with a NULL close for hours and has been
+seen to regress a real close back to null; `dropna()` then compares today against the session
+*before* yesterday. Observed live on 2026-09-23: XLK reported +0.25% (measured vs 09-21) when the
+true move was -0.47%, and QQQ showed the previous day's price outright. The endpoint needs Yahoo's
+cookie/crumb handshake, so it is called through `yfinance.data.YfData` (a bare request returns
+401). It also batches ~100 symbols per call, making the large-cap sweep ~5 s instead of ~90 s.
+Order of preference: quote endpoint -> `price_history` -> daily bars.
+
+**The news phase runs as a subprocess.** Yahoo's feed needs yfinance's `curl_cffi` transport
+(plain urllib gets 429), and `libcurl-impersonate` has aborted the interpreter outright — SIGABRT
+inside `SSL_write`, exit 134 — when Yahoo throttles, which it does hardest right after the close.
+A native abort is uncatchable in Python, so `news_fetcher.py` is invoked via `subprocess` and a
+crash costs only the reasons, not the newsletter. Article bodies are fetched in ONE shared pool
+across all tickers with a wall-clock deadline; per-ticker pools ran serially at ~40 s each and
+overran the timeout.
+
+**Gemini 503s are common.** Retries are bounded by a total deadline (`REASON_DEADLINE_S`) with
+growing backoff across a model list, not a fixed per-model count — a 3-attempt budget burned out
+in 90 s during a real run. Non-transient errors (400s) drop that model immediately.
+
+Roughly 15–20 of the ~930 screened tickers return no Yahoo data on a given day (delistings, buyouts
+and renames the local `fundamentals` table has not caught up with). They are dropped and the count
+is printed in the newsletter footer.
 
 ### tickers.txt
 Large comma-separated file of ~2 500 US tickers used for bulk scan mode. `all_tickers.txt` is a similar list. Neither is actively managed — they are reference lists for the scan queue.

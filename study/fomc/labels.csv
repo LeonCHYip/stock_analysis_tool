@@ -1,0 +1,25 @@
+date,priced,decision_surprise,tone_hand,summary,same_day_events
+2023-09-20,Hold fully priced,False,hawkish,"Hold at 5.25-5.50%; dots keep one more 2023 hike and trim 2024 cuts to two ('higher for longer')",
+2023-11-01,Hold fully priced,False,dovish,"Hold; Powell says tighter financial conditions are doing some of the work",Treasury refunding (smaller coupon sizes) same morning
+2023-12-13,Hold fully priced,False,dovish,"Hold; dots pencil in three 2024 cuts, the 'pivot' meeting",PPI same morning
+2024-01-31,Hold fully priced,False,hawkish,"Hold; tightening bias dropped but Powell says a March cut is not the base case",MSFT/GOOGL/AMD earnings AMC 30 Jan; NYCB plunge
+2024-03-20,Hold fully priced,False,dovish,"Hold; dots still show three 2024 cuts despite hot Jan-Feb CPI",
+2024-05-01,Hold fully priced,False,dovish,"Hold; QT slowed from June; Powell says next move unlikely to be a hike (gains faded into close)",AMD/SMCI earnings AMC 30 Apr
+2024-06-12,Hold fully priced,False,hawkish,"Hold; dots cut to one 2024 cut, hours after a soft May CPI",May CPI same morning
+2024-07-31,Hold fully priced,False,dovish,"Hold; Powell says a September cut could be on the table",MSFT/AMD earnings AMC 30 Jul; NVDA +13% on the day
+2024-09-18,Split between 25 and 50 (~60% for 50),True,neutral,"First cut, 50bp; Powell: not the new pace; early pop faded",
+2024-11-07,Cut 25 fully priced,False,neutral,"25bp cut two days after the election",Post-election rally week
+2024-12-18,Cut 25 fully priced,False,hawkish,"25bp cut but dots halve 2025 cuts to two; SOXL -10.6%",MU earnings AMC same day (guide miss)
+2025-01-29,Hold fully priced,False,neutral,"Hold; 'progress on inflation' line dropped; Powell in no hurry",DeepSeek week; MSFT/META/TSLA earnings AMC same day
+2025-03-19,Hold fully priced,False,dovish,"Hold; dots keep two 2025 cuts; QT slowed sharply; tariff inflation seen as transitory base case",
+2025-05-07,Hold fully priced,False,hawkish,"Hold; risks to both unemployment and inflation up; Powell says the Fed can wait",
+2025-06-18,Hold fully priced,False,neutral,"Hold; median still two cuts but seven officials see none; tariff inflation expected over summer",Israel-Iran war; Juneteenth holiday next day
+2025-07-30,Hold fully priced,False,hawkish,"Hold; Waller and Bowman dissent for a cut; Powell noncommittal on September",MSFT/META earnings AMC same day
+2025-09-17,Cut 25 fully priced,False,neutral,"25bp 'risk-management' cut; Miran dissents for 50; dots add two more 2025 cuts",
+2025-10-29,Cut 25 fully priced,False,hawkish,"25bp cut; Powell: December cut far from a foregone conclusion; QT ends 1 Dec",MSFT/GOOGL/META earnings AMC same day
+2025-12-10,Cut 25 fully priced,False,dovish,"25bp cut with three dissents; dots show one 2026 cut; reserve-management bill purchases start",ORCL earnings AMC same day
+2026-01-28,Hold fully priced,False,neutral,"Hold at 3.50-3.75%; Miran and Waller dissent for a cut; Powell: hard to call policy significantly restrictive",MSFT/META/TSLA earnings AMC same day
+2026-03-18,Hold fully priced,False,hawkish,"Hold 11-1; median dot unchanged but drift to fewer cuts; 2026 inflation forecast raised to 2.7%; oil ~$100 after strike on Iranian energy sites",MU earnings AMC same day
+2026-04-29,Hold fully priced,False,hawkish,"Hold 8-4, most dissents since 1992: Hammack/Kashkari/Logan object to easing bias, Miran wants a cut; Powell's last meeting",Big-tech earnings AMC same day (likely)
+2026-06-17,Hold fully priced,False,hawkish,"Warsh's first meeting: unanimous hold, 130-word statement; dot plot flips to a hike; Warsh submits no dot",
+2026-07-29,Hold fully priced,False,hawkish,"Hold 9-3 with three dissents for a hike; statement cites Middle East conflict and solid growth",MSFT/META earnings AMC (likely); SOXL -16% chip rout same day

@@ -1,0 +1,55 @@
+date,category,catalyst,confidence
+2023-10-25,Earnings/guidance,"GOOGL cloud miss (AMC 10/24) and TXN weak guide; AI-capex ROI questioned",high
+2024-01-02,No clear catalyst,"New-year rotation out of 2023 tech winners; Barclays AAPL downgrade; yields up",medium
+2024-03-08,No clear catalyst,"NVDA reversal from record high (+5% to -5.5%) after Feb jobs; AVGO guide underwhelmed",high
+2024-04-19,Earnings/guidance,"ASML bookings miss + TSMC cut chip-industry outlook; SMCI no pre-announce; Israel strike on Iran",high
+2024-07-17,Tariffs/export/geopolitics,"Report of tougher US China-chip curbs (FDPR) + Trump says Taiwan should pay for defense; ASML beat but -13%",high
+2024-07-24,Earnings/guidance,"GOOGL capex step-up and TSLA miss (AMC 7/23); AI-capex ROI doubts",high
+2024-07-30,AI-capex doubt,"AI trade unwind ahead of MSFT/AMD prints; NVDA -7%",medium
+2024-08-01,Macro/rates,"ISM manufacturing 46.8 growth scare; ARM/QCOM/LRCX sold on beats; reversal of prior-day +18%",high
+2024-08-02,Macro/rates,"Weak July payrolls (Sahm rule); INTC -26% dividend suspension; yen carry unwind",high
+2024-08-22,Macro/rates,"Yields up ahead of Powell Jackson Hole; positioning before NVDA 8/28 print",low
+2024-09-03,Macro/rates,"Weak ISM manufacturing; report of DOJ subpoena to NVDA",high
+2024-09-06,Earnings/guidance,"AVGO AI guide underwhelmed (AMC 9/5); mixed August jobs",high
+2024-10-15,Earnings/guidance,"ASML leaked Q3 a day early: bookings ~half of consensus, 2025 guide cut",high
+2024-10-30,Earnings/guidance,"AMD data-center guide underwhelmed (AMC 10/29)",medium
+2024-10-31,Earnings/guidance,"MSFT Azure guide + META capex warning (AMC 10/30)",high
+2024-12-18,Macro/rates,"Hawkish FOMC: only two 2025 cuts projected (MU guide miss came after the close)",high
+2025-01-27,AI-capex doubt,"DeepSeek R1 low-cost model; NVDA -17%",high
+2025-02-27,Earnings/guidance,"NVDA post-earnings selloff on margin guide; Trump confirms Mexico/Canada/China tariffs",high
+2025-03-06,Tariffs/export/geopolitics,"Tariff whipsaw; MRVL -20% on guide (AMC 3/5)",high
+2025-03-10,Macro/rates,"Recession scare after Trump declines to rule out recession; Nasdaq -4%",high
+2025-04-03,Tariffs/export/geopolitics,"Liberation Day reciprocal tariffs",high
+2025-04-04,Tariffs/export/geopolitics,"China retaliates with 34% tariffs; Powell inflation warning",high
+2025-04-10,Tariffs/export/geopolitics,"Giveback after 90-day pause rally; China tariff clarified at 145%",high
+2025-04-16,Tariffs/export/geopolitics,"NVDA $5.5B H20 China export charge; ASML bookings miss",high
+2025-10-10,Tariffs/export/geopolitics,"Trump threatens 100% China tariffs after rare-earth export controls",high
+2025-11-04,AI-capex doubt,"AI-bubble fear: PLTR sold on beat; bank CEOs warn of pullback",high
+2025-11-13,Macro/rates,"December rate-cut odds fade after shutdown ends; AI valuation worries",medium
+2025-11-20,Earnings/guidance,"NVDA beat reversed from +5% to -3%; Sept jobs data cut Dec-cut odds",high
+2025-12-12,Earnings/guidance,"AVGO -11% on margin/AI backlog commentary; ORCL data-center delay report",high
+2025-12-17,AI-capex doubt,"Blue Owl exits ORCL Michigan data-center financing (MU beat came after the close)",high
+2026-01-30,Macro/rates,"Trump nominates Warsh as Fed chair (seen hawkish); KLAC -15% on guide",medium
+2026-02-04,Earnings/guidance,"AMD -17% on Q1 guide despite beat (AMC 2/3)",high
+2026-03-03,Tariffs/export/geopolitics,"US-Iran tensions lift oil and yields; profit-taking after SOX +65% YTD",medium
+2026-03-06,No clear catalyst,"Continuation of early-March semis correction (oil/inflation backdrop)",low
+2026-03-12,Macro/rates,"Brent +10% to >$101, 10y yield 4.27%",medium
+2026-03-26,Memory-specific,"MU post-earnings slide: FY27 capex / peak-margin worry + Google AI memory-efficiency news",medium
+2026-03-30,Memory-specific,"MU -10%, ~30% below post-earnings level; Google memory algorithm fears hit SNDK/WDC",high
+2026-04-28,No clear catalyst,"No single headline found; CLS -14% on beat",low
+2026-05-15,Tariffs/export/geopolitics,"Trump-Xi summit ends without chip deal / NVDA China sales; rising yields",high
+2026-06-05,Earnings/guidance,"AVGO AI guide disappoints (-13%) + hot May payrolls; SOX -10.3%, worst since Mar 2020",high
+2026-06-10,AI-capex doubt,"AI-valuation worries; AI IPO fundraising pulling capital from listed chips",medium
+2026-06-16,No clear catalyst,"Chips/AI names lose steam; continuation of June correction",low
+2026-06-23,Macro/rates,"BofA rate-hike call; KOSPI -10% (SK Hynix/Samsung -12%); debt-funded AI capex worry",high
+2026-06-26,Memory-specific,"MU -7% reversing its +16% post-earnings jump",medium
+2026-07-01,AI-capex doubt,"Meta Compute (selling surplus AI capacity) read as fewer chip purchases",high
+2026-07-02,AI-capex doubt,"Two-day chip skid continues ahead of June jobs; SOX -6.7%",high
+2026-07-07,Memory-specific,"SK Hynix delays HBM4 expansion; 'AI spend peaking' narrative",medium
+2026-07-13,No clear catalyst,"Profit-taking / leveraged-trade unwind",low
+2026-07-16,Earnings/guidance,"TSM print (miss) ; ARM -5%, SK Hynix ADR -13%; SOX -9% on week",medium
+2026-07-24,Earnings/guidance,"INTC -8% despite beat (capex/foundry cost); memory selloff SNDK -11%, MU -7%",high
+2026-07-28,Memory-specific,"SK Hynix/Samsung plunge spreads to MU",high
+2026-07-29,AI-capex doubt,">$1T wiped from chips; KLAC -11% on beat; AI returns questioned",high
+2026-08-18,Macro/rates,"Bond-yield spike; memory names -6%",high
+2026-09-14,AI-capex doubt,"Weekend calls from Anthropic/OpenAI/xAI leaders for slower AI development; higher yields",high

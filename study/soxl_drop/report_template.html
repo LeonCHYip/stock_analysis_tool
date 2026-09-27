@@ -1,0 +1,693 @@
+<title>The SOXL −10% Sell Rule</title>
+<meta name="description" content="Does selling everything when SOXL closes down 10% or more improve SOXL and MU returns? A 3-year event study and backtest, checked against 2010–2023.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+:root {
+  color-scheme: light;
+  --ground: #eff2f5;
+  --surface: #fbfcfd;
+  --ink: #0f1419;
+  --ink-2: #47505c;
+  --muted: #737c88;
+  --rule: #dce1e7;
+  --axis: #bec5ce;
+  --accent: #1c5cab;
+  --bh: #2a78d6;
+  --rc: #eb6834;
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --trig: #d03b3b;
+  --up: #006300;
+  --down: #b3261e;
+  --pos: #2a78d6;
+  --neg: #d03b3b;
+  --mid: #e9ecf0;
+  --chip: #e3e8ee;
+  --tip-bg: #10151b;
+  --tip-ink: #f2f5f8;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --ground: #0b0e12; --surface: #131820; --ink: #edf1f5; --ink-2: #abb3be; --muted: #838c97;
+    --rule: #242b34; --axis: #3a434e; --accent: #6da7ec; --bh: #3987e5; --rc: #d95926; --s3: #199e70;
+    --s4: #c98500; --trig: #e66767; --up: #3dbb3d; --down: #f07a73; --pos: #3987e5; --neg: #e66767;
+    --mid: #262d36; --chip: #1f2630; --tip-bg: #edf1f5; --tip-ink: #0f1419;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ground: #0b0e12; --surface: #131820; --ink: #edf1f5; --ink-2: #abb3be; --muted: #838c97;
+  --rule: #242b34; --axis: #3a434e; --accent: #6da7ec; --bh: #3987e5; --rc: #d95926; --s3: #199e70;
+  --s4: #c98500; --trig: #e66767; --up: #3dbb3d; --down: #f07a73; --pos: #3987e5; --neg: #e66767;
+  --mid: #262d36; --chip: #1f2630; --tip-bg: #edf1f5; --tip-ink: #0f1419;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--ground); color: var(--ink); font: 16px/1.6 var(--f-body); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-inline: 20px; padding-block: 44px 96px; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; letter-spacing: -0.005em; }
+h1 { font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.04; font-weight: 700; max-width: 18ch; }
+h2 { font-size: clamp(1.5rem, 3vw, 2rem); line-height: 1.15; font-weight: 600; }
+h3 { font-size: 1.12rem; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+.eyebrow, .label { font-family: var(--f-mono); font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.num, td.n, .mono { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+.up { color: var(--up); } .down { color: var(--down); }
+.muted { color: var(--muted); }
+
+/* masthead */
+.mast { display: grid; gap: 18px; padding-bottom: 28px; }
+.lede { font-size: 1.14rem; color: var(--ink-2); max-width: 64ch; }
+.lede strong { color: var(--ink); }
+.fired { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; font-family: var(--f-mono); font-size: 0.86rem; padding: 10px 14px; border: 1px solid var(--trig); border-radius: 4px; background: color-mix(in oklab, var(--trig) 7%, var(--surface)); width: fit-content; max-width: 100%; }
+.fired b { color: var(--trig); font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; font-size: 0.74rem; }
+
+.panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 18px 18px 14px; }
+.hero-cap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 20px; align-items: baseline; margin-bottom: 6px; }
+.hero-cap p { font-size: 0.92rem; color: var(--ink-2); }
+
+/* verdict figures */
+.figs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin-top: 34px; border-top: 2px solid var(--ink); }
+.fig { padding: 16px 20px 4px 0; display: grid; gap: 6px; align-content: start; }
+.fig + .fig { padding-left: 20px; border-left: 1px solid var(--rule); }
+.fig .big { font-family: var(--f-display); font-weight: 600; font-size: clamp(1.9rem, 4vw, 2.6rem); line-height: 1; font-variant-numeric: tabular-nums; }
+.fig .big small { font-size: 0.5em; color: var(--muted); font-weight: 500; }
+.fig p { font-size: 0.93rem; color: var(--ink-2); }
+@media (max-width: 760px) {
+  .figs { grid-template-columns: 1fr; }
+  .fig + .fig { padding-left: 0; border-left: 0; border-top: 1px solid var(--rule); }
+}
+
+section { margin-top: 72px; display: grid; gap: 16px; }
+.sec-head { display: grid; gap: 8px; }
+.sec-head p { color: var(--ink-2); }
+.controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--axis); border-radius: 4px; overflow: hidden; }
+.seg button { font: 500 0.82rem var(--f-body); color: var(--ink-2); background: var(--surface); border: 0; padding: 6px 11px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--axis); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+.seg button:hover:not([aria-pressed="true"]) { background: var(--mid); }
+.ctl { display: inline-flex; gap: 8px; align-items: center; }
+select { font: 500 0.82rem var(--f-body); color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 5px 8px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.84rem; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+.sw.line { height: 3px; border-radius: 2px; width: 16px; }
+
+.chart { width: 100%; position: relative; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart text { font-family: var(--f-mono); font-size: 11px; fill: var(--muted); }
+.grid line { stroke: var(--rule); stroke-width: 1; }
+.baseline { stroke: var(--axis); stroke-width: 1; }
+
+.multiples { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 860px) { .multiples { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.mult { display: grid; gap: 4px; }
+.mult h3 { font-size: 0.98rem; }
+.mult .foot { font-size: 0.8rem; color: var(--muted); line-height: 1.45; }
+
+.two { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+
+.tbl-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--f-mono); font-weight: 500; font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+td.n, th.n { text-align: right; white-space: nowrap; }
+tr.hold td { font-weight: 600; }
+tr.grp td { background: var(--mid); font-family: var(--f-mono); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); padding-block: 5px; }
+
+.heat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+@media (max-width: 900px) { .heat-grid { grid-template-columns: 1fr; } }
+.heat { border-collapse: separate; border-spacing: 2px; font-size: 0.78rem; }
+.heat th { text-align: center; padding: 3px 2px; font-size: 0.64rem; border: 0; }
+.heat th.row { text-align: right; padding-right: 8px; text-transform: none; vertical-align: middle; }
+.heat td { text-align: center; padding: 6px 2px; border: 0; border-radius: 2px; font-family: var(--f-mono); font-variant-numeric: tabular-nums; cursor: default; min-width: 40px; }
+.heat tr.is-rule th.row { color: var(--trig); }
+.heat tr.is-rule td { box-shadow: inset 0 0 0 1.5px var(--trig); }
+.scale { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; color: var(--muted); font-family: var(--f-mono); }
+.scale i { width: 160px; height: 10px; border-radius: 2px; background: linear-gradient(90deg, var(--neg), var(--mid), var(--pos)); }
+
+.chip { display: inline-block; font-family: var(--f-mono); font-size: 0.7rem; padding: 1px 7px; border-radius: 3px; background: var(--chip); color: var(--ink-2); white-space: nowrap; }
+.chip.flip { background: color-mix(in oklab, var(--trig) 16%, var(--surface)); color: var(--down); }
+.chip.hold { background: color-mix(in oklab, var(--bh) 16%, var(--surface)); color: var(--accent); }
+.earn { display: block; font-family: var(--f-mono); font-size: 0.72rem; color: var(--muted); margin-top: 2px; }
+.cat-note { font-size: 0.84rem; color: var(--ink-2); }
+td.why { min-width: 280px; max-width: 460px; }
+
+.note { font-size: 0.9rem; color: var(--ink-2); border-left: 3px solid var(--axis); padding: 2px 0 2px 14px; max-width: 72ch; }
+.profile { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0; border-top: 1px solid var(--rule); }
+.profile div { padding: 10px 14px 10px 0; border-bottom: 1px solid var(--rule); }
+.profile .v { font-family: var(--f-mono); font-size: 1.02rem; }
+ol.method, ul.src { margin: 0; padding-left: 20px; display: grid; gap: 8px; max-width: 76ch; color: var(--ink-2); font-size: 0.93rem; }
+ul.src { font-size: 0.86rem; }
+
+.tip { position: fixed; z-index: 10; pointer-events: none; background: var(--tip-bg); color: var(--tip-ink); font: 0.78rem/1.45 var(--f-mono); padding: 7px 9px; border-radius: 4px; max-width: 300px; box-shadow: 0 4px 16px rgb(0 0 0 / 0.18); }
+.tip b { font-weight: 500; }
+footer { margin-top: 80px; padding-top: 18px; border-top: 1px solid var(--rule); font-size: 0.82rem; color: var(--muted); }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow">Rule test · SOXL &amp; MU · daily closes 14 Sep 2023 – 14 Sep 2026 · checked against 2010–2023</div>
+    <h1>Does a −10% SOXL close mean sell everything?</h1>
+    <p class="lede"><strong>Not as a timing signal.</strong> Across 54 closes at −10% or worse in the past three years, SOXL and MU did <em>better</em> than usual afterwards, not worse. Selling on the trigger usually meant selling just before a bounce: with a 5-day wait before buying back, MU compounded at 80% a year instead of 137%. The rule's one real use was <strong>bear-market insurance</strong>. From 2010 to 2023, standing aside for a month after each trigger cut SOXL's worst drawdown from −90% to −58%. But the cost of that insurance in bull years was large.</p>
+    <div class="fired"><b>Your rule fired today</b><span>Mon 14 Sep 2026 close · SOXL −17.0% · MU −5.3% · QQQ −0.8% · VIX +8.0%</span></div>
+  </header>
+
+  <div class="panel">
+    <div class="hero-cap">
+      <span class="label">SOXL close, log scale · red ticks = closes at −10% or worse</span>
+      <p id="hero-count"></p>
+    </div>
+    <div class="chart" id="hero"></div>
+  </div>
+
+  <div class="figs">
+    <div class="fig">
+      <span class="label">Day after a trigger</span>
+      <div class="big">+1.8%</div>
+      <p>SOXL's average next-day return (all days: +0.5%). The next open gapped up +1.0% on average, so selling at the trigger close gave up the rebound. 2010–2023 was the same: +1.7%.</p>
+    </div>
+    <div class="fig">
+      <span class="label">MU, sell and wait 5 days</span>
+      <div class="big">80% <small>vs 137% / yr</small></div>
+      <p>CAGR over three years. $1 grew to $5.75 instead of $13.02. Max drawdown did improve, from −58% to −39%, and beat 87% of random-exit runs. But the return ranked mid-pack, so that safety came at full price.</p>
+    </div>
+    <div class="fig">
+      <span class="label">SOXL 2010–2023, out 21 days</span>
+      <div class="big">−58% <small>vs −90% max DD</small></div>
+      <p>The one place the rule shines: long bears (2011, 2022). Same return (32% vs 30% CAGR), much shallower hole. In the last three years the same setting earned 0.7% a year.</p>
+    </div>
+  </div>
+
+  <section id="fwd">
+    <div class="sec-head">
+      <span class="eyebrow">1 · Event study</span>
+      <h2>What SOXL and MU did after the drop</h2>
+      <p>Forward returns from the trigger close, compared with the same horizon measured from every day in the window. If −10% days signalled more downside, the orange bars would sit below the blue ones. They mostly don't.</p>
+    </div>
+    <div class="controls">
+      <div class="ctl"><span class="label">Asset</span><div class="seg" id="fwd-asset"></div></div>
+      <div class="ctl"><span class="label">Window</span><div class="seg" id="fwd-win"></div></div>
+      <div class="ctl"><label class="label" for="fwd-th">SOXL drop</label><select id="fwd-th"></select></div>
+      <div class="ctl"><span class="label">Days</span><div class="seg" id="fwd-sample"></div></div>
+      <div class="ctl"><span class="label">Stat</span><div class="seg" id="fwd-stat"></div></div>
+    </div>
+    <div class="legend"><span><i class="sw" style="background:var(--rc)"></i>After a SOXL drop of this size</span><span><i class="sw" style="background:var(--bh)"></i>All days in the window</span></div>
+    <div class="panel"><div class="multiples" id="fwd-mult"></div></div>
+    <div class="two">
+      <div class="note" id="fwd-note">“First in 2 weeks” counts only the first trigger of each burst. Drops cluster, so the full sample counts the same selloff several times. At −15% and deeper, samples are small (fewer than 20 events in three years), so read those bars loosely.</div>
+      <div></div>
+    </div>
+    <div class="sec-head" style="margin-top:14px">
+      <h3>What a −10% day does predict: more volatility, not direction</h3>
+    </div>
+    <div class="panel tbl-wrap"><table id="risk"></table></div>
+  </section>
+
+  <section id="bt">
+    <div class="sec-head">
+      <span class="eyebrow">2 · Backtest</span>
+      <h2>Following the rule vs just holding</h2>
+      <p>Sell everything at the trigger close, sit in cash earning 4% a year, then buy back using one of three rules. A new trigger while you're out restarts the clock. The chart covers the last three years.</p>
+    </div>
+    <div class="controls">
+      <div class="ctl"><span class="label">Holding</span><div class="seg" id="eq-asset"></div></div>
+    </div>
+    <div class="legend" id="eq-legend"></div>
+    <div class="panel">
+      <div class="hero-cap"><span class="label">Growth of $1, log scale · red ticks = trigger days</span></div>
+      <div class="chart" id="equity"></div>
+    </div>
+    <div class="controls" style="margin-top:8px">
+      <div class="ctl"><span class="label">Window</span><div class="seg" id="bt-win"></div></div>
+      <div class="ctl"><span class="label">Sell at</span><div class="seg" id="bt-exec"></div></div>
+    </div>
+    <div class="panel tbl-wrap"><table id="bt-table"></table></div>
+    <p class="note" id="placebo-note"></p>
+  </section>
+
+  <section id="sweep">
+    <div class="sec-head">
+      <span class="eyebrow">3 · Robustness</span>
+      <h2>Is there a better threshold?</h2>
+      <p>Every trigger level and re-entry rule, scored against buy &amp; hold. Blue cells beat holding; red cells lost to it. A real edge would show the same colour in the same place across assets and eras. Instead, shallow triggers that looked good for SOXL in 2023–26 lost for MU over the same years and for SOXL in 2010–23. That's the signature of curve-fitting. The −10% row (outlined) lost in every 3-year cell.</p>
+    </div>
+    <div class="controls">
+      <div class="ctl"><span class="label">Measure</span><div class="seg" id="hm-metric"></div></div>
+      <div class="ctl"><span class="label">Sell at</span><div class="seg" id="hm-exec"></div></div>
+      <div class="scale"><span id="hm-lo"></span><i></i><span id="hm-hi"></span></div>
+    </div>
+    <div class="heat-grid" id="heat"></div>
+    <p class="note">Re-entry columns: back in after 1–21 trading days, when SOXL closes above its 10-day average (10DMA), or when SOXL closes back above the price you sold at (Exit px). The z-score rows scale the trigger to recent volatility (the drop divided by the 60-day standard deviation), since −10% is routine when SOXL runs at 130% volatility and rare at 60%.</p>
+  </section>
+
+  <section id="years">
+    <div class="sec-head">
+      <span class="eyebrow">4 · Year by year</span>
+      <h2>When the insurance paid, and what it cost</h2>
+      <p>Calendar-year returns from 2010. The rule rescued 2020 (the COVID crash) and 2022. It gave back a lot in 2019, 2023, 2025 and 2026, when −10% days were buying opportunities in a bull market.</p>
+    </div>
+    <div class="controls"><div class="ctl"><span class="label">Holding</span><div class="seg" id="yr-asset"></div></div></div>
+    <div class="panel tbl-wrap"><table id="yr-table"></table></div>
+  </section>
+
+  <section id="context">
+    <div class="sec-head">
+      <span class="eyebrow">5 · Context</span>
+      <h2>Does the kind of drop matter?</h2>
+      <p>Each trigger split by its setting: trend, clustering, breadth, VIX, and whether a big chip or AI name had just reported. For a condition to be useful, the better-performing side has to be the same in both eras. Almost none pass.</p>
+    </div>
+    <div class="panel tbl-wrap"><table id="ctx-table"></table></div>
+    <p class="note">One pattern worth keeping an eye on (3-year data only, 19 events): when a company <em>beat</em> earnings and still fell more than 5%, SOXL's median 21-day return was −2.2% and only 47% of cases were higher a month later. When earnings drops didn't look like that, 6 of 7 recovered. The sample is too small to trade on alone.</p>
+  </section>
+
+  <section id="news">
+    <div class="sec-head">
+      <span class="eyebrow">6 · Catalysts</span>
+      <h2>54 drops and what caused them</h2>
+      <p>Each trigger day labelled from contemporaneous news coverage. Earnings reactions (the stock's first trading day after the report) come from the Finviz data in the app's database. Macro and rate scares hurt MU the most afterwards. Tariff and export-control scares were the most reliably bought.</p>
+    </div>
+    <div class="panel tbl-wrap"><table id="cat-sum"></table></div>
+    <div class="controls"><div class="ctl"><span class="label">Show</span><div class="seg" id="ev-cat"></div></div></div>
+    <div class="panel tbl-wrap"><table id="ev-table"></table></div>
+    <p class="note">MU's own prints are a case study in “beat and sold”. FQ2'26 (18 Mar 2026) blew past estimates, yet MU fell about 30% over the next eight sessions and triggered the 26 and 30 March drops. Those were followed by the biggest rebounds in the sample. FQ3'26 (24 Jun) jumped +16% and then reversed two days later, inside the June–July cluster that did keep falling.</p>
+  </section>
+
+  <section id="today">
+    <div class="sec-head">
+      <span class="eyebrow">7 · Today</span>
+      <h2>Where 14 September 2026 sits</h2>
+      <p>The trigger came on AI-pacing warnings from Anthropic, OpenAI and xAI leaders over the weekend, plus higher Treasury yields. It was a semis-only drop: QQQ fell less than 1%.</p>
+    </div>
+    <div class="profile" id="profile"></div>
+    <h3 style="margin-top:10px">Closest 3-year matches: SOXL below its 200-day average, and a semis-only drop (QQQ above −2%)</h3>
+    <div class="panel tbl-wrap"><table id="analogs"></table></div>
+    <p class="note" id="analog-note"></p>
+  </section>
+
+  <section id="method">
+    <div class="sec-head">
+      <span class="eyebrow">Method &amp; caveats</span>
+      <h2>How this was measured</h2>
+    </div>
+    <ol class="method">
+      <li><strong>Prices.</strong> Yahoo Finance daily bars, split- and dividend-adjusted, for SOXL, MU, SOXX, NVDA, QQQ and VIX, 2010 to 14 Sep 2026. A trigger is a close-to-close SOXL return of −10% or worse. Two exchange holidays that Yahoo printed only for VIX (25 May and 7 Sep 2026) were removed.</li>
+      <li><strong>Event study.</strong> Forward returns run from the trigger close to the close 1, 5, 21 and 63 trading days later. The benchmark uses every day in the same window. “Beats X% of random samples” compares the event average with 10,000 random draws of the same number of days.</li>
+      <li><strong>Backtest.</strong> “Sell at close” assumes a market-on-close order on the trigger day. “Next open” assumes you see the close and sell at the following open. Cash earns 4% a year. There are no commissions, taxes or slippage, all of which would hurt the rule further. The placebo runs the same re-entry rule from 500 sets of random exit days.</li>
+      <li><strong>Overlap.</strong> Triggers cluster: 52% are followed by another within five days. Forward windows overlap, so the effective sample is closer to the 21 separate episodes in three years than to 54.</li>
+      <li><strong>Regime.</strong> The three-year window was an extraordinary bull run for memory (MU rose about 13×). Any rule that steps aside looks bad in it. The 2010–2023 check covers the 2011, 2015, 2018 and 2022 downturns for balance.</li>
+      <li><strong>Catalysts</strong> were labelled by hand from news searches and are marked low / medium / high confidence. Several 2026 dates had no single clear headline.</li>
+    </ol>
+    <p class="note">This is a historical study of one rule, not investment advice. Code and CSVs live in <span class="mono">study/soxl_drop/</span>.</p>
+    <h3 style="margin-top:12px">News sources</h3>
+    <ul class="src">
+      <li><a href="https://www.fool.com/investing/2026/09/14/market-indexes-drop-as-chip-stocks-take-the-weeken/">Motley Fool: Market indexes drop as chip stocks take the weekend's news badly (14 Sep 2026)</a></li>
+      <li><a href="https://investinglive.com/stocks/ai-and-chip-stocks-tumble-as-weekend-warnings-challenge-the-sector-s-growth-assumptions/">investingLive: AI and chip stocks tumble as weekend warnings challenge growth assumptions</a></li>
+      <li><a href="https://www.cnbc.com/2026/08/17/stock-market-today-live-updates.html">CNBC: Stock market news for 18 Aug 2026</a></li>
+      <li><a href="https://www.cnbc.com/2026/07/29/chip-selloff-sk-hynix-samsung-softbank.html">CNBC: Chip stocks shed more than $1 trillion (29 Jul 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/07/28/sk-hynix-plunges-semiconductor-selloff-deepens-samsung-softbank.html">CNBC: AMD, Intel and Micron extend losses (28 Jul 2026)</a></li>
+      <li><a href="https://www.fool.com/investing/2026/07/24/why-did-intel-stock-drop-friday/">Motley Fool: Why did Intel stock drop Friday? (24 Jul 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/07/16/stock-market-today-live-updates.html">CNBC: Stock market news for 17 Jul 2026</a></li>
+      <li><a href="https://www.forbes.com/sites/petercohan/2026/07/08/intel-stock-down-21-inside-the-july-2026-semiconductor-selloff/">Forbes: Semiconductor selloff deepens as AI spending fears hit Intel (8 Jul 2026)</a></li>
+      <li><a href="https://www.bloomberg.com/news/articles/2026-07-02/chip-stocks-off-to-rough-start-in-third-quarter-with-2-day-skid">Bloomberg: Chip stocks off to rough start in third quarter (2 Jul 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/06/26/micron-stock-earnings-tech-selloff-ai.html">CNBC: Micron sinks 6%, wrapping a wild week (26 Jun 2026)</a></li>
+      <li><a href="https://www.thestreet.com/stock-market-today/stock-market-today-dow-jones-sp-500-nasdaq-updates-june-23-2026">TheStreet: Stock market today, 23 Jun 2026</a></li>
+      <li><a href="https://sherwood.news/markets/market-wrap-2026-06-16-sp500-qqq/">Sherwood: Semiconductors slump (16 Jun 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/06/10/softbank-samsung-skhynix-asia-tech-stocks-ai-ipo.html">CNBC: SoftBank sinks as global tech stocks tumble (10 Jun 2026)</a></li>
+      <li><a href="https://finance.yahoo.com/markets/stocks/articles/nasdaq-p-futures-decline-semiconductors-110740283.html">Yahoo Finance: Wall Street ends sharply lower as chips slide, jobs data fuels rate-hike fears (5 Jun 2026)</a></li>
+      <li><a href="https://finance.yahoo.com/markets/stocks/articles/chip-stocks-slide-u-china-110300500.html">Yahoo Finance: Chip stocks slide after U.S.–China summit ends without major tech deals (15 May 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/03/30/micron-stock-earnings-sell-off-memory-shortage.html">CNBC: Micron stock sinks 10%, further cratering in post-earnings sell-off (30 Mar 2026)</a></li>
+      <li><a href="https://finance.yahoo.com/markets/stocks/articles/micron-just-had-worst-week-185000992.html">Yahoo Finance: Micron just had its worst week of 2026</a></li>
+      <li><a href="https://www.abnamromeespierson.be/en/news/investor/market-comment/Chip-stocks-stumble-but-the-long-term-outlook-remains-strong.html">ABN AMRO: Chip stocks stumble (March 2026)</a></li>
+      <li><a href="https://www.cnbc.com/2026/02/04/amd-stock-earnings-forecast-chips.html">CNBC: AMD stock sinks 17% after earnings (4 Feb 2026)</a></li>
+      <li><a href="https://www.nasdaq.com/articles/stocks-fall-trump-nominates-warsh-fed-chair">Nasdaq: Stocks fall as Trump nominates Warsh for Fed chair (30 Jan 2026)</a></li>
+      <li>Events before 2026 were labelled from widely reported market coverage at the time (for example DeepSeek on 27 Jan 2025, Liberation Day on 3 Apr 2025, and ASML's early release on 15 Oct 2024).</li>
+    </ul>
+  </section>
+
+  <footer>Built from <span class="mono">study/soxl_drop/</span>: fetch.py → event_study.py → backtest.py → context.py → report.py. Data through the 14 Sep 2026 close.</footer>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+const DATA = /*__DATA__*/null;
+
+/* ---------- helpers ---------- */
+const $ = (s) => document.querySelector(s);
+const MINUS = "−";
+const sgn = (v) => (v > 0 ? "+" : v < 0 ? MINUS : "");
+const pct = (v, d = 1, sign = true) => (v == null || Number.isNaN(v)) ? "—" : (sign ? sgn(v) : (v < 0 ? MINUS : "")) + Math.abs(v).toFixed(d) + "%";
+const num = (v, d = 2) => (v == null || Number.isNaN(v)) ? "—" : (v < 0 ? MINUS : "") + Math.abs(v).toFixed(d);
+const cls = (v) => (v == null ? "" : v > 0 ? "up" : v < 0 ? "down" : "");
+const median = (a) => { const b = a.filter((x) => x != null).sort((x, y) => x - y); if (!b.length) return null; const m = b.length >> 1; return b.length % 2 ? b[m] : (b[m - 1] + b[m]) / 2; };
+const fmtDate = (s) => new Date(s + "T12:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const tip = $("#tip");
+function showTip(e, html) {
+  tip.innerHTML = html; tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 14;
+  tip.style.left = Math.max(8, x) + "px"; tip.style.top = Math.max(8, y) + "px";
+}
+const hideTip = () => { tip.hidden = true; };
+
+function seg(id, options, get, set) {
+  const el = document.getElementById(id);
+  el.innerHTML = options.map(([v, l]) => `<button type="button" data-v="${v}">${l}</button>`).join("");
+  const sync = () => el.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === String(get()))));
+  el.addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; set(b.dataset.v); sync(); });
+  sync();
+}
+
+/* ---------- line chart (hero + equity) ---------- */
+function lineChart(el, o) {
+  const W = Math.max(320, el.clientWidth || 800), H = o.height;
+  const narrow = W < 620;
+  const m = { t: 10, r: o.endLabels && !narrow ? 170 : 14, b: 44, l: 50 };
+  const n = o.dates.length;
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const X = (i) => m.l + (i / (n - 1)) * iw;
+  const all = o.series.flatMap((s) => s.values).filter((v) => v > 0);
+  const lo = Math.min(...all) * 0.92, hi = Math.max(...all) * 1.06;
+  const L = Math.log;
+  const Y = (v) => m.t + (1 - (L(v) - L(lo)) / (L(hi) - L(lo))) * ih;
+  let cands = [0.25, 0.5, 1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000].filter((v) => v >= lo && v <= hi);
+  if (cands.length > 6) cands = cands.filter((v) => [1, 2, 5].includes(+String(v)[0]) && !String(v).startsWith("3"));
+  let g = `<g class="grid">`;
+  cands.forEach((v) => { g += `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}"/>`; });
+  g += `</g>`;
+  let t = cands.map((v) => `<text x="${m.l - 8}" y="${Y(v) + 4}" text-anchor="end">${o.yFmt(v)}</text>`).join("");
+  // x ticks: January and July
+  let lastLabel = -1e9;
+  o.dates.forEach((d, i) => {
+    const prev = o.dates[i - 1];
+    if (!prev || d.slice(5, 7) === prev.slice(5, 7)) return;
+    const mo = d.slice(5, 7);
+    if (mo !== "01" && (narrow || mo !== "07")) return;
+    const x = X(i);
+    if (x - lastLabel < 56) return;
+    lastLabel = x;
+    t += `<line class="baseline" x1="${x}" x2="${x}" y1="${H - m.b}" y2="${H - m.b + 4}"/>`;
+    t += `<text x="${x}" y="${H - m.b + 16}" text-anchor="middle">${mo === "01" ? d.slice(0, 4) : "Jul"}</text>`;
+  });
+  const idx = new Map(o.dates.map((d, i) => [d, i]));
+  let marks = "";
+  (o.marks || []).forEach((d) => {
+    const i = idx.get(d); if (i == null) return;
+    marks += `<line x1="${X(i).toFixed(1)}" x2="${X(i).toFixed(1)}" y1="${H - 18}" y2="${H - 4}" style="stroke:var(--trig);stroke-width:1.5"/>`;
+  });
+  let paths = o.series.map((s) => `<path d="${s.values.map((v, i) => (i ? "L" : "M") + X(i).toFixed(1) + "," + Y(v).toFixed(1)).join("")}" style="fill:none;stroke:var(${s.color});stroke-width:${s.width || 2};stroke-linejoin:round"/>`).join("");
+  let ends = "";
+  if (o.endLabels && !narrow) {
+    const items = o.series.map((s) => ({ s, y: Y(s.values[n - 1]) })).sort((a, b) => a.y - b.y);
+    for (let k = 1; k < items.length; k++) if (items[k].y - items[k - 1].y < 26) items[k].y = items[k - 1].y + 26;
+    items.forEach(({ s, y }) => {
+      ends += `<circle cx="${X(n - 1)}" cy="${Y(s.values[n - 1])}" r="3.5" style="fill:var(${s.color});stroke:var(--surface);stroke-width:2"/>`;
+      ends += `<text x="${X(n - 1) + 10}" y="${y - 1}" style="fill:var(--ink);font-size:12px">${o.yFmt(s.values[n - 1], true)}</text>`;
+      ends += `<text x="${X(n - 1) + 10}" y="${y + 12}" style="font-size:10.5px">${esc(s.short)}</text>`;
+    });
+  }
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(o.aria)}">
+    ${g}<line class="baseline" x1="${m.l}" x2="${W - m.r}" y1="${H - m.b}" y2="${H - m.b}"/>${t}${marks}${paths}${ends}
+    <g class="hover" style="display:none"><line y1="${m.t}" y2="${H - m.b}" style="stroke:var(--axis);stroke-width:1"/>${o.series.map((s) => `<circle r="4" style="fill:var(${s.color});stroke:var(--surface);stroke-width:2"/>`).join("")}</g>
+    <rect x="${m.l}" y="${m.t}" width="${iw}" height="${H - m.t}" style="fill:transparent"/></svg>`;
+  const svg = el.querySelector("svg"), hov = svg.querySelector(".hover"), rect = svg.querySelector("rect");
+  const trig = new Set(o.marks || []);
+  rect.addEventListener("pointermove", (e) => {
+    const bb = svg.getBoundingClientRect();
+    const px = (e.clientX - bb.left) * (W / bb.width);
+    const i = Math.max(0, Math.min(n - 1, Math.round(((px - m.l) / iw) * (n - 1))));
+    hov.style.display = "";
+    hov.querySelector("line").setAttribute("x1", X(i)); hov.querySelector("line").setAttribute("x2", X(i));
+    hov.querySelectorAll("circle").forEach((c, k) => { c.setAttribute("cx", X(i)); c.setAttribute("cy", Y(o.series[k].values[i])); });
+    showTip(e, `<b>${fmtDate(o.dates[i])}</b>${trig.has(o.dates[i]) ? ` <span style="color:var(--trig)">· trigger</span>` : ""}<br>` + o.tipRows(i));
+  });
+  rect.addEventListener("pointerleave", () => { hov.style.display = "none"; hideTip(); });
+}
+
+/* ---------- hero ---------- */
+const TRIG3 = DATA.events.map((e) => e.date);
+function renderHero() {
+  const p = DATA.price;
+  const r1 = (i) => i > 0 ? (p.SOXL[i] / p.SOXL[i - 1] - 1) * 100 : null;
+  lineChart($("#hero"), {
+    dates: p.dates, height: 250, marks: TRIG3, aria: "SOXL price with trigger days marked",
+    series: [{ color: "--ink-2", width: 1.6, values: p.SOXL }],
+    yFmt: (v) => "$" + (v >= 10 ? v.toFixed(0) : v.toFixed(1)),
+    tipRows: (i) => `SOXL $${p.SOXL[i].toFixed(2)} · day ${pct(r1(i))}`,
+  });
+  $("#hero-count").textContent = `${TRIG3.length} triggers in ${p.dates.length - 1} trading days`;
+}
+
+/* ---------- 1 · event study ---------- */
+const S = { fwd: { asset: "SOXL", win: "3y", th: -10, sample: "all", stat: "mean" }, eq: "SOXL", bt: { win: "3y", exec: "close" }, hm: { metric: "cagr", exec: "close" }, yr: "SOXL", cat: "All" };
+const HNAME = { 1: "Next day", 5: "Next week", 21: "Next month", 63: "Next quarter" };
+const HSUB = { 1: "1 trading day", 5: "5 trading days", 21: "21 trading days", 63: "63 trading days" };
+
+function barPath(x, y0, y1, w, r) {
+  const up = y1 < y0, h = Math.abs(y1 - y0); r = Math.min(r, h, w / 2);
+  if (h < 0.5) return `M${x},${y0}h${w}`;
+  return up
+    ? `M${x},${y0}V${y1 + r}Q${x},${y1} ${x + r},${y1}H${x + w - r}Q${x + w},${y1} ${x + w},${y1 + r}V${y0}Z`
+    : `M${x},${y0}V${y1 - r}Q${x},${y1} ${x + r},${y1}H${x + w - r}Q${x + w},${y1} ${x + w},${y1 - r}V${y0}Z`;
+}
+
+function renderFwd() {
+  const f = S.fwd;
+  const rows = DATA.fwd.filter((r) => r.asset === f.asset && r.window === f.win && r.threshold === f.th && r.sample === f.sample);
+  $("#fwd-mult").innerHTML = [1, 5, 21, 63].map((h) => {
+    const r = rows.find((x) => x.h === h);
+    if (!r || !r.n) return `<div class="mult"><h3>${HNAME[h]}</h3><p class="foot">No events.</p></div>`;
+    const a = f.stat === "mean" ? r.mean : r.median, b = f.stat === "mean" ? r.base_mean : r.base_median;
+    const W = 220, H = 190, top = 24, bot = 30;
+    let lo = Math.min(0, a, b), hi = Math.max(0, a, b);
+    const span = (hi - lo) || 1; lo -= lo < 0 ? span * 0.18 : 0; hi += hi > 0 ? span * 0.18 : 0;
+    const Y = (v) => top + (1 - (v - lo) / (hi - lo)) * (H - top - bot);
+    const y0 = Y(0);
+    const bar = (x, v, color, lab) => {
+      const y = Y(v), ty = v >= 0 ? y - 6 : y + 14;
+      return `<path d="${barPath(x, y0, y, 44, 4)}" style="fill:var(${color})"/><text x="${x + 22}" y="${ty}" text-anchor="middle" style="fill:var(--ink);font-size:12.5px">${pct(v)}</text>
+        <text x="${x + 22}" y="${H - 10}" text-anchor="middle">${lab}</text>`;
+    };
+    const svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${HNAME[h]}: after trigger ${pct(a)}, all days ${pct(b)}">
+      <line class="baseline" x1="20" x2="${W - 20}" y1="${y0}" y2="${y0}"/>${bar(52, a, "--rc", "after drop")}${bar(124, b, "--bh", "all days")}</svg>`;
+    const beat = f.stat === "mean" && r.boot_pct != null ? ` Average beats ${Math.round(r.boot_pct * 100)}% of random same-size samples.` : "";
+    return `<div class="mult"><h3>${HNAME[h]} <span class="muted" style="font-weight:500;font-size:0.8rem">· ${HSUB[h]}</span></h3><div class="chart">${svg}</div>
+      <p class="foot">n = ${r.n} · higher ${Math.round(r.hit)}% of the time (all days ${Math.round(r.base_hit)}%).${beat}</p></div>`;
+  }).join("");
+}
+
+function renderRisk() {
+  const w = S.fwd.win;
+  const a = DATA.risk.find((r) => r.window === w && r.sample === "all days");
+  const t = DATA.risk.find((r) => r.window === w && r.sample !== "all days");
+  const rows = [
+    ["Another −10% close within 5 days", "p_another_trig_5d", (v) => pct(v, 0, false)],
+    ["SOXL down 20%+ a month later", "p_soxl_f21_le_m20", (v) => pct(v, 0, false)],
+    ["SOXL up 20%+ a month later", "p_soxl_f21_ge_p20", (v) => pct(v, 0, false)],
+    ["SOXL volatility over the next month (annualised)", "soxl_fwd_vol21", (v) => pct(v, 0, false)],
+    ["SOXL average worst close in the next month", "soxl_mae21_mean", (v) => pct(v)],
+    ["MU average worst close in the next month", "mu_mae21_mean", (v) => pct(v)],
+    ["SOXL next-morning gap (average)", "soxl_next_gap_mean", (v) => pct(v, 2)],
+    ["SOXL next day, open to close", "soxl_next_intraday_mean", (v) => pct(v, 2)],
+    ["MU next-morning gap (average)", "mu_next_gap_mean", (v) => pct(v, 2)],
+  ];
+  $("#risk").innerHTML = `<thead><tr><th>${w === "3y" ? "Sep 2023 – Sep 2026" : "2010 – Sep 2023"}</th><th class="n">After a −10% close (n ${t.n})</th><th class="n">Any day</th></tr></thead><tbody>` +
+    rows.map(([l, k, fm]) => `<tr><td>${l}</td><td class="n">${fm(t[k])}</td><td class="n muted">${fm(a[k])}</td></tr>`).join("") + `</tbody>`;
+}
+
+/* ---------- 2 · backtest ---------- */
+const EQ = [
+  ["Buy & hold", "--bh", "Hold", "Hold throughout"],
+  ["Sell at -10%, re-enter 5d", "--rc", "Back in after 5d", "Sell at −10%, back in after 5 days"],
+  ["Sell at -10%, re-enter sma10", "--s3", "Back in on 10DMA", "Sell at −10%, back in when SOXL > 10-day avg"],
+  ["Sell at -10%, re-enter above_exit", "--s4", "Back in above exit", "Sell at −10%, back in when SOXL tops sell price"],
+];
+function renderEquity() {
+  const a = S.eq, e = DATA.equity;
+  const series = EQ.map(([k, c, short, long]) => ({ color: c, short, long, values: e.series[`${a}|${k}`] }));
+  $("#eq-legend").innerHTML = series.map((s) => `<span><i class="sw line" style="background:var(${s.color})"></i>${s.long}</span>`).join("");
+  lineChart($("#equity"), {
+    dates: e.dates, height: 380, marks: TRIG3, endLabels: true, series, aria: `Growth of $1 in ${a}: hold vs rule variants`,
+    yFmt: (v, end) => "$" + (end ? v.toFixed(2) : v >= 1 ? v.toFixed(0) : v.toFixed(2)),
+    tipRows: (i) => series.map((s) => `<span style="color:var(${s.color})">■</span> ${s.short}: $${s.values[i].toFixed(2)}`).join("<br>"),
+  });
+}
+
+const RE = [["1d", "Back in next day"], ["3d", "Back in after 3 days"], ["5d", "Back in after 5 days"], ["10d", "Back in after 10 days"], ["21d", "Back in after 21 days"], ["sma10", "Back in when SOXL > 10-day avg"], ["above_exit", "Back in when SOXL tops sell price"]];
+function renderBt() {
+  const { win, exec } = S.bt;
+  const blocks = ["SOXL", "MU"].map((a) => {
+    const bh = DATA.backtest.find((r) => r.window === win && r.asset === a && r.trigger === "buy&hold");
+    const rows = RE.map(([k, l]) => [l, DATA.backtest.find((r) => r.window === win && r.asset === a && r.trigger === "ret<=-10%" && r.reentry === k && r.exec === exec)]);
+    const tr = (l, r, hold) => `<tr class="${hold ? "hold" : ""}"><td>${l}</td>
+      <td class="n ${hold ? "" : cls(r.cagr - bh.cagr)}">${pct(r.cagr, 1, false)}</td>
+      <td class="n">${pct(r.maxdd, 0)}</td><td class="n">${num(r.sharpe)}</td>
+      <td class="n">${pct(r.time_in, 0, false)}</td><td class="n">${hold ? "—" : r.exits}</td>
+      <td class="n">$${(1 + r.total / 100).toFixed(2)}</td></tr>`;
+    return `<tr class="grp"><td colspan="7">${a}</td></tr>` + tr("Hold throughout", bh, true) + rows.map(([l, r]) => tr(l, r, false)).join("");
+  }).join("");
+  $("#bt-table").innerHTML = `<thead><tr><th>Sell at −10%, then…</th><th class="n">CAGR</th><th class="n">Max drawdown</th><th class="n">Sharpe</th><th class="n">Invested</th><th class="n">Exits</th><th class="n">$1 becomes</th></tr></thead><tbody>${blocks}</tbody>`;
+  const pl = DATA.placebo.filter((r) => r.window === win);
+  const line = (a) => pl.filter((r) => r.asset === a).map((r) => `${r.reentry.replace("d", "-day")} wait: return beats ${Math.round(r.rule_cagr_pctile)}% of random runs, drawdown beats ${Math.round(r.rule_maxdd_pctile)}%`).join("; ");
+  $("#placebo-note").innerHTML = `<strong>Placebo check (${win === "3y" ? "2023–26" : "2010–23"}, sell at close).</strong> Each rule was re-run from 500 sets of random exit days, same count. If −10% days were informative, the rule would rank high. SOXL: ${line("SOXL")}. MU: ${line("MU")}. Around 50% means no better than chance. Selling and buying back the next day ranks near the bottom because it sells right before the typical bounce.`;
+}
+
+/* ---------- 3 · heatmaps ---------- */
+const TRIGS = ["ret<=-5%", "ret<=-6%", "ret<=-7%", "ret<=-8%", "ret<=-9%", "ret<=-10%", "ret<=-12%", "ret<=-15%", "ret<=-20%", "z<=-2.0", "z<=-2.5", "z<=-3.0"];
+const TLAB = (t) => t.startsWith("ret") ? MINUS + t.slice(6) : "z ≤ " + MINUS + t.slice(4) + "σ";
+const RCOL = [["1d", "1d"], ["3d", "3d"], ["5d", "5d"], ["10d", "10d"], ["21d", "21d"], ["sma10", "10DMA"], ["above_exit", "Exit px"]];
+const METRIC = { cagr: { lab: "CAGR vs hold", clamp: 50, d: 0, unit: "pp" }, sharpe: { lab: "Sharpe vs hold", clamp: 0.5, d: 2, unit: "" }, maxdd: { lab: "Max drawdown vs hold", clamp: 30, d: 0, unit: "pp" } };
+function renderHeat() {
+  const { metric, exec } = S.hm, M = METRIC[metric];
+  $("#hm-lo").textContent = `worse ${MINUS}${M.clamp}${M.unit}`;
+  $("#hm-hi").textContent = `+${M.clamp}${M.unit} better`;
+  const panels = [["SOXL", "3y", "SOXL · Sep 2023 – Sep 2026"], ["MU", "3y", "MU · Sep 2023 – Sep 2026"], ["SOXL", "2010-2023", "SOXL · 2010 – 2023"], ["MU", "2010-2023", "MU · 2010 – 2023"]];
+  $("#heat").innerHTML = panels.map(([a, w, title]) => {
+    const bh = DATA.backtest.find((r) => r.window === w && r.asset === a && r.trigger === "buy&hold");
+    const body = TRIGS.map((t) => `<tr class="${t === "ret<=-10%" ? "is-rule" : ""}"><th class="row">${TLAB(t)}</th>` + RCOL.map(([k]) => {
+      const r = DATA.backtest.find((x) => x.window === w && x.asset === a && x.trigger === t && x.reentry === k && x.exec === exec);
+      const v = r[metric] - bh[metric];
+      const p = Math.min(1, Math.abs(v) / M.clamp);
+      const bg = `color-mix(in oklab, var(${v >= 0 ? "--pos" : "--neg"}) ${Math.round(p * 88)}%, var(--mid))`;
+      const ink = p > 0.55 ? "#fff" : "var(--ink)";
+      const txt = (v > 0 ? "+" : v < 0 ? MINUS : "") + Math.abs(v).toFixed(M.d);
+      return `<td style="background:${bg};color:${ink}" data-a="${a}" data-w="${w}" data-t="${t}" data-k="${k}">${txt}</td>`;
+    }).join("") + `</tr>`).join("");
+    return `<div class="panel"><h3 style="margin-bottom:8px">${title}</h3><div class="tbl-wrap"><table class="heat"><thead><tr><th class="row label">Trigger</th>${RCOL.map(([, l]) => `<th>${l}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table></div>
+      <p class="foot muted" style="font-size:0.8rem;margin-top:6px">Hold: CAGR ${pct(bh.cagr, 1, false)} · Sharpe ${num(bh.sharpe)} · max DD ${pct(bh.maxdd, 0)}</p></div>`;
+  }).join("");
+}
+$("#heat").addEventListener("pointermove", (e) => {
+  const td = e.target.closest("td[data-t]"); if (!td) return hideTip();
+  const { a, w, t, k } = td.dataset, exec = S.hm.exec;
+  const r = DATA.backtest.find((x) => x.window === w && x.asset === a && x.trigger === t && x.reentry === k && x.exec === exec);
+  const bh = DATA.backtest.find((x) => x.window === w && x.asset === a && x.trigger === "buy&hold");
+  const re = RCOL.find(([kk]) => kk === k)[1];
+  showTip(e, `<b>${a} · ${w === "3y" ? "2023–26" : "2010–23"}</b><br>Trigger ${TLAB(t)} · re-entry ${re}<br>CAGR ${pct(r.cagr, 1, false)} (hold ${pct(bh.cagr, 1, false)})<br>Max DD ${pct(r.maxdd, 0)} (hold ${pct(bh.maxdd, 0)})<br>Sharpe ${num(r.sharpe)} (hold ${num(bh.sharpe)})<br>${r.exits} exits · invested ${pct(r.time_in, 0, false)}`);
+});
+$("#heat").addEventListener("pointerleave", hideTip);
+
+/* ---------- 4 · years ---------- */
+function renderYears() {
+  const a = S.yr;
+  const ys = [...new Set(DATA.years.map((r) => r.year))];
+  const get = (y, v) => DATA.years.find((r) => r.asset === a && r.year === y && r.variant === v);
+  const body = ys.map((y) => {
+    const h = get(y, "buy&hold"), r5 = get(y, "-10% out 5d"), r21 = get(y, "-10% out 21d");
+    const d = (r) => { const v = r.ret - h.ret; return `<td class="n">${pct(r.ret, 0)}</td><td class="n ${Math.abs(v) < 1 ? "muted" : cls(v)}">${Math.abs(v) < 1 ? "·" : (v > 0 ? "+" : MINUS) + Math.abs(v).toFixed(0)}</td>`; };
+    return `<tr><td class="mono">${y}${y === 2026 ? " <span class='muted'>YTD</span>" : ""}${y === 2010 ? " <span class='muted'>from Mar</span>" : ""}</td><td class="n">${h.triggers}</td><td class="n" style="font-weight:600">${pct(h.ret, 0)}</td>${d(r5)}${d(r21)}</tr>`;
+  }).join("");
+  $("#yr-table").innerHTML = `<thead><tr><th>Year</th><th class="n">Triggers</th><th class="n">Hold</th><th class="n">Out 5 days</th><th class="n">vs hold, pp</th><th class="n">Out 21 days</th><th class="n">vs hold, pp</th></tr></thead><tbody>${body}</tbody>`;
+}
+
+/* ---------- 5 · context ---------- */
+const CTX = [
+  ["above200", { True: "SOXL above its 200-day average", False: "SOXL below its 200-day average" }],
+  ["first_in_cluster", { True: "First −10% day in two weeks", False: "Follow-on (another within 10 days)" }],
+  ["broad_qqq_le_-2", { True: "Broad selloff (QQQ −2% or worse)", False: "Semis-only (QQQ better than −2%)" }],
+  ["vix_jump20", { True: "VIX jumped 20%+", False: "VIX up less than 20%" }],
+  ["mu_worse_than_soxx", { True: "MU fell more than SOXX", False: "MU held up better than SOXX" }],
+  ["prior20_up", { True: "SOXL up over the prior month", False: "SOXL down over the prior month" }],
+  ["dd_bucket", { "DD <20%": "SOXL within 20% of 1-year high", "DD 20-40%": "SOXL 20–40% below high", "DD >40%": "SOXL more than 40% below high" }],
+  ["earn_linked", { True: "A big chip/AI name had just reported", False: "No major earnings reaction that day" }],
+  ["earn_beat_selloff", { True: "A company beat and still fell >5%", False: "Earnings day, no beat-and-sold" }],
+];
+function renderCtx() {
+  const B = DATA.buckets;
+  const body = CTX.map(([f, labels]) => {
+    const lv = Object.keys(labels);
+    const r3 = lv.map((l) => B.find((b) => b.window === "3y" && b.factor === f && b.level === l));
+    const rp = lv.map((l) => B.find((b) => b.window === "2010-2023" && b.factor === f && b.level === l));
+    const best = (rs) => { const ok = rs.filter(Boolean); if (ok.length < 2) return null; return ok.reduce((x, y) => (y.SOXL_f21_med > x.SOXL_f21_med ? y : x)).level; };
+    const b3 = best(r3), bp = best(rp);
+    const verdict = bp == null ? `<span class="chip">3y only</span>` : b3 === bp ? `<span class="chip hold">Holds</span>` : `<span class="chip flip">Flips</span>`;
+    return lv.map((l, i) => {
+      const a = r3[i], p = rp[i];
+      const c = (r, k, fm) => r ? `<td class="n ${k.includes("med") ? cls(r[k]) : ""}">${fm(r[k])}</td>` : `<td class="n muted">—</td>`;
+      return `<tr><td>${labels[l]}</td>${c(a, "n", (v) => v)}${c(a, "SOXL_f21_med", (v) => pct(v))}${c(a, "SOXL_hit21", (v) => pct(v, 0, false))}${c(a, "MU_f21_med", (v) => pct(v))}
+        ${c(p, "n", (v) => v)}${c(p, "SOXL_f21_med", (v) => pct(v))}${c(p, "MU_f21_med", (v) => pct(v))}${i === 0 ? `<td rowspan="${lv.length}" style="vertical-align:middle">${verdict}</td>` : ""}</tr>`;
+    }).join("");
+  }).join("");
+  $("#ctx-table").innerHTML = `<thead><tr><th rowspan="2" style="vertical-align:bottom">Condition on the trigger day</th><th colspan="4" style="text-align:center">Sep 2023 – Sep 2026</th><th colspan="3" style="text-align:center">2010 – 2023</th><th rowspan="2" style="vertical-align:bottom">Same winner?</th></tr>
+    <tr><th class="n">n</th><th class="n">SOXL 21d med</th><th class="n">SOXL up</th><th class="n">MU 21d med</th><th class="n">n</th><th class="n">SOXL 21d med</th><th class="n">MU 21d med</th></tr></thead><tbody>${body}</tbody>`;
+}
+
+/* ---------- 6 · catalysts ---------- */
+const CATS = ["Macro/rates", "Tariffs/export/geopolitics", "Earnings/guidance", "AI-capex doubt", "Memory-specific", "No clear catalyst"];
+const CATLAB = { "Macro/rates": "Macro / rates", "Tariffs/export/geopolitics": "Tariffs / export curbs", "Earnings/guidance": "Earnings / guidance", "AI-capex doubt": "AI-capex doubt", "Memory-specific": "Memory-specific", "No clear catalyst": "No clear catalyst" };
+function renderCatSum() {
+  const E = DATA.events;
+  const body = CATS.map((c) => {
+    const g = E.filter((e) => e.category === c);
+    const f21 = g.map((e) => e.SOXL_f21).filter((v) => v != null);
+    const up = f21.length ? f21.filter((v) => v > 0).length / f21.length * 100 : null;
+    const mae = g.map((e) => e.SOXL_mae21).filter((v) => v != null);
+    const mu = median(g.map((e) => e.MU_f21)), so = median(f21), s5 = median(g.map((e) => e.SOXL_f5));
+    return `<tr><td><span class="chip">${CATLAB[c]}</span></td><td class="n">${g.length}</td><td class="n ${cls(s5)}">${pct(s5)}</td><td class="n ${cls(so)}">${pct(so)}</td><td class="n">${pct(up, 0, false)}</td><td class="n ${cls(mu)}">${pct(mu)}</td><td class="n">${pct(mae.reduce((x, y) => x + y, 0) / (mae.length || 1))}</td></tr>`;
+  }).join("");
+  $("#cat-sum").innerHTML = `<thead><tr><th>Catalyst</th><th class="n">Drops</th><th class="n">SOXL 5d med</th><th class="n">SOXL 21d med</th><th class="n">SOXL up at 21d</th><th class="n">MU 21d med</th><th class="n">SOXL avg worst 21d</th></tr></thead><tbody>${body}</tbody>`;
+}
+function renderEvents() {
+  const E = DATA.events.filter((e) => S.cat === "All" || e.category === S.cat).slice().reverse();
+  const body = E.map((e) => `<tr>
+    <td class="mono" style="white-space:nowrap">${e.date}</td>
+    <td class="n down">${pct(e.SOXL_1d)}</td><td class="n ${cls(e.MU_1d)}">${pct(e.MU_1d)}</td><td class="n ${cls(e.QQQ_1d)}">${pct(e.QQQ_1d)}</td>
+    <td class="why"><span class="chip">${CATLAB[e.category]}</span> <span class="muted" style="font-size:0.72rem">${e.confidence} confidence</span><br>${esc(e.catalyst)}${e.earn_names ? `<span class="earn">Reported: ${esc(e.earn_names)}</span>` : ""}</td>
+    <td class="n ${cls(e.SOXL_f5)}">${pct(e.SOXL_f5)}</td><td class="n ${cls(e.SOXL_f21)}">${pct(e.SOXL_f21)}</td><td class="n ${cls(e.MU_f21)}">${pct(e.MU_f21)}</td><td class="n">${pct(e.SOXL_mae21)}</td></tr>`).join("");
+  $("#ev-table").innerHTML = `<thead><tr><th>Date</th><th class="n">SOXL</th><th class="n">MU</th><th class="n">QQQ</th><th>What happened</th><th class="n">SOXL +5d</th><th class="n">SOXL +21d</th><th class="n">MU +21d</th><th class="n">SOXL worst 21d</th></tr></thead><tbody>${body}</tbody>`;
+}
+
+/* ---------- 7 · today ---------- */
+function renderToday() {
+  const t = DATA.events.find((e) => e.date === "2026-09-14");
+  const prof = [
+    ["SOXL close", pct(t.SOXL_1d)], ["MU close", pct(t.MU_1d)], ["QQQ close", pct(t.QQQ_1d)], ["VIX change", pct(t.VIX_1d)],
+    ["SOXL vs 1-year high", pct(t.dd252, 0)], ["200-day average", t.above200 ? "Above" : "Below"],
+    ["Prior −10% close", "18 Aug (18 sessions ago)"], ["Catalyst", "AI-capex doubt"],
+  ];
+  $("#profile").innerHTML = prof.map(([k, v]) => `<div><div class="label">${k}</div><div class="v">${v}</div></div>`).join("");
+  const A = DATA.events.filter((e) => e.date < "2026-09-14" && !e.above200 && e.QQQ_1d > -2);
+  const body = A.map((e) => `<tr><td class="mono">${e.date}</td><td class="n down">${pct(e.SOXL_1d)}</td><td class="n">${pct(e.QQQ_1d)}</td><td><span class="chip">${CATLAB[e.category]}</span></td>
+    <td class="n ${cls(e.SOXL_f5)}">${pct(e.SOXL_f5)}</td><td class="n ${cls(e.SOXL_f21)}">${pct(e.SOXL_f21)}</td><td class="n ${cls(e.MU_f21)}">${pct(e.MU_f21)}</td></tr>`).join("");
+  const m5 = median(A.map((e) => e.SOXL_f5)), m21 = median(A.map((e) => e.SOXL_f21)), mu21 = median(A.map((e) => e.MU_f21));
+  $("#analogs").innerHTML = `<thead><tr><th>Date</th><th class="n">SOXL</th><th class="n">QQQ</th><th>Catalyst</th><th class="n">SOXL +5d</th><th class="n">SOXL +21d</th><th class="n">MU +21d</th></tr></thead><tbody>${body}
+    <tr class="hold"><td>Median of ${A.length}</td><td></td><td></td><td></td><td class="n ${cls(m5)}">${pct(m5)}</td><td class="n ${cls(m21)}">${pct(m21)}</td><td class="n ${cls(mu21)}">${pct(mu21)}</td></tr></tbody>`;
+  const up21 = A.filter((e) => e.SOXL_f21 != null);
+  $("#analog-note").innerHTML = `SOXL was higher 21 days later in ${up21.filter((e) => e.SOXL_f21 > 0).length} of ${up21.length} of these. In 2010–2023, semis-only triggers had a <em>better</em> median month than broad ones, so this split doesn't hold up either. If you want protection, the evidence favours a smaller position or a longer stand-aside chosen because you expect a prolonged bear, not an automatic exit on the −10% print itself.`;
+}
+
+/* ---------- wiring ---------- */
+seg("fwd-asset", [["SOXL", "SOXL"], ["MU", "MU"]], () => S.fwd.asset, (v) => { S.fwd.asset = v; renderFwd(); });
+seg("fwd-win", [["3y", "2023–26"], ["2010-2023", "2010–23"]], () => S.fwd.win, (v) => { S.fwd.win = v; renderFwd(); renderRisk(); });
+seg("fwd-sample", [["all", "All"], ["declustered", "First in 2 weeks"]], () => S.fwd.sample, (v) => { S.fwd.sample = v; renderFwd(); });
+seg("fwd-stat", [["mean", "Average"], ["median", "Median"]], () => S.fwd.stat, (v) => { S.fwd.stat = v; renderFwd(); });
+const thSel = $("#fwd-th");
+thSel.innerHTML = [-5, -7, -8, -10, -12, -15, -20].map((t) => `<option value="${t}" ${t === -10 ? "selected" : ""}>${MINUS}${-t}% or worse</option>`).join("");
+thSel.addEventListener("change", () => { S.fwd.th = +thSel.value; renderFwd(); });
+seg("eq-asset", [["SOXL", "SOXL"], ["MU", "MU"]], () => S.eq, (v) => { S.eq = v; renderEquity(); });
+seg("bt-win", [["3y", "2023–26"], ["2010-2023", "2010–23"]], () => S.bt.win, (v) => { S.bt.win = v; renderBt(); });
+seg("bt-exec", [["close", "Trigger close"], ["open", "Next open"]], () => S.bt.exec, (v) => { S.bt.exec = v; renderBt(); });
+seg("hm-metric", [["cagr", "CAGR"], ["sharpe", "Sharpe"], ["maxdd", "Max drawdown"]], () => S.hm.metric, (v) => { S.hm.metric = v; renderHeat(); });
+seg("hm-exec", [["close", "Trigger close"], ["open", "Next open"]], () => S.hm.exec, (v) => { S.hm.exec = v; renderHeat(); });
+seg("yr-asset", [["SOXL", "SOXL"], ["MU", "MU"]], () => S.yr, (v) => { S.yr = v; renderYears(); });
+seg("ev-cat", [["All", "All"], ...CATS.map((c) => [c, CATLAB[c]])], () => S.cat, (v) => { S.cat = v; renderEvents(); });
+
+function renderCharts() { renderHero(); renderEquity(); }
+renderCharts(); renderFwd(); renderRisk(); renderBt(); renderHeat(); renderYears(); renderCtx(); renderCatSum(); renderEvents(); renderToday();
+let rz; addEventListener("resize", () => { cancelAnimationFrame(rz); rz = requestAnimationFrame(renderCharts); });
+</script>
