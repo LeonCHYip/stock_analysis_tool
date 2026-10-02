@@ -236,6 +236,24 @@ per day that have nothing to do cost no HTTP at all — which is why the launchd
 **five times per weekday** (16:45, 17:30, 18:30, 20:00, plus 08:00 next morning as catch-up)
 rather than once. Exactly one newsletter goes out per session regardless.
 
+**A hung run blocks every later slot.** launchd never starts a second copy of a job that is still
+running, so one stuck network call cost all of 2026-09-30's retries (the Mac slept mid-Gemini-call
+during a dark-wake run; the SDK's default timeout is infinite; it sat 7 h). Three layers now:
+the plist wraps the job in `caffeinate -i`; Gemini calls have `GEMINI_TIMEOUT_MS`; and a
+whole-run watchdog (`RUN_WATCHDOG_S`, 45 min) `os._exit`s and records `run_state` `error`. The
+watchdog counts *awake* time — `time.monotonic()` stops during sleep on macOS — so dozing is not
+mistaken for hanging. After editing the plist, re-arm via the sidebar Start (or
+`newsletter_control.start_schedule()`) since the installed copy is not a symlink.
+
+**Quality gate (added 2026-09-29).** `build_report()` returns `ctx["problems"]`: under 90% of the
+$10B+ universe priced, under half the 5d/3m/1y rows resolved, Gemini *failed* (not "explained
+nothing" — `generate_reasons()` returns `None` on failure vs `{}` for nothing to do), or news failed
+for most movers. While ET today is still the session day, `main()` defers the send to the next slot;
+from the next morning's catch-up on it sends anyway with an amber "Incomplete data" banner, so a bad
+night delays a session but never loses it. `--force` sends regardless (banner still shown).
+Motivated by 2026-09-29: a DNS outage for Yahoo produced 407/931 ranked, every horizon blank and
+Gemini 503s, and it was emailed as if normal.
+
 **Catch-up is by session, not by date (changed Sep 2026).** There used to be a fourth gate that
 refused to send unless the last completed session was *today* (ET). It silently destroyed any
 session the Mac slept through: the run that fires on wake sees yesterday's session and bailed,
@@ -299,6 +317,22 @@ with an empty one**, so a later `--no-news` or Gemini-failed rerun of the same s
 a good entry; same session re-runs upsert rather than append. The model-fallback/backoff loop is
 shared with the reasons call via `_gemini_json()`.
 
+**Each of sections 2 and 3 opens with a numbers-only overview table** (`_metrics_table`),
+then the narrative/heading, then the written-up blocks: scan first, read second. Section 2 lists
+the top-5/bottom-5 constituents with the daily move plus the 5d/3m/1y price and volume trios,
+sub-labelled by `SOXX_SEGMENTS` (memory / foundry / GPU-accelerator / …) rather than by sector,
+which is "Technology > Semiconductors" for nearly all of them and so says nothing. Section 3
+lists the top/bottom 10 with sector > industry, market cap and the same trios. The horizons are
+deliberately **not** repeated in the per-mover blocks below — that duplicated ~4 KB in a message
+Gmail clips.
+
+**`fundamentals.raw_info_json` stores `longName`, never `shortName`** (`fundamental_fetcher.py:698`).
+`load_large_cap_universe()` asked for `$.shortName` and so returned an empty `name` for all 936
+rows, which silently degraded **every** newsletter news query to a bare-ticker Google search
+instead of the company name. Both queries now `COALESCE(longName, shortName)`. `load_soxx_meta()`
+re-reads the constituents with no market-cap screen; that is a safety net for a constituent
+dropping below $10B, not the fix for the missing names.
+
 **5d/3m/1y price and volume come from one `yf.download(..., period="3y")`, not the DB.**
 `tech_indicators.ret_5d/ret_60d/ret_252d` and `storage.compute_returns_for_tickers()` already
 exist but are unusable here: both need DuckDB, and the lock is the *common* case, so the columns
@@ -323,7 +357,11 @@ Order of preference: quote endpoint -> `price_history` -> daily bars.
 (plain urllib gets 429), and `libcurl-impersonate` has aborted the interpreter outright — SIGABRT
 inside `SSL_write`, exit 134 — when Yahoo throttles, which it does hardest right after the close.
 A native abort is uncatchable in Python, so `news_fetcher.py` is invoked via `subprocess` and a
-crash costs only the reasons, not the newsletter. Article bodies are fetched in ONE shared pool
+crash costs only the reasons, not the newsletter. The child streams one flushed JSON line per
+ticker (then a final line with bodies), so a crash keeps every ticker already written; the
+missing ones are retried **Google-only** (`"yahoo": false` — plain urllib, cannot abort). Tickers
+that still get nothing are flagged `news_failed` and render "news fetch failed", never "no news".
+(2026-09-28 went out with zero news because the child used to write one blob at the very end.) Article bodies are fetched in ONE shared pool
 across all tickers with a wall-clock deadline; per-ticker pools ran serially at ~40 s each and
 overran the timeout.
 

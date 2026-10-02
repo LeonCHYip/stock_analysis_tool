@@ -288,15 +288,18 @@ def _norm_title(t: str) -> str:
 
 
 def gather_meta(ticker: str, name: str | None, hours: int = 48,
-                max_articles: int = 6) -> list[dict]:
+                max_articles: int = 6, use_yahoo: bool = True) -> list[dict]:
     """Merge Google News + Yahoo results, WITHOUT fetching bodies (fast).
 
     Google supplies breadth and recency ranking; Yahoo supplies followable
     links. Items whose body cannot be retrieved still carry their headline,
     which is often enough on its own ("Why X Stock Is Jumping as ...").
+
+    use_yahoo=False is the crash-proof mode: Google News goes through plain
+    urllib, so nothing touches libcurl-impersonate and nothing can abort.
     """
     google = fetch_headlines(build_query(ticker, name), hours=hours, limit=max_articles)
-    yahoo = fetch_yahoo_news(ticker, hours=hours, limit=max_articles)
+    yahoo = fetch_yahoo_news(ticker, hours=hours, limit=max_articles) if use_yahoo else []
 
     merged: list[dict] = []
     seen: set[str] = set()
@@ -351,17 +354,35 @@ def gather_with_bodies(ticker: str, name: str | None, hours: int = 48,
 # ─────────────────────────────────────────────────────────────────────────────
 # Subprocess entry point
 # ─────────────────────────────────────────────────────────────────────────────
-# Run as: python news_fetcher.py  with a JSON spec on stdin, JSON on stdout.
-# Isolates the curl_cffi-backed Yahoo calls so a native abort takes down only
-# this child, leaving the newsletter to continue without reasons.
+# Run as: python news_fetcher.py  with a JSON spec on stdin, JSON LINES on
+# stdout. Isolates the curl_cffi-backed Yahoo calls so a native abort takes
+# down only this child.
+#
+# Output is streamed, one flushed line per ticker as its headlines arrive, then
+# a final line carrying the bodies:
+#   {"ticker": "AMD", "articles": [...]}     (headlines, no bodies)
+#   {"final": {"AMD": [...], ...}}           (everything, with bodies)
+# Writing a single blob at the end meant an abort on ticker 40 of 47 threw
+# away the 39 already fetched -- 2026-09-28 went out with no news at all. Now
+# the parent keeps every line that made it out and retries only the rest.
+
+def _public(arts: list[dict]) -> list[dict]:
+    return [{k: v for k, v in a.items() if k != "published"} for a in arts]
+
 
 def _cli_main() -> int:
     import sys
+
+    def emit(obj: dict) -> None:
+        sys.stdout.write(_json.dumps(obj) + "\n")
+        sys.stdout.flush()               # must reach the pipe before any abort
+
     try:
         spec = _json.loads(sys.stdin.read())
         hours = int(spec.get("hours", 48))
         limit = int(spec.get("limit", 6))
         deadline = float(spec.get("body_deadline", 180))
+        use_yahoo = bool(spec.get("yahoo", True))
         # bodies_for narrows the expensive phase. Headlines are cheap (one RSS
         # call per ticker); article bodies are not, and they all share ONE pool
         # under a single wall-clock deadline. Widening the ticker list without
@@ -375,16 +396,16 @@ def _cli_main() -> int:
 
         out, every = {}, []
         for m in movers:
-            arts = gather_meta(m["ticker"], m.get("name"), hours=hours, max_articles=limit)
+            arts = gather_meta(m["ticker"], m.get("name"), hours=hours,
+                               max_articles=limit, use_yahoo=use_yahoo)
             out[m["ticker"]] = arts
+            emit({"ticker": m["ticker"], "articles": _public(arts)})
             if m["ticker"] in want_bodies:
                 every.extend(arts)
         filled = fill_bodies(every, deadline_s=deadline)
         sys.stderr.write(f"bodies: {filled}/{len(every)} "
                          f"({len(want_bodies)}/{len(movers)} tickers)\n")
-        out = {t: [{k: v for k, v in a.items() if k != "published"} for a in arts]
-               for t, arts in out.items()}
-        sys.stdout.write(_json.dumps(out))
+        emit({"final": {t: _public(arts) for t, arts in out.items()}})
         return 0
     except Exception as exc:
         sys.stderr.write(f"{type(exc).__name__}: {exc}")

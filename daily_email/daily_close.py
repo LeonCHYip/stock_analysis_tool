@@ -795,7 +795,54 @@ def attach_horizons(movers: list[dict], horizons: dict[str, dict]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 NEWS_TIMEOUT_S = 420
+# Quality gate (see build_report). A normal day prices ~98% of the universe.
+QUALITY_MIN_COVERAGE = 0.90
+QUALITY_MIN_HORIZONS = 0.50
 BODY_DEADLINE_S = 200
+# The fallback pass is Google-only (plain urllib, cannot abort) and fetches no
+# bodies, so it is quick: ~0.3 s politeness delay per ticker.
+NEWS_RETRY_TIMEOUT_S = 180
+
+
+def _run_news_child(spec: dict, timeout: int, label: str
+                    ) -> tuple[dict[str, list], bool, str]:
+    """Run news_fetcher once. Returns (articles by ticker, finished, stderr tail).
+
+    The child streams one JSON line per ticker, so whatever it wrote before a
+    crash or timeout is still usable. `finished` is True only when the final
+    line (which carries the bodies) arrived.
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(HERE / "news_fetcher.py")],
+            input=json.dumps(spec), capture_output=True, text=True, timeout=timeout)
+        stdout, stderr, rc = proc.stdout or "", proc.stderr or "", proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or b""
+        stdout = out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+        stderr, rc = "", None
+        log(f"WARN: news {label} exceeded {timeout}s")
+
+    got: dict[str, list] = {}
+    final = None
+    for line in stdout.splitlines():
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue                           # a line cut off mid-write by the abort
+        if "final" in obj:
+            final = obj["final"]
+        elif "ticker" in obj:
+            got[obj["ticker"]] = obj.get("articles") or []
+    if final is not None:
+        got.update(final)
+
+    tail = stderr.strip().splitlines()[-1:] or ["no stderr"]
+    if rc not in (0, None):
+        crashed = rc < 0 or rc > 128
+        log(f"WARN: news {label} {'CRASHED' if crashed else 'failed'} "
+            f"(exit {rc}: {tail[0][:120]}) -- kept {len(got)}/{len(spec['movers'])} tickers")
+    return got, final is not None and rc == 0, tail[0]
 
 
 def attach_news(movers: list[dict], hours: int = 48, limit: int = 6,
@@ -808,9 +855,15 @@ def attach_news(movers: list[dict], hours: int = 48, limit: int = 6,
     hardest right after the close, exactly when this job runs. A native abort
     is uncatchable in-process, so isolation is the only way to keep a crash
     from costing the whole newsletter.
+
+    A crash keeps every ticker the child already streamed out; the rest are
+    retried Google-only, which cannot abort. Tickers that still got nothing
+    are marked `news_failed` so the email says the fetch failed rather than
+    claiming there was no news.
     """
     for m in movers:
         m["news"] = []
+        m["news_failed"] = False
 
     # Bodies are best-effort: whatever has not arrived by the deadline keeps its
     # headline. Bounded so this phase cannot overrun NEWS_TIMEOUT_S and cost the
@@ -819,38 +872,31 @@ def attach_news(movers: list[dict], hours: int = 48, limit: int = 6,
             "hours": hours, "limit": limit, "body_deadline": BODY_DEADLINE_S}
     if bodies_for is not None:
         spec["bodies_for"] = sorted(bodies_for)
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(HERE / "news_fetcher.py")],
-            input=json.dumps(spec), capture_output=True, text=True, timeout=NEWS_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        log(f"WARN: news subprocess exceeded {NEWS_TIMEOUT_S}s -- continuing without news.")
-        return
+    data, finished, tail = _run_news_child(spec, NEWS_TIMEOUT_S, "subprocess")
+    if finished and tail.startswith("bodies:"):
+        log(f"  news: {tail}")
 
-    if proc.returncode != 0:
-        detail = (proc.stderr or "").strip().splitlines()[-1:] or ["no stderr"]
-        crashed = proc.returncode < 0 or proc.returncode > 128
-        log(f"WARN: news subprocess {'CRASHED' if crashed else 'failed'} "
-            f"(exit {proc.returncode}: {detail[0][:120]}) -- continuing without news.")
-        return
-
-    try:
-        data = json.loads(proc.stdout or "{}")
-    except json.JSONDecodeError:
-        log("WARN: news subprocess returned unparseable output -- continuing without news.")
-        return
+    missing = [m for m in spec["movers"] if m["ticker"] not in data]
+    if missing:
+        log(f"  news: retrying {len(missing)} ticker(s) Google-only (no Yahoo, no bodies)")
+        retry = {"movers": missing, "hours": hours, "limit": limit,
+                 "yahoo": False, "bodies_for": []}
+        again, _, _ = _run_news_child(retry, NEWS_RETRY_TIMEOUT_S, "retry")
+        data.update(again)
 
     for m in movers:
-        m["news"] = data.get(m["ticker"], [])
+        if m["ticker"] in data:
+            m["news"] = data[m["ticker"]]
+        else:
+            m["news_failed"] = True
 
-    tail = (proc.stderr or "").strip().splitlines()[-1:]
-    if tail and tail[0].startswith("bodies:"):
-        log(f"  news: {tail[0]}")
     got = sum(1 for m in movers if m["news"])
     bodies = sum(1 for m in movers for h in m["news"] if h.get("body"))
     total = sum(len(m["news"]) for m in movers)
+    failed = sum(1 for m in movers if m["news_failed"])
     log(f"  news: {got}/{len(movers)} movers have articles in the last {hours}h "
-        f"({total} articles, {bodies} with readable text)")
+        f"({total} articles, {bodies} with readable text)"
+        + (f"; fetch FAILED for {failed}" if failed else ""))
 
 
 _REASON_PROMPT = """You are writing a factual daily market-close briefing.
@@ -890,6 +936,7 @@ REASON_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest"]
 # reasons, so retries are bounded by a total deadline with growing backoff
 # instead -- the job is unattended and can afford to wait.
 REASON_DEADLINE_S = 360
+GEMINI_TIMEOUT_MS = 120_000          # per call; a normal reasons call takes ~15-30 s
 REASON_BACKOFFS = [5, 15, 30, 60, 60]
 
 
@@ -908,7 +955,12 @@ def _gemini_json(prompt: str, *, label: str, model: str | None = None,
     """
     from google import genai
     from google.genai import types
-    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    # The SDK's default is to wait forever. On 2026-09-30 the Mac slept mid-call,
+    # the connection died half-open, and the run hung for 7+ hours -- which also
+    # blocked every later launchd slot, since launchd will not start a second
+    # copy of a job that is still running.
+    client = genai.Client(api_key=config.GEMINI_API_KEY,
+                          http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
     cfg = types.GenerateContentConfig(response_mime_type="application/json",
                                       temperature=temperature)
 
@@ -952,13 +1004,17 @@ def _gemini_json(prompt: str, *, label: str, model: str | None = None,
     return data
 
 
-def generate_reasons(movers: list[dict], model: str | None = None) -> dict[str, list[str]]:
+def generate_reasons(movers: list[dict], model: str | None = None
+                     ) -> dict[str, list[str]] | None:
     """One batched Gemini call for all movers -> 1-3 reasons each.
 
     Grounding is the fetched articles themselves (Google Search tooling is NOT
     enabled), so every sentence can be checked against the links printed beside
     it. Any failure degrades to headlines-only -- a missing API key must never
     block the newsletter.
+
+    Returns None when Gemini was asked and FAILED, so the email can say so
+    instead of implying the articles explained nothing.
     """
     if not config.GEMINI_API_KEY:
         log("  reasons: GEMINI_API_KEY not set -- rendering headlines only. "
@@ -1003,7 +1059,7 @@ def generate_reasons(movers: list[dict], model: str | None = None) -> dict[str, 
     except Exception as exc:
         log(f"WARN: Gemini reason synthesis failed ({type(exc).__name__}: {exc}). "
             f"Rendering headlines only.")
-        return {}
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1192,6 +1248,13 @@ _CSS = (
     f".src{{color:{MUTED}}}"
     ".lbl{font-size:13px;font-weight:600;margin:14px 0 4px}"
     f".nd{{font-size:12px;color:{GREY}}}"
+    f".th{{font-size:10px;color:{MUTED};text-transform:uppercase;letter-spacing:.04em;"
+    f"padding:5px 6px;border-bottom:2px solid {BORDER};font-weight:600}}"
+    f".tc{{font-size:12px;padding:5px 6px;border-bottom:1px solid {BORDER}}}"
+    f".tk{{font-size:12.5px;font-weight:700;color:{INK}}}"
+    f".sg{{font-size:10.5px;color:{MUTED};font-weight:400}}"
+    f".gh{{font-size:11px;font-weight:700;color:{MUTED};text-transform:uppercase;"
+    f"letter-spacing:.04em;padding:11px 6px 3px}}"
     f".fn{{font-size:11px;color:{MUTED};margin-top:8px}}"
     f".ft{{font-size:11px;color:{MUTED};margin-top:26px;padding-top:10px;"
     f"border-top:1px solid {BORDER}}}"
@@ -1261,6 +1324,10 @@ def empty_note(mover: dict) -> str:
     the headlines even when the real cause was that Gemini never ran."""
     if not config.GEMINI_API_KEY:
         return "set GEMINI_API_KEY in .env to get reasons"
+    if mover.get("news_failed"):
+        return "news fetch failed"
+    if mover.get("reasons_failed"):
+        return "AI summary unavailable (Gemini failed)"
     if not mover.get("news"):
         return "no news in the last 48h"
     return "articles found, but none explained the move"
@@ -1315,6 +1382,46 @@ def _narrative_text(ctx: dict) -> list[str]:
     return ["", "  Sector read", "  " + "-" * 44] + [f"  * {t}" for t in themes]
 
 
+def _metrics_table(groups: list[tuple[str, list[dict]]], *, show_cap: bool,
+                   sub_key: str = "") -> str:
+    """Overview table at the head of a section: the numbers, with no prose.
+
+    Lets the reader scan every mover's daily move against its 5d/3m/1y price and
+    volume trend before reading any of the write-ups below. The horizons are
+    deliberately NOT repeated in the per-mover blocks -- that would duplicate
+    ~4 KB in a message Gmail clips at ~102 KB.
+
+    `groups` is [(label, movers)], rendered as labelled bands in one table so
+    winners and losers stay directly comparable.
+    """
+    cols = [("Ticker", ""), ("Chg", "r"), ("Px 5d/3m/1y", "r"), ("Vol 5d/3m/1y", "r")]
+    if show_cap:
+        cols.append(("Cap", "r"))
+    head = "".join(f'<th class="th {al}">{h}</th>' for h, al in cols)
+
+    body = []
+    for label, movers in groups:
+        if not movers:
+            continue
+        body.append(f'<tr><td class="gh" colspan="{len(cols)}">{_esc(label)}</td></tr>')
+        for m in movers:
+            sub = _esc(m.get(sub_key) or "") if sub_key else ""
+            if sub_key == "sector" and m.get("industry"):
+                sub = f'{sub} &rsaquo; {_esc(m["industry"])}'
+            body.append(
+                f'<tr><td class="tc"><span class="tk">{_esc(m["ticker"])}</span>'
+                + (f'<div class="sg">{sub}</div>' if sub else "") + '</td>'
+                f'<td class="tc r">{_pct_html(m["pct_change"])}</td>'
+                f'<td class="tc r">{_trio([m.get("px_5d"), m.get("px_3m"), m.get("px_1y")])}</td>'
+                f'<td class="tc r">{_trio([m.get("vol_5d"), m.get("vol_3m"), m.get("vol_1y")])}</td>'
+                + (f'<td class="tc r">{_millify(m.get("market_cap"))}</td>' if show_cap else "")
+                + '</tr>')
+    if not body:
+        return '<div class="nd">no data</div>'
+    return ('<table cellpadding="0" cellspacing="0" border="0">'
+            f'<tr>{head}</tr>{"".join(body)}</table>')
+
+
 def _mover_rows(movers: list[dict], reasons: dict[str, list[str]],
                 max_articles: int = 6) -> str:
     out = []
@@ -1342,7 +1449,7 @@ def _mover_rows(movers: list[dict], reasons: dict[str, list[str]],
             f'<div class="mn">{_esc(m.get("name") or "")}'
             f'{" &middot; " if m.get("name") else ""}'
             f'{_esc(m.get("sector") or "n/a")} &rsaquo; {_esc(m.get("industry") or "n/a")}</div>'
-            f'{_horizon_html(m)}{reason_html}{news_html}</td></tr>'
+            f'{reason_html}{news_html}</td></tr>'
         )
     return ('<table cellpadding="0" cellspacing="0" border="0">'
             f'{"".join(out)}</table>')
@@ -1360,6 +1467,12 @@ def render_html(ctx: dict) -> str:
     p.append(f'<div class="hd">Market Close</div>'
              f'<div class="sb">{_esc(ctx["headline_date"])} &middot; generated '
              f'{_esc(ctx["generated_at"])}</div>')
+    if ctx.get("problems"):
+        p.append('<div style="margin:12px 0;padding:10px 12px;border:1px solid #d97706;'
+                 'border-radius:6px;background:#fffbeb;color:#92400e;font-size:13px">'
+                 '<b>&#9888; Incomplete data &mdash; sent anyway so the session is not lost:</b>'
+                 + "".join(f'<div>&middot; {_esc(pr)}</div>' for pr in ctx["problems"])
+                 + '</div>')
 
     # 1. Index board
     p.append(_h2("1. Index Board", f"US session close · {eq_asof}"))
@@ -1389,6 +1502,12 @@ def render_html(ctx: dict) -> str:
                  f'<span style="color:{GREY}">no data</span>')
     p.append(_h2("2. SOXL", f"as of {_esc(rsi_date or eq_asof)}"))
     p.append(f'<div style="margin-bottom:6px">{soxl_line}</div><div>{rsi_html}</div>')
+    # Numbers first, then the read, then the evidence.
+    p.append(f'<div class="lbl" style="margin-top:16px">Constituent movers</div>')
+    p.append(_metrics_table(
+        [(f"Top {SOXX_MOVERS_N} gainers", ctx["soxx_up"]),
+         (f"Bottom {SOXX_MOVERS_N}", ctx["soxx_down"])],
+        show_cap=False, sub_key="segment"))
     p.append(_narrative_html(ctx))
 
     for title, rows in ((f"Top {SOXX_MOVERS_N} constituent gainers", ctx["soxx_up"]),
@@ -1401,11 +1520,15 @@ def render_html(ctx: dict) -> str:
              f'SOXL is swap-based and holds no equities; SOXX is used as the '
              f'constituent proxy.</div>')
 
-    # 3. Movers
-    p.append(_h2(f"3. Top {MOVERS_N} Winners — $10B+ cap",
+    # 3. Movers -- overview table first, then the written-up blocks.
+    p.append(_h2(f"3. Large-Cap Movers — $10B+ cap",
                  f'{ctx["universe_n"]} stocks screened · ETFs excluded · {eq_asof}'))
+    p.append(_metrics_table([(f"Top {MOVERS_N} winners", ctx["winners"]),
+                             (f"Top {MOVERS_N} losers", ctx["losers"])],
+                            show_cap=True, sub_key="sector"))
+    p.append(_h2(f"Top {MOVERS_N} Winners — detail", f"{eq_asof}"))
     p.append(_mover_rows(ctx["winners"], ctx["reasons"], n_art))
-    p.append(_h2(f"Top {MOVERS_N} Losers — $10B+ cap", f"{eq_asof}"))
+    p.append(_h2(f"Top {MOVERS_N} Losers — detail", f"{eq_asof}"))
     p.append(_mover_rows(ctx["losers"], ctx["reasons"], n_art))
 
     p.append(f'<div class="ft">'
@@ -1456,7 +1579,11 @@ def render_within_budget(ctx: dict) -> tuple[str, str]:
 
 def render_text(ctx: dict) -> str:
     L = [f'MARKET CLOSE -- {ctx["headline_date"]}',
-         f'generated {ctx["generated_at"]}', "", "1. INDEX BOARD", "-" * 46]
+         f'generated {ctx["generated_at"]}', ""]
+    if ctx.get("problems"):
+        L += ["WARNING -- incomplete data, sent anyway so the session is not lost:"]
+        L += [f"  - {pr}" for pr in ctx["problems"]] + [""]
+    L += ["1. INDEX BOARD", "-" * 46]
     for t, d, r in _sort_board(INDEX_EQUITIES, ctx["quotes"]):
         L.append(f'{t:<9}{_fmt_price(r["close"]) if r else "no data":>12}'
                  f'{(f"{r["pct_change"]:+.2f}%" if r else ""):>10}   {d}')
@@ -1613,6 +1740,9 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
         meta = soxx_meta.get(t) or universe.get(t) or {}
         for k in ("name", "sector", "industry"):
             rec[k] = meta.get(k) or ""
+        # Sub-segment rather than "Technology > Semiconductors", which is the
+        # same string for nearly every constituent and so says nothing.
+        rec["segment"] = SOXX_SEGMENTS.get(t, "")
         soxx_rows.append(rec)
     soxx_rows.sort(key=lambda r: r["pct_change"], reverse=True)
     soxx_up = soxx_rows[:SOXX_MOVERS_N]
@@ -1646,7 +1776,9 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
 
     # 5d/3m/1y for everything that gets rendered, in one download.
     rendered = winners + losers + soxx_up + soxx_down
-    attach_horizons(rendered, fetch_multi_horizon([m["ticker"] for m in rendered]))
+    horizon_tickers = {m["ticker"] for m in rendered}
+    horizons = fetch_multi_horizon(sorted(horizon_tickers))
+    attach_horizons(rendered, horizons)
 
     # ── News + AI ────────────────────────────────────────────────────────────
     # ONE subprocess for the union of the large-cap movers and every SOXX
@@ -1656,6 +1788,7 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
     # import besides. Bodies are limited to the names that get written up --
     # the rest supply headlines for the sector read only.
     reasons: dict[str, list[str]] = {}
+    reasons_failed = False
     narrative = {"themes": [], "prior_sessions": []}
     summarised = winners + losers + soxx_up + soxx_down
     if skip_news:
@@ -1675,11 +1808,38 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
         for m in summarised + soxx_rows:
             if m is not by_ticker[m["ticker"]]:
                 m["news"] = by_ticker[m["ticker"]].get("news", [])
+                m["news_failed"] = by_ticker[m["ticker"]].get("news_failed", False)
 
-        reasons = generate_reasons(summarised)
+        got = generate_reasons(summarised)
+        reasons_failed = got is None
+        reasons = got or {}
+        if reasons_failed:
+            for m in summarised:
+                m["reasons_failed"] = True
         narrative = generate_soxl_narrative(equity_asof, quotes.get("SOXL"),
                                             soxl_rsi, soxx_rows)
         save_narrative(equity_asof, narrative.get("themes") or [])
+
+    # ── Data quality ─────────────────────────────────────────────────────────
+    # 2026-09-29 went out during a network outage (DNS failing for Yahoo):
+    # 407/931 stocks ranked, every 5d/3m/1y blank, Gemini 503ing. Each check
+    # below names a failure that would make the email misleading, not merely
+    # thinner. main() defers the send while any is present.
+    problems: list[str] = []
+    if universe and len(cap_quotes) < QUALITY_MIN_COVERAGE * len(universe):
+        problems.append(f"only {len(cap_quotes)}/{len(universe)} large caps had a "
+                        f"price -- the top/bottom 10 may be wrong")
+    if horizon_tickers and len(horizons) < QUALITY_MIN_HORIZONS * len(horizon_tickers):
+        problems.append(f"5d/3m/1y history missing for "
+                        f"{len(horizon_tickers) - len(horizons)}/{len(horizon_tickers)} movers")
+    if reasons_failed:
+        problems.append("Gemini failed -- no AI summaries")
+    if not skip_news:
+        failed = sum(1 for m in summarised if m.get("news_failed"))
+        if failed > len(summarised) / 2:
+            problems.append(f"news fetch failed for {failed}/{len(summarised)} movers")
+    for pr in problems:
+        log(f"  QUALITY: {pr}")
 
     spy, qqq = quotes.get("SPY"), quotes.get("QQQ")
     bits = [f'{n} {q["pct_change"]:+.2f}%' for n, q in (("SPY", spy), ("QQQ", qqq)) if q]
@@ -1701,6 +1861,7 @@ def build_report(quotes: dict, equity_asof: str, alt_asof: str,
         "winners": winners, "losers": losers, "reasons": reasons,
         "universe_n": len(universe),
         "unavailable_n": unavailable,
+        "problems": problems,
         "filtered_n": len(rejected),
         "subject": "Market Close — " + headline_date + (" — " + " · ".join(bits) if bits else ""),
     }
@@ -1865,6 +2026,14 @@ def main() -> int:
     ctx = build_report(quotes, equity_asof, alt_asof,
                        news_hours=args.news_hours, skip_news=args.no_news,
                        max_articles=args.articles)
+    # Defer a degraded build while there are still evening slots left today (ET);
+    # the next-morning catch-up run sends whatever it gets, with a banner, so a
+    # bad night can delay a session but never lose it.
+    if ctx["problems"] and not args.force and mc.et_today().isoformat() == session:
+        log(f"Data incomplete ({len(ctx['problems'])} problem(s)) -- nothing sent, will "
+            f"retry on the next scheduled run. Use --force to send anyway.")
+        return _finish("skipped", session, "incomplete: " + "; ".join(ctx["problems"]))
+
     html_body, text_body = render_within_budget(ctx)
 
     REPORTS_DIR.mkdir(exist_ok=True)
@@ -1906,7 +2075,33 @@ def mail_preflight() -> tuple[bool, str]:
         return False, f"mailer unavailable ({type(exc).__name__}: {exc})"
 
 
+# Whole-run watchdog. Every network call has its own timeout, but a hung run is
+# so costly -- it silently blocks every later launchd slot -- that one backstop
+# for the timeouts nobody thought of is worth having. threading.Timer waits on
+# time.monotonic(), which on macOS does NOT advance while the machine sleeps, so
+# this budget is AWAKE time: a run that dozes through the evening in dark-wake
+# bursts is not killed for sleeping, only for genuinely making no progress.
+RUN_WATCHDOG_S = 45 * 60
+
+
+def _arm_watchdog() -> None:
+    import os
+    import threading
+
+    def _fire() -> None:
+        log(f"ERROR: watchdog -- run exceeded {RUN_WATCHDOG_S // 60} min of awake time; "
+            f"killing it so the next scheduled run can retry.")
+        _flush_log()
+        _write_run_state("error", None, f"watchdog: exceeded {RUN_WATCHDOG_S}s", 3)
+        os._exit(3)            # a hung C-level socket read cannot be interrupted
+
+    t = threading.Timer(RUN_WATCHDOG_S, _fire)
+    t.daemon = True
+    t.start()
+
+
 if __name__ == "__main__":
+    _arm_watchdog()
     # An exception out of main() otherwise leaves no trace anywhere: _flush_log()
     # never runs, so daily_close.log still shows the *previous* run and the
     # failure is invisible to anything watching.

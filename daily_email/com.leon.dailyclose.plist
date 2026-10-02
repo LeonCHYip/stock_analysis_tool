@@ -41,6 +41,11 @@
 
     <key>ProgramArguments</key>
     <array>
+        <!-- caffeinate -i: once a run starts, keep the Mac from idle-sleeping until
+             it ends. Without it a run that launchd starts in a dark-wake window
+             is put back to sleep mid-network-call (2026-09-30: hung 7 h). -->
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
         <string>/opt/homebrew/bin/uv</string>
         <string>run</string>
         <string>--directory</string>
