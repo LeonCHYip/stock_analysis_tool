@@ -54,7 +54,7 @@ ET = ZoneInfo("America/New_York")
 # Mirrors StartCalendarInterval in the plist. Kept as data rather than parsed
 # back out of the XML: the plist is 25 near-identical dicts and this is the one
 # fact the UI needs from it.
-SLOTS = [(8, 0), (16, 45), (17, 30), (18, 30), (20, 0)]
+SLOTS = [(8, 0), (16, 45), (17, 30), (18, 30), (20, 0), (21, 0), (22, 0), (23, 0)]
 
 _TIMEOUT_S = 15
 

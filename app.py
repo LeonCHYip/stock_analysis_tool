@@ -18,7 +18,7 @@ import threading
 import concurrent.futures
 import time
 import traceback
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -867,7 +867,13 @@ def _refresh_stale_count() -> None:
         from market_calendar import last_completed_trading_day
         _target = last_completed_trading_day()
         if _target:
-            _count = len(storage.get_tickers_with_stale_tech(_target))
+            # Read tickers.txt directly: this runs on a thread started during
+            # module exec, before load_ticker_list() (defined further down)
+            # necessarily exists.
+            _active = ({t.strip() for t in TICKERS_FILE.read_text().split(",") if t.strip()}
+                       if TICKERS_FILE.exists() else set())
+            _count = len([t for t in storage.get_tickers_with_stale_tech(_target)
+                          if t in _active])
             with _scan_state.PROC_SCAN_LOCK:
                 _scan_state.STARTUP["stale"]["count"] = _count
                 _scan_state.STARTUP["stale"]["target"] = _target
@@ -1867,6 +1873,8 @@ def scan_thread_func(tickers, analysis_dt, daily_date, weekly_date,
             nonlocal consecutive_failures, vpn_switched_this_batch
             country = VPN_COUNTRIES[batch_num % len(VPN_COUNTRIES)]
             progress["current"] = f"{reason} — switching VPN to {country.upper()}…"
+            # Logged so a bad batch can be matched to the exit it ran through.
+            _slog(f"[scan] VPN SWITCH  after batch {batch_num} ({reason}) -> {country.upper()}")
             vpn_switcher.switch_server(
                 country,
                 log=lambda msg: progress.update({"current": msg}),
@@ -4978,10 +4986,60 @@ def _auto_scan_poll() -> None:
     if not ticker_list:
         _slog(f"[auto-scan] SKIP  already done  {len(already_done)}/{len(all_tickers)} "
               f"tickers scanned/skipped since {cutoff_str}")
+        _auto_stale_retry(set(all_tickers))
         return
 
     label = f"Auto scan 4:30pm ET — {len(ticker_list)} tickers ({len(already_done)} already run)"
     _launch_scan_headless(ticker_list, label, fetch_peers=True, vpn_rotate=True)
+
+
+_AUTO_STALE_MAX_ATTEMPTS = 3
+_AUTO_STALE_SPACING_SECS = 30 * 60
+
+
+def _auto_stale_retry(universe: set[str]) -> None:
+    """Re-scan tickers the day's scan left a session behind.
+
+    "Done" in _auto_scan_poll means *scanned*, not *got today's bar*. On
+    2026-10-01 Yahoo served 30 Sep as the newest bar for ~1,130 tickers in the
+    second half of the auto scan; they were stored, counted as done, and --
+    because storage.mark_old_tech_finalized() flips any pre-today row to
+    finalized -- invisible to refetch_unfinalized too. Only the manual
+    "Refresh Stale Data" button could repair them.
+
+    Retries only tickers whose newest row is the PREVIOUS session (fresh
+    yesterday, missing today), so delisted names drop out by themselves.
+    Capped at _AUTO_STALE_MAX_ATTEMPTS per session, spaced
+    _AUTO_STALE_SPACING_SECS apart, and run WITHOUT VPN rotation -- the
+    stale batches on 10-01 all ran after rotating to non-US exits.
+    """
+    from market_calendar import last_completed_trading_day, get_trading_days
+    target = last_completed_trading_day()
+    if not target:
+        return
+    st_ = _scan_state.AUTO_STALE
+    if st_["date"] != target:
+        st_.update(date=target, attempts=0, last=0.0)
+    if st_["attempts"] >= _AUTO_STALE_MAX_ATTEMPTS:
+        return
+    if st_["last"] and time.monotonic() - st_["last"] < _AUTO_STALE_SPACING_SECS:
+        return
+
+    t = date.fromisoformat(target)
+    sessions = get_trading_days((t - timedelta(days=10)).isoformat(), target)
+    if len(sessions) < 2:
+        return
+    prev = sessions[-2]
+    behind = sorted(storage.get_tickers_latest_tech_on(prev) & universe)
+    if not behind:
+        return
+
+    st_["attempts"] += 1
+    st_["last"] = time.monotonic()
+    label = (f"Auto stale retry {st_['attempts']}/{_AUTO_STALE_MAX_ATTEMPTS} — "
+             f"{len(behind)} tickers still on {prev}, want {target}")
+    _slog(f"[auto-scan] STALE RETRY  {label}")
+    _launch_scan_headless(behind, label, fetch_peers=False, vpn_rotate=False)
 
 
 def _auto_scan_loop() -> None:
@@ -5034,7 +5092,11 @@ if run_stale_btn:
     from market_calendar import last_completed_trading_day
     _stale_target = last_completed_trading_day()
     if _stale_target:
-        _stale_tickers = storage.get_tickers_with_stale_tech(_stale_target)
+        # Only the active universe -- tickers dropped from tickers.txt stay
+        # stale forever and would otherwise be re-scanned on every click.
+        _active = set(load_ticker_list())
+        _stale_tickers = [t for t in storage.get_tickers_with_stale_tech(_stale_target)
+                          if t in _active]
         if not _stale_tickers:
             st.sidebar.info("No stale tickers found.")
         else:

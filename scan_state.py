@@ -39,3 +39,9 @@ STARTUP: dict = {"stale": {"count": 0, "target": ""}}
 # cache on the next rerun. Lives here (not app.py) because app.py's module
 # globals reset on every Streamlit rerun -- see this module's docstring.
 DATA_VERSION: int = 0
+
+# Auto stale-retry bookkeeping for app.py's _auto_scan_poll: {"date": ISO session
+# the attempts belong to, "attempts": int, "last": time.monotonic() of the last
+# launch}. Process-level for the same reason as PROC_SCAN -- a rerun must not
+# reset the attempt cap and relaunch every 5-minute poll.
+AUTO_STALE: dict = {"date": None, "attempts": 0, "last": 0.0}

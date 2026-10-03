@@ -1266,17 +1266,26 @@ def get_tickers_with_stale_tech(min_date: str) -> list[str]:
     Both feed the "Refresh Stale Data" button and the sidebar banner count, so
     a re-scan repairs partial rows (their price_history is already deep, so the
     fast path recomputes the MAs correctly).
+
+    STOCKS ONLY. ETF screener rows live in the same table (asset_type='etf')
+    and are refreshed by etf_fetcher, not the stock scan; counting them made
+    the banner read ~6,900 when ~1,270 stocks were stale (2026-10-01), and the
+    button then fed 5,600 ETFs into the stock scan. Callers should still
+    intersect with the active ticker list -- tickers dropped from tickers.txt
+    stay stale forever.
     """
     con = _conn()
     rows = con.execute(
         """
         SELECT ticker FROM tech_indicators
+         WHERE COALESCE(asset_type, 'stock') <> 'etf'
           GROUP BY ticker HAVING MAX(CAST(as_of_date AS TEXT)) < ?
         UNION
         SELECT ticker FROM (
             SELECT ticker, sma200,
                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY as_of_date DESC) AS rn
             FROM tech_indicators
+             WHERE COALESCE(asset_type, 'stock') <> 'etf'
         ) t
         WHERE rn = 1 AND sma200 IS NULL
           AND ticker IN (
@@ -3019,6 +3028,25 @@ def get_scan_skip_tickers(since_date: str) -> set[str]:
     rows = con.execute(
         "SELECT DISTINCT ticker FROM scan_skip_log WHERE skip_date >= ?",
         [since_date],
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def get_tickers_latest_tech_on(as_of_date: str) -> set[str]:
+    """Stock tickers whose NEWEST tech_indicators row is exactly `as_of_date`.
+
+    Called with the session BEFORE the latest one, this is "had a bar last
+    session but not this one" -- the signature of a transient Yahoo miss, as
+    opposed to a delisting (whose newest row keeps getting older). Used by the
+    auto-scan's stale retry so dead tickers are not retried forever."""
+    con = _conn()
+    rows = con.execute(
+        """
+        SELECT ticker FROM tech_indicators
+         WHERE COALESCE(asset_type, 'stock') <> 'etf'
+         GROUP BY ticker HAVING MAX(as_of_date) = CAST(? AS DATE)
+        """,
+        [as_of_date],
     ).fetchall()
     return {r[0] for r in rows}
 

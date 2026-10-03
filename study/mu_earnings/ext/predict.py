@@ -19,7 +19,9 @@ if "--no-fetch" not in sys.argv:
 subprocess.run([sys.executable, f"{HERE}/panel.py"], check=True, capture_output=True, cwd=HERE)
 
 panel = pd.read_csv(f"{HERE}/panel.csv", parse_dates=["date"])
-P = load_prices()
+panel = panel[panel.date < NEXT_PRINT].reset_index(drop=True)   # fit on strictly earlier prints
+P_full = load_prices()
+P = {t: s[s.index <= NEXT_PRINT] for t, s in P_full.items()}       # no peeking past day T
 last = P["MU"].index[-1]
 bdays = pd.bdate_range(last, NEXT_PRINT)[1:]    # sessions still to come up to and including T
 prev_react = panel.react_1d.iloc[-1]
@@ -71,13 +73,15 @@ for k, (p, sd, xt) in res.items():
     ovx = f"   ovx z {xt['ovx'].iloc[0]:+.2f}" if "ovx" in xt else ""
     print(f"   {k} {lab[k]:32s} {p:+6.2f}%   ±1sd {sd:5.1f}%{ovx}")
 
-print("\n-- scenario: MU cumulative move from last close to T close")
 rows = []
-for mv in (-10, -6, -3, 0, 3, 6, 10):
+if len(bdays):
+    print("\n-- scenario: MU cumulative move from last close to T close")
+for mv in ((-10, -6, -3, 0, 3, 6, 10) if len(bdays) else ()):
     r = predict(features_at_T(mv))
     rows.append({"move_to_T": mv, "A_react": r["A"][0], "B_drift5": r["B"][0], "C_full5": r["C"][0],
                  "ovx_z": r["B"][2]["ovx"].iloc[0]})
-print(pd.DataFrame(rows).round(2).to_string(index=False))
+if rows:
+    print(pd.DataFrame(rows).round(2).to_string(index=False))
 
 # nearest 2014+ analogues on the two stable signals
 reg = reg.copy()
@@ -88,3 +92,17 @@ reg["dist"] = np.hypot(z(reg.ovx, x_ovx), z(reg.prev_react, prev_react))
 print("\n-- closest 2014+ analogues (overextension + previous reaction)")
 print(reg.nsmallest(6, "dist")[["date", "prev_react", "ovx", "ret_5d", "react_1d", "post_5d", "full_5d", "post_21d"]]
       .round(2).to_string(index=False))
+
+# once the print is history, score the call against what actually happened
+mu = P_full["MU"].close
+if NEXT_PRINT in mu.index and mu.index[-1] > NEXT_PRINT:
+    i = mu.index.get_loc(NEXT_PRINT); n = len(mu) - 1 - i
+    r = lambda a, b: (mu.iloc[b] / mu.iloc[a] - 1) * 100
+    print(f"\n-- actual so far ({n} session(s) after T, through {mu.index[-1].date()})")
+    print(f"   A reaction day     pred {res['A'][0]:+6.2f}%   actual {r(i, i + 1):+6.2f}%   "
+          f"(gap {(P_full['MU'].open.iloc[i + 1] / mu.iloc[i] - 1) * 100:+.2f}%)")
+    if n >= 2:
+        k = min(n, 6)
+        print(f"   B drift T+1->T+6   pred {res['B'][0]:+6.2f}%   so far {r(i + 1, i + k):+6.2f}%  (T+1->T+{k}{'' if k == 6 else ', incomplete'})")
+        k = min(n, 5)
+        print(f"   C hold T->T+5      pred {res['C'][0]:+6.2f}%   so far {r(i, i + k):+6.2f}%  (T->T+{k}{'' if k == 5 else ', incomplete'})")

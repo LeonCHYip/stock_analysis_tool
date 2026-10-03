@@ -200,6 +200,26 @@ Disabled with an early `sys.exit(0)`. The SQLite→DuckDB migration ran in Febru
 ### `data_fetcher.py` vs `technical_fetcher.py` / `fundamental_fetcher.py`
 `data_fetcher.py` is the original combined fetcher (still used by `main.py` CLI and for single-ticker lookups in `app.py`). `technical_fetcher.py` and `fundamental_fetcher.py` are the newer, richer replacements that write to DuckDB and are used by the Streamlit scan flow.
 
+### Stale bars and the auto-scan
+"Done" in `_auto_scan_poll` means *scanned*, not *got the latest bar*. Yahoo sometimes serves the
+previous session as the newest bar (2026-10-01: batches 10–17 of the VPN-rotating auto scan, ~1,130
+tickers stored with 30 Sep). `fetch_and_store_bulk` correctly stores those with
+`is_finalized=FALSE`, but `storage.mark_old_tech_finalized()` (app.py `_finalize_loop`) flips every
+pre-today row to TRUE, so `is_finalized` **cannot** be used to find stale tickers —
+`get_tickers_with_stale_tech()` / `get_tickers_latest_tech_on()` compare `as_of_date` instead.
+`_auto_stale_retry()` re-scans tickers whose newest row is the *previous* session (delistings age
+out by themselves), max 3 attempts per session, 30 min apart, without VPN rotation. VPN switches
+are now logged to `scan_debug.log` as `[scan] VPN SWITCH`. The scheduler thread keeps the code it
+started with, so changes to the poll need a Streamlit **restart**, not a rerun.
+`get_tickers_with_stale_tech()` excludes ETFs (`asset_type='etf'`, ~5,600 rows from the ETF
+screener) and callers intersect it with `tickers.txt`; before that the banner read ~6,900.
+
+**Restart Streamlit after editing `storage.py` or `scan_state.py`.** On the next rerun Streamlit
+re-imports changed local modules, so the page gets a *new* `storage` (fresh `_global_conn`,
+`_db_lock`) and a *new* `scan_state` (empty `PROC_SCAN`, reset locks) while every background thread
+still holds the old ones. On 2026-10-01 a click on "Refresh Stale Data" right after such an edit
+hung the script run with no scan launched.
+
 ### yfinance Rate Limiting
 The fundamental fetcher retries with delays `[5, 10, 20]` seconds on 401/rate-limit responses. The VPN switcher (`vpn_switcher.py`) can rotate the Mullvad exit node between batch groups to avoid IP-level blocks. It is optional and silently skips if `mullvad` is not in PATH.
 
@@ -244,6 +264,14 @@ whole-run watchdog (`RUN_WATCHDOG_S`, 45 min) `os._exit`s and records `run_state
 watchdog counts *awake* time — `time.monotonic()` stops during sleep on macOS — so dozing is not
 mistaken for hanging. After editing the plist, re-arm via the sidebar Start (or
 `newsletter_control.start_schedule()`) since the installed copy is not a symlink.
+
+**A sleeping Mac cannot send on time — the code only makes sure it sends soon after waking.**
+On battery with the lid closed, macOS only dark-wakes for seconds at a time and `caffeinate`
+cannot hold it (2026-10-02: asleep 15:00–23:02 ET; the run that launchd fired in a dark wake crawled
+for 5 h). The watchdog therefore also aborts a run once the Mac has **slept** > `SLEEP_ABORT_S`
+(5 min) during it — wall-clock minus monotonic drift — freeing the slot. Slots now run hourly to
+23:00 ET (plus 08:00 catch-up; `newsletter_control.SLOTS` mirrors the plist), and launchd fires one
+missed slot on wake. Gemini timeouts count as transient (retried), not as a rejection.
 
 **Quality gate (added 2026-09-29).** `build_report()` returns `ctx["problems"]`: under 90% of the
 $10B+ universe priced, under half the 5d/3m/1y rows resolved, Gemini *failed* (not "explained

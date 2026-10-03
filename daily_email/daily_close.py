@@ -977,7 +977,13 @@ def _gemini_json(prompt: str, *, label: str, model: str | None = None,
                 break
             except Exception as exc:
                 last_exc = exc
-                if not any(c in str(exc) for c in ("503", "429", "UNAVAILABLE")):
+                # Timeouts are transient too: 2026-10-02 a ReadTimeout (the Mac
+                # slept mid-call) was read as "rejected" and dropped the model.
+                transient = (any(c in str(exc) for c in ("503", "429", "UNAVAILABLE",
+                                                         "timed out"))
+                             or "Timeout" in type(exc).__name__
+                             or "Connect" in type(exc).__name__)
+                if not transient:
                     log(f"  {label}: {candidate} rejected the request "
                         f"({type(exc).__name__}) -- not retrying this model")
                     candidates = [c for c in candidates if c != candidate]
@@ -2075,29 +2081,54 @@ def mail_preflight() -> tuple[bool, str]:
         return False, f"mailer unavailable ({type(exc).__name__}: {exc})"
 
 
-# Whole-run watchdog. Every network call has its own timeout, but a hung run is
-# so costly -- it silently blocks every later launchd slot -- that one backstop
-# for the timeouts nobody thought of is worth having. threading.Timer waits on
-# time.monotonic(), which on macOS does NOT advance while the machine sleeps, so
-# this budget is AWAKE time: a run that dozes through the evening in dark-wake
-# bursts is not killed for sleeping, only for genuinely making no progress.
+# Whole-run watchdog -- two limits, polled every 15 s:
+#
+#  1. AWAKE time > RUN_WATCHDOG_S. Every network call has its own timeout, but a
+#     hung run silently blocks every later launchd slot (launchd never starts a
+#     second copy of a running job), so one backstop is worth having.
+#  2. The Mac SLEPT for more than SLEEP_ABORT_S during the run. launchd fires
+#     missed slots inside dark-wake maintenance windows; on battery with the lid
+#     closed those last seconds and caffeinate cannot extend them. 2026-10-02:
+#     a run started in a dark wake crawled for 5 h, both Gemini calls died
+#     mid-sleep, and it held the job slot all evening. Anything fetched across
+#     a sleep is suspect anyway, so give up and let a run on an awake Mac redo
+#     it -- that takes ~3 min.
+#
+# time.monotonic() does not advance during sleep on macOS; time.time() does.
+# Their drift is exactly how long the machine has slept since the run began.
 RUN_WATCHDOG_S = 45 * 60
+SLEEP_ABORT_S = 5 * 60
 
 
 def _arm_watchdog() -> None:
     import os
     import threading
 
-    def _fire() -> None:
-        log(f"ERROR: watchdog -- run exceeded {RUN_WATCHDOG_S // 60} min of awake time; "
-            f"killing it so the next scheduled run can retry.")
-        _flush_log()
-        _write_run_state("error", None, f"watchdog: exceeded {RUN_WATCHDOG_S}s", 3)
-        os._exit(3)            # a hung C-level socket read cannot be interrupted
+    mono0, wall0 = time.monotonic(), time.time()
 
-    t = threading.Timer(RUN_WATCHDOG_S, _fire)
-    t.daemon = True
-    t.start()
+    def _die(outcome: str, msg: str, detail: str, code: int) -> None:
+        log(msg)
+        _flush_log()
+        _write_run_state(outcome, None, detail, code)
+        os._exit(code)          # a hung C-level socket read cannot be interrupted
+
+    def _watch() -> None:
+        while True:
+            time.sleep(15)
+            awake = time.monotonic() - mono0
+            slept = (time.time() - wall0) - awake
+            if slept > SLEEP_ABORT_S:
+                _die("skipped",
+                     f"Mac slept {slept / 60:.0f} min during this run -- abandoning it; "
+                     f"the next scheduled run on an awake Mac will send.",
+                     f"slept {slept:.0f}s mid-run", 0)
+            if awake > RUN_WATCHDOG_S:
+                _die("error",
+                     f"ERROR: watchdog -- run exceeded {RUN_WATCHDOG_S // 60} min of awake "
+                     f"time; killing it so the next scheduled run can retry.",
+                     f"watchdog: exceeded {RUN_WATCHDOG_S}s", 3)
+
+    threading.Thread(target=_watch, daemon=True, name="watchdog").start()
 
 
 if __name__ == "__main__":
